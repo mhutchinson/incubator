@@ -61,6 +61,13 @@ type InputLog interface {
 	StreamLeaves(ctx context.Context, start, end uint64) iter.Seq2[[]byte, error]
 }
 
+type OutputLog interface {
+	// GetCheckpoint returns the latest checkpoint committing to the output log state.
+	GetCheckpoint(ctx context.Context) (checkpoint []byte, err error)
+	// Append adds a new leaf and returns the checkpoint that commits to it.
+	Append(ctx context.Context, data []byte) (checkpoint []byte, err error)
+}
+
 // OpenCheckpointFn is a function that parses a checkpoint, validating it, and returns a parsed
 // checkpoint. This is expected to be a thin wrapper around log.ParseCheckpoint with the
 // validators set up according to the index operator's policy on the number of witnesses
@@ -72,7 +79,7 @@ type OpenCheckpointFn func(cpRaw []byte) (*log.Checkpoint, error)
 // path.
 // Note that only one IndexBuilder should exist for any given walPath at any time. The behaviour is unspecified,
 // but likely broken, if multiple processes are writing to the same file at any given time.
-func NewVerifiableIndex(ctx context.Context, inputLog InputLog, logParseFn OpenCheckpointFn, mapFn MapFn, walPath string) (*VerifiableIndex, error) {
+func NewVerifiableIndex(ctx context.Context, inputLog InputLog, inputLogParseFn OpenCheckpointFn, outputLog OutputLog, outputLogParseFn OpenCheckpointFn, mapFn MapFn, walPath string) (*VerifiableIndex, error) {
 	wal := &writeAheadLog{
 		walPath: walPath,
 	}
@@ -89,14 +96,16 @@ func NewVerifiableIndex(ctx context.Context, inputLog InputLog, logParseFn OpenC
 		return nil, fmt.Errorf("InitStorage: %s", err)
 	}
 	b := &VerifiableIndex{
-		inputLog:   inputLog,
-		logParseFn: logParseFn,
-		mapFn:      mapFn,
-		wal:        wal,
-		reader:     reader,
-		vindex:     *mpt.NewTree(sha256.Sum256, vtreeStorage),
-		data:       map[[32]byte][]uint64{},
-		nextIndex:  ws,
+		inputLog:         inputLog,
+		inputLogParseFn:  inputLogParseFn,
+		outputLog:        outputLog,
+		outputLogParseFn: outputLogParseFn,
+		mapFn:            mapFn,
+		wal:              wal,
+		reader:           reader,
+		vindex:           *mpt.NewTree(sha256.Sum256, vtreeStorage),
+		data:             map[[32]byte][]uint64{},
+		nextIndex:        ws,
 	}
 	return b, nil
 }
@@ -104,11 +113,13 @@ func NewVerifiableIndex(ctx context.Context, inputLog InputLog, logParseFn OpenC
 // VerifiableIndex manages reading from the input log, mapping leaves, updating the WAL,
 // reading the WAL, and keeping the state of the in-memory index updated from the WAL.
 type VerifiableIndex struct {
-	inputLog   InputLog
-	logParseFn OpenCheckpointFn
-	mapFn      MapFn
-	wal        *writeAheadLog
-	reader     *logReader
+	inputLog         InputLog
+	inputLogParseFn  OpenCheckpointFn
+	outputLog        OutputLog
+	outputLogParseFn OpenCheckpointFn
+	mapFn            MapFn
+	wal              *writeAheadLog
+	reader           *logReader
 
 	indexMu sync.RWMutex // covers vindex and data
 	vindex  mpt.Tree
@@ -162,7 +173,7 @@ func (b *VerifiableIndex) Update(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get latest checkpoint from DB: %s", err)
 	}
-	cp, err := b.logParseFn(rawCp)
+	cp, err := b.inputLogParseFn(rawCp)
 	if err != nil {
 		return fmt.Errorf("failed to parse checkpoint: %s", err)
 	}
