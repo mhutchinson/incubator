@@ -5,7 +5,7 @@ go 1.24.1
 require (
 	filippo.io/torchwood v0.5.1-0.20250605130057-fa65d721a6ce
 	github.com/gorilla/mux v1.8.1
-	github.com/transparency-dev/formats v0.0.0-20250616090723-6ce2fd29df16
+	github.com/transparency-dev/formats v0.0.0-20250723101439-be3b1008ec3a
 	github.com/transparency-dev/tessera v0.2.1-0.20250722085756-7303218c6614
 	golang.org/x/mod v0.26.0
 	golang.org/x/sync v0.16.0

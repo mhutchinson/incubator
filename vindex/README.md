@@ -195,9 +195,9 @@ LOG_PRIVATE_KEY=PRIVATE+KEY+logandmap+38581672+AXJ0FKWOcO2ch6WC8kP705Ed3Gxu7pVtZ
 ```
 
 Running the above will run a web server hosting the following URLs:
- - `/inputlog/` - the [tlog-tiles][]
+ - `/inputlog/` - the [tlog-tiles][] base URL for the input log
  - `/vindex/lookup` - the provisional [vindex lookup API](./api/api.go)
- - `/outputlog/` - TODO(mhutchinson): this is where the output log will be hosted
+ - `/outputlog/` - the [tlog-tiles][] base URL for the output log
 
 The input log has entries for packages in the set {`foo`, `bar`, `baz`, `splat`}.
 To inspect the log, you can use the woodpecker tool (using the corresponding public key to the private key used above):

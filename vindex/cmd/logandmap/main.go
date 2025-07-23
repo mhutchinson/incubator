@@ -23,9 +23,7 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -36,12 +34,12 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/transparency-dev/formats/log"
+	fnote "github.com/transparency-dev/formats/note"
 	"github.com/transparency-dev/incubator/vindex"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/api"
@@ -315,7 +313,7 @@ func getInputLogSignerVerifierOrDie() (note.Signer, note.Verifier) {
 			klog.Exit("Supply private key file path using --input_log_private_key or set INPUT_LOG_PRIVATE_KEY environment variable")
 		}
 	}
-	s, v, err := signerVerifierFromSkey(privKey)
+	s, v, err := fnote.NewEd25519SignerVerifier(privKey)
 	if err != nil {
 		klog.Exitf("Failed to get signer/verifier: %v", err)
 	}
@@ -338,51 +336,11 @@ func getOutputLogSignerVerifierOrDie() (note.Signer, note.Verifier) {
 			klog.Exit("Supply private key file path using --output_log_private_key or set OUTPUT_LOG_PRIVATE_KEY environment variable")
 		}
 	}
-	s, v, err := signerVerifierFromSkey(privKey)
+	s, v, err := fnote.NewEd25519SignerVerifier(privKey)
 	if err != nil {
 		klog.Exitf("Failed to get signer/verifier: %v", err)
 	}
 	return s, v
-}
-
-// TODO(mhutchinson): move this into t-dev/formats.
-func signerVerifierFromSkey(skey string) (note.Signer, note.Verifier, error) {
-	const algEd25519 = 1
-	s, err := note.NewSigner(skey)
-	if err != nil {
-		return nil, nil, err
-	}
-	_, skey, _ = strings.Cut(skey, "+")
-	_, skey, _ = strings.Cut(skey, "+")
-	_, skey, _ = strings.Cut(skey, "+")
-	_, key64, _ := strings.Cut(skey, "+")
-	key, err := base64.StdEncoding.DecodeString(key64)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decode base64: %v", err)
-	}
-
-	alg, key := key[0], key[1:]
-	switch alg {
-	default:
-		return nil, nil, errors.New("unsupported algorithm")
-
-	case algEd25519:
-		if len(key) != ed25519.SeedSize {
-			return nil, nil, fmt.Errorf("expected key seed of size %d but got %d", ed25519.SeedSize, len(key))
-		}
-		key := ed25519.NewKeyFromSeed(key)
-		publicKey := key.Public().(ed25519.PublicKey)
-		vkey, err := note.NewEd25519VerifierKey(s.Name(), publicKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to generate verifier from key: %v", err)
-
-		}
-		v, err := note.NewVerifier(vkey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to create verifier from vkey: %v", err)
-		}
-		return s, v, err
-	}
 }
 
 func getKeyFile(path string) (string, error) {
