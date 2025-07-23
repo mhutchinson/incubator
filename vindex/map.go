@@ -80,14 +80,14 @@ type OpenCheckpointFn func(cpRaw []byte) (*log.Checkpoint, error)
 // Note that only one IndexBuilder should exist for any given walPath at any time. The behaviour is unspecified,
 // but likely broken, if multiple processes are writing to the same file at any given time.
 func NewVerifiableIndex(ctx context.Context, inputLog InputLog, inputLogParseFn OpenCheckpointFn, outputLog OutputLog, outputLogParseFn OpenCheckpointFn, mapFn MapFn, walPath string) (*VerifiableIndex, error) {
-	wal := &writeAheadLog{
+	wal := &walWriter{
 		walPath: walPath,
 	}
 	ws, err := wal.init()
 	if err != nil {
 		return nil, err
 	}
-	reader, err := newLogReader(walPath)
+	reader, err := newWalReader(walPath)
 	if err != nil {
 		return nil, err
 	}
@@ -101,8 +101,8 @@ func NewVerifiableIndex(ctx context.Context, inputLog InputLog, inputLogParseFn 
 		outputLog:        outputLog,
 		outputLogParseFn: outputLogParseFn,
 		mapFn:            mapFn,
-		wal:              wal,
-		reader:           reader,
+		walWriter:        wal,
+		walReader:        reader,
 		vindex:           *mpt.NewTree(sha256.Sum256, vtreeStorage),
 		data:             map[[32]byte][]uint64{},
 		nextIndex:        ws,
@@ -118,8 +118,8 @@ type VerifiableIndex struct {
 	outputLog        OutputLog
 	outputLogParseFn OpenCheckpointFn
 	mapFn            MapFn
-	wal              *writeAheadLog
-	reader           *logReader
+	walWriter        *walWriter
+	walReader        *walReader
 
 	indexMu sync.RWMutex // covers vindex and data
 	vindex  mpt.Tree
@@ -138,7 +138,7 @@ type VerifiableIndex struct {
 
 // Close ensures that any open connections are closed before returning.
 func (b *VerifiableIndex) Close() error {
-	return b.wal.close()
+	return b.walWriter.close()
 }
 
 // Lookup returns the values stored for the given key.
@@ -236,7 +236,7 @@ func (b *VerifiableIndex) syncFromInputLog(ctx context.Context) error {
 				// even if there are no hashes.
 				continue
 			}
-			if err := b.wal.append(idx, hashes); err != nil {
+			if err := b.walWriter.append(idx, hashes); err != nil {
 				return fmt.Errorf("failed to add index to entry for leaf %d: %v", idx, err)
 			}
 		}
@@ -255,7 +255,7 @@ func (b *VerifiableIndex) buildMap(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
-		idx, hashes, err := b.reader.next()
+		idx, hashes, err := b.walReader.next()
 		if err != nil {
 			if err != io.EOF {
 				return err
@@ -322,7 +322,10 @@ func (b *VerifiableIndex) buildMap(ctx context.Context) error {
 	return nil
 }
 
-type writeAheadLog struct {
+// walWriter provides the methods needed by the processor of the Input Log when interacting
+// with the WAL. init provides the index that this processor should start from, and append
+// allows new mapped entries to be added to the WAL.
+type walWriter struct {
 	walPath string
 	f       *os.File
 }
@@ -332,7 +335,7 @@ type writeAheadLog struct {
 //
 // Note that it returns the next expected index to avoid awkwardness with the meaning of 0,
 // which could mean 0 was successfully read from a previous run, or that there was no log.
-func (l *writeAheadLog) init() (uint64, error) {
+func (l *walWriter) init() (uint64, error) {
 	ffs := os.O_WRONLY | os.O_APPEND
 
 	idx, err := l.validate()
@@ -353,14 +356,14 @@ func (l *writeAheadLog) init() (uint64, error) {
 	return idx, err
 }
 
-func (l *writeAheadLog) close() error {
+func (l *walWriter) close() error {
 	return l.f.Close()
 }
 
 // validate reads the file and determines what the last mapped log index was, and returns it.
 // The assumption is that all lines ending with a newline were written correctly.
 // If there are any errors in the file then this throws an error.
-func (l *writeAheadLog) validate() (uint64, error) {
+func (l *walWriter) validate() (uint64, error) {
 	f, err := os.Open(l.walPath)
 	if err != nil {
 		return 0, err
@@ -428,7 +431,7 @@ func (l *writeAheadLog) validate() (uint64, error) {
 	return idx, err
 }
 
-func (l *writeAheadLog) append(idx uint64, hashes [][32]byte) error {
+func (l *walWriter) append(idx uint64, hashes [][32]byte) error {
 	e, err := marshalWalEntry(idx, hashes)
 	if err != nil {
 		return fmt.Errorf("failed to marshal entry: %v", err)
@@ -437,18 +440,18 @@ func (l *writeAheadLog) append(idx uint64, hashes [][32]byte) error {
 	return err
 }
 
-func newLogReader(path string) (*logReader, error) {
+func newWalReader(path string) (*walReader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &logReader{
+	return &walReader{
 		f: f,
 		r: bufio.NewReader(f),
 	}, nil
 }
 
-type logReader struct {
+type walReader struct {
 	f       *os.File
 	r       *bufio.Reader
 	partial string
@@ -458,7 +461,7 @@ type logReader struct {
 // TODO(mhutchinson): change this as it's inconvenient with EOF handling,
 // which should be common when reader hits the end of the file but more is
 // to be written.
-func (r *logReader) next() (uint64, [][32]byte, error) {
+func (r *walReader) next() (uint64, [][32]byte, error) {
 	line, err := r.r.ReadString('\n')
 	if err != nil {
 		if err == io.EOF {
@@ -473,7 +476,7 @@ func (r *logReader) next() (uint64, [][32]byte, error) {
 	return unmarshalWalEntry(line)
 }
 
-func (r *logReader) close() error {
+func (r *walReader) close() error {
 	return r.f.Close()
 }
 

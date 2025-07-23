@@ -81,7 +81,7 @@ func TestWriteAheadLog_init(t *testing.T) {
 			if err := f.Close(); err != nil {
 				t.Fatal(err)
 			}
-			wal := &writeAheadLog{
+			wal := &walWriter{
 				walPath: f.Name(),
 			}
 			idx, err := wal.init()
@@ -113,7 +113,7 @@ func TestWriteAheadLog_roundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wal := &writeAheadLog{
+	wal := &walWriter{
 		walPath: f.Name(),
 	}
 	idx, err := wal.init()
@@ -160,7 +160,7 @@ func TestWriteAndWriteLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wal := &writeAheadLog{
+	wal := &walWriter{
 		walPath: f.Name(),
 	}
 	idx, err := wal.init()
@@ -171,7 +171,7 @@ func TestWriteAndWriteLog(t *testing.T) {
 		t.Fatalf("expected index %d, got %d", want, got)
 	}
 
-	reader, err := newLogReader(f.Name())
+	reader, err := newWalReader(f.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
