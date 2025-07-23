@@ -107,33 +107,37 @@ func NewVerifiableIndex(ctx context.Context, inputLog InputLog, inputLogParseFn 
 		data:             map[[32]byte][]uint64{},
 		nextIndex:        ws,
 	}
+	if err := b.buildMap(ctx); err != nil {
+		return nil, fmt.Errorf("failed to build map: %v", err)
+	}
 	return b, nil
 }
 
 // VerifiableIndex manages reading from the input log, mapping leaves, updating the WAL,
 // reading the WAL, and keeping the state of the in-memory index updated from the WAL.
 type VerifiableIndex struct {
-	inputLog         InputLog
-	inputLogParseFn  OpenCheckpointFn
-	outputLog        OutputLog
-	outputLogParseFn OpenCheckpointFn
-	mapFn            MapFn
-	walWriter        *walWriter
-	walReader        *walReader
+	inputLog        InputLog
+	inputLogParseFn OpenCheckpointFn
+	mapFn           MapFn
+	walWriter       *walWriter
 
 	indexMu sync.RWMutex // covers vindex and data
 	vindex  mpt.Tree
 	data    map[[32]byte][]uint64
 
-	nextIndex uint64 // nextIndex is the next index in the log to consume
-	rawCp     []byte // rawCp is the last checkpoint we started syncing to
-	cpSize    uint64 // cpSize is the tree size of rawCp
-	mapSize   uint64 // mapSize is the total number of leaves processed into the map
+	walReader        *walReader
+	outputLog        OutputLog
+	outputLogParseFn OpenCheckpointFn
 
 	// servingSize is the size of the input log we are serving for.
 	// This a temporary workaround not having an output log, which we will eventually read to get
 	// the checkpoint size.
 	servingSize uint64
+
+	nextIndex      uint64 // nextIndex is the next index in the log to consume
+	inputLogCp     []byte // rawCp is the last checkpoint we started syncing to
+	inputLogCpSize uint64 // cpSize is the tree size of rawCp
+	mapSize        uint64 // mapSize is the total number of leaves processed into the map
 }
 
 // Close ensures that any open connections are closed before returning.
@@ -178,20 +182,20 @@ func (b *VerifiableIndex) Update(ctx context.Context) error {
 		return fmt.Errorf("failed to parse checkpoint: %s", err)
 	}
 
-	if cp.Size == b.cpSize {
+	if cp.Size == b.inputLogCpSize {
 		klog.V(1).Infof("No update needed: checkpoint size is still %d", b.servingSize)
 		return nil
 	}
-	b.cpSize = cp.Size
-	b.rawCp = rawCp
-	klog.Infof("Building map to log size of %d", b.cpSize)
+	b.inputLogCpSize = cp.Size
+	b.inputLogCp = rawCp
+	klog.Infof("Building map to log size of %d", b.inputLogCpSize)
 
 	eg, cctx := errgroup.WithContext(ctx)
 	eg.Go(func() error { return b.syncFromInputLog(cctx) })
 	eg.Go(func() error { return b.buildMap(cctx) })
 
 	err = eg.Wait()
-	b.servingSize = b.cpSize
+	b.servingSize = b.inputLogCpSize
 
 	return err
 }
@@ -204,10 +208,10 @@ func (b *VerifiableIndex) Update(ctx context.Context) error {
 // cloneDB, which performed this validation. Implementing this will require the index to store some
 // state alongside the WAL which contains a compact range of its current progress.
 func (b *VerifiableIndex) syncFromInputLog(ctx context.Context) error {
-	if b.cpSize > b.nextIndex {
+	if b.inputLogCpSize > b.nextIndex {
 		ctx, done := context.WithCancel(ctx)
 		defer done()
-		for l, err := range b.inputLog.StreamLeaves(ctx, b.nextIndex, b.cpSize) {
+		for l, err := range b.inputLog.StreamLeaves(ctx, b.nextIndex, b.inputLogCpSize) {
 			idx := b.nextIndex
 			if err != nil {
 				return fmt.Errorf("failed to read leaf at index %d: %v", idx, err)
@@ -229,7 +233,7 @@ func (b *VerifiableIndex) syncFromInputLog(ctx context.Context) error {
 				return mapErr
 			}
 			b.nextIndex++
-			if len(hashes) == 0 && idx < b.cpSize-1 {
+			if len(hashes) == 0 && idx < b.inputLogCpSize-1 {
 				// We can skip writing out values with no hashes, as long as we're
 				// not at the end of the log.
 				// If we are at the end of the log, we need to write out a value as a sentinel
@@ -249,7 +253,7 @@ func (b *VerifiableIndex) syncFromInputLog(ctx context.Context) error {
 func (b *VerifiableIndex) buildMap(ctx context.Context) error {
 	startWal := time.Now()
 	updatedKeys := make(map[[32]byte]bool) // Allows us to efficiently update vindex after first init
-	for b.mapSize < b.cpSize {
+	for b.mapSize < b.inputLogCpSize {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
