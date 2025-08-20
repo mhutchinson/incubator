@@ -396,8 +396,20 @@ func (b *VerifiableIndex) Lookup(ctx context.Context, key [sha256.Size]byte) (ap
 	}
 	result.IndexValue = allIndices
 
-	// TODO(filosottile): Generate proof for the vindex
-	result.IndexProof = nil
+	ll, err := mpt.NewLabel(256, key)
+	if err != nil {
+		return result, fmt.Errorf("failed to create label: %v", err)
+	}
+	ip, err := b.vstore.LoadPath(ll)
+	if err != nil {
+		return result, fmt.Errorf("failed to load vindex inclusion proof: %v", err)
+	}
+
+	result.IndexProof = make([][32]byte, len(ip))
+	for i, n := range ip {
+		// TODO(mhutchinson): we will need to propagate the left/right info here as well as hash
+		result.IndexProof[i] = n.Hash
+	}
 
 	return result, nil
 }

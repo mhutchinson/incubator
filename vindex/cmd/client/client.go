@@ -142,7 +142,7 @@ func (c VIndexClient) Lookup(ctx context.Context, key string) ([]uint64, error) 
 	vindexLeafHash := idxLeafHash.Sum(nil)
 	vindexKeyHash := sha256.Sum256([]byte(key))
 	// TODO(mhutchinson): verify inclusion in the vindex!
-	klog.Warningf("TODO: confirm inclusion of leaf hash %x at key location %x with root hash %x", vindexLeafHash, vindexKeyHash, mapRoot)
+	klog.Warningf("TODO: confirm inclusion (got len %d) of leaf hash %x at key location %x with root hash %x", len(resp.IndexProof), vindexLeafHash, vindexKeyHash, mapRoot)
 
 	return resp.IndexValue, nil
 }
