@@ -45,10 +45,16 @@ The primary reason for executing the `MapFn` inside a WebAssembly environment is
 A persistent embedded key-value store optimized for fast writes and byte-range iteration. 
 - **Database**: `Pebble` (CockroachDB's highly optimized LevelDB clone).
 - **Schema**:
-    - `Key`: `Hash(MapKey) + [Input-Log-Index]` (Big-endian encoded uint64).
-    - `Value`: The serialized **Compact Range** state for the mini-log up to this index.
-    - **Storage Optimization**: To prevent unbounded disk usage and enable O(1) mini-tree updates, the system maintains an invariant: only the *latest* entry for a given `Hash(MapKey)` contains the serialized compact range in its value. When appending a new index, the system seeks to the previous highest key, reads the compact range, appends the new index, writes the new compact range to the new key, and atomically overwrites the previous key's value to be empty. Because the index is physically encoded in the key, the key itself remains in Pebble to satisfy client history queries, while the bulky intermediate tree state is garbage collected immediately.
-    - **Note**: This schema allows efficient prefix scans and utilizes Pebble's native range bounds to limit scans to specific Input Log checkpoints. This solves the "Pebble ahead" issue from 6.1 by allowing the `Read Server` to natively ignore keys beyond the target checkpoint. Because the mini-log stores strictly increasing Input Log indices, the `Read Server` can perfectly reconstruct the mini-log's state for any given Output Log checkpoint simply by dropping any Pebble entries where the index is greater than or equal to the checkpoint's Input Log size.
+    - We evaluated three different storage layouts (Flat List, Log Construction, and Chunked Log) to balance write amplification, lookup latency, and tail-latency stalls under compaction.
+    - **Default Layout**: **Chunked Log (PebbleChunk)**.
+      - `Key`: `Hash(MapKey) + [BlockNum]` (40 bytes: 32B hash + 8B big-endian uint64 block number). `BlockNum = Input-Log-Index / 1024`.
+      - `Value (Latest Block)`: `Header (1B)` + `PrevBlockNum (8B)` + `EndIndex (8B)` + `hashes (compact range)` + `RelativeIndices ([]uint16)`.
+        - `EndIndex`: The absolute `Input-Log-Index` up to which this block's compact range is valid.
+        - `hashes (compact range)`: Serialized hashes of the compact Merkle range. The number of hashes is determined by the number of set bits (1-bits) in `EndIndex`.
+      - `Value (Older Blocks)`: `Header (1B)` + `PrevBlockNum (8B)` + `RelativeIndices ([]uint16)`. (Compact range is stripped).
+      - **Relative Indices**: Each `uint16` in `RelativeIndices` represents an offset relative to the block's base index (`BlockNum * 1024`). For example, a relative index of `5` in block `2` represents absolute index `2053`.
+      - **Linked Blockchain**: Blocks are backward-linked via `PrevBlockNum` (referencing the previous `BlockNum`), allowing history reconstruction via point lookups without expensive prefix scans.
+    - For details on the alternative layouts and the performance benchmarks that led to this decision, see [Appendix: Storage Layout Evaluation](#8-appendix-storage-layout-evaluation).
 
 ### 2.4 The Verifiable Prefix Trie (MPT)
 This maintains the global cryptographic map state.
@@ -199,5 +205,35 @@ func map_leaf(ptr uint32, len uint32) uint64 {
 	// (This typically requires a helper to allocate memory for the return value)
 	return packPtrLen(allocateAndWrite(serialized))
 }
+
+## 8. Appendix: Storage Layout Evaluation
+
+During the implementation design phase, we evaluated three alternative layouts for storing index data in Pebble DB.
+
+### 8.1 Evaluated Layouts
+1.  **Flat List (PebbleFlat)**: Maps `Hash(Key)` to a serialized list of all its input log indices (`[]uint64`).
+    *   *Pros*: Fast read lookups (single `Get`).
+    *   *Cons*: High write amplification for hot keys (rewriting the entire history on every append).
+2.  **Log Construction (PebbleLog)**: Maps `Hash(Key) + [Input-Log-Index]` to a serialized `compact.Range` (mini Merkle tree) state. Old values are cleared.
+    *   *Pros*: Small write size, low write amplification.
+    *   *Cons*: Read lookups require a prefix scan. Write path requires an iterator seek to find the latest index, which suffers from severe stalls during background compactions.
+3.  **Chunked Log (PebbleChunk)**: Groups indices into blocks of 1024. Maps `Hash(Key) + [BlockNum]` to a chunk of relative `uint16` indices. Blocks are backward-linked.
+    *   *Pros*: Caps write size (max 2KB blocks), eliminates prefix scans (uses point gets following links), and reduces key cardinality by 1000x, resolving write stalls.
+
+### 8.2 Performance Comparison (Sustained Load)
+We ran a 45-second write-heavy benchmark (10 hot keys, batch size 1000) to force background compactions and measure tail latencies and write stalls.
+
+| Metric | PebbleFlat (Flat List) | PebbleLog (Log Construction) | PebbleChunk (Chunked Log) |
+| :--- | :--- | :--- | :--- |
+| **Write Throughput** | 2,012 batches | 3,508 batches | **14,311 batches** (7x vs Flat) |
+| **Commit Latency (p50)** | 23.57 ms | 894.65 µs | **553.03 µs** |
+| **Commit Latency (p99)** | 44.72 ms | 463.41 ms | **1.67 ms** (270x faster than Log) |
+| **Commit Latency (Max)** | 117.17 ms | 1.15 s | **55.87 ms** (20x faster than Log) |
+| **Write Stalls (>500ms)** | **0** | 32 | **0** |
+| **WAL Bytes Written** | 16.22 GB | **1.34 GB** | 6.88 GB (2.4x less than Flat) |
+| **Disk Space (Hot Keys)** | 8.24 MB | **5.52 MB** | 7.89 MB |
+
+### 8.3 Conclusion
+`PebbleChunk` was selected as the default layout because it resolves the write stalls of `PebbleLog` by reducing key cardinality (making seeks cache-friendly) while keeping write amplification low.
 ```
 
