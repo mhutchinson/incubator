@@ -110,8 +110,6 @@ func NewVerifiableIndex(ctx context.Context, inputLog InputLog, mapFn MapFn, out
 		return nil, fmt.Errorf("pebble.Open(): %v", err)
 	}
 
-
-
 	// Load the compact range we have calculated so far, and the size persisted. We MUST start
 	// from this index in order to have properly verified the state of the input log.
 	crf := compact.RangeFactory{Hash: rfc6962.DefaultHasher.HashChildren}
@@ -594,17 +592,14 @@ func (b *VerifiableIndex) Update(ctx context.Context) error {
 	return b.buildMap(ctx, true)
 }
 
-func (b *VerifiableIndex) publish(ctx context.Context, inCp []byte) error {
-	// Construct the leaf for the output log
-
-	if b.servingSize > math.MaxInt64 {
-		return fmt.Errorf("servingSize %d exceeds MaxInt64", b.servingSize)
-	}
-	snap, err := b.vindex.Snap(int64(b.servingSize))
-	if err != nil {
-		return fmt.Errorf("Snap(): %v", err)
-	}
-	outIdx, rawCp, err := b.outputLog.Append(ctx, MarshalLeaf(snap.Hash, inCp))
+// publish creates an outputLog entry with the provisional next VIndex root hash.
+// This returns once it is published, and then the serving state can be updated.
+func (b *VerifiableIndex) publish(ctx context.Context, inCp []byte, hash mpt.Hash) error {
+	startPublish := time.Now()
+	defer func() {
+		b.buildPublishDuration.Record(ctx, time.Since(startPublish).Seconds())
+	}()
+	outIdx, rawCp, err := b.outputLog.Append(ctx, MarshalLeaf(hash, inCp))
 	if err != nil {
 		return fmt.Errorf("failed to append to output log: %v", err)
 	}
@@ -693,58 +688,100 @@ func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error 
 	b.buildWalDuration.Record(ctx, durationWal.Seconds())
 
 	startVIndex := time.Now()
+	var predictedHash mpt.Hash
+	var mptChanges []mpt.KeyVal
+
 	if updateIndex {
-		// Build the verifiable index _afterwards_ for several reasons:
-		//  1) doing this incrementally leads to a lot of duplicate work for keys with multiple values
-		//  2) updating the vindex needs to block lookups for the whole update of the data structure
-
-		// Locking strategy for the verifiable index is to prevent all reads while this is being updated.
-		// TODO(mhutchinson): inside the same mutex we will need to update the output log with the calculated
-		// map root, and eventually witness checkpoints.
-		// If this is too slow (almost certain), then we need some strategy to allow us to serve a version of
-		// the vindex while also updating it. One approach could be to have 2 trees whenever we are performing
-		// an update.
-		klog.V(1).Infof("buildMap [%d, %d): updating %d keys in vindex", b.servingSize, size, len(updatedKeys))
-		b.indexMu.Lock()
-		defer b.indexMu.Unlock()
-		for h := range updatedKeys {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			idxes := b.data[h]
-
-			// Here we hash by simply appending all indices in the list and hashing that
-			// TODO(mhutchinson): maybe use a log construction?
-			sum := sha256.New()
-			for _, idx := range idxes {
-				if err := binary.Write(sum, binary.BigEndian, idx); err != nil {
-					klog.Warning(err)
-					return err
+		if len(updatedKeys) > 0 {
+			b.indexMu.Lock()
+			mptChanges = make([]mpt.KeyVal, 0, len(updatedKeys))
+			for h := range updatedKeys {
+				select {
+				case <-ctx.Done():
+					b.indexMu.Unlock()
+					return ctx.Err()
+				default:
 				}
+				idxes := b.data[h]
+				sum := sha256.New()
+				for _, idx := range idxes {
+					if err := binary.Write(sum, binary.BigEndian, idx); err != nil {
+						b.indexMu.Unlock()
+						return err
+					}
+				}
+				mptChanges = append(mptChanges, mpt.KeyVal{
+					Key: h,
+					Val: [sha256.Size]byte(sum.Sum(nil)),
+				})
 			}
+			// Sort changes by key as required by Predict
+			slices.SortFunc(mptChanges, func(a, b mpt.KeyVal) int {
+				return a.Key.Compare(b.Key)
+			})
 
-			if err := b.vindex.Set(h, [sha256.Size]byte(sum.Sum(nil))); err != nil {
-				return fmt.Errorf("Insert(): %s", err)
+			var err error
+			predictedHash, err = b.vindex.Predict(mptChanges)
+			if err != nil {
+				b.indexMu.Unlock()
+				return fmt.Errorf("Predict(): %w", err)
 			}
+			b.indexMu.Unlock()
+		} else {
+			// If there are no updates, the MPT root hash hasn't changed.
+			// However, we still need to publish a new checkpoint to commit to the
+			// new input log size (we know it changed because from != to).
+			// We use Snap(-1) to get the current hash without changing the MPT version.
+			b.indexMu.Lock()
+			snap, err := b.vindex.Snap(-1)
+			if err != nil {
+				b.indexMu.Unlock()
+				return fmt.Errorf("Snap(-1): %w", err)
+			}
+			predictedHash = snap.Hash
+			b.indexMu.Unlock()
 		}
 	}
 	durationVIndex := time.Since(startVIndex)
 	b.buildVIndexDuration.Record(ctx, durationVIndex.Seconds())
 	durationTotal := time.Since(startWal)
 
-	b.servingSize = size
-	klog.Infof("buildMap [%d, %d): total=%s (wal=%s, vindex=%s)", from, to, durationTotal, durationWal, durationVIndex)
+	if !updateIndex {
+		// If we're not updating the index, then update the servingSize state and return.
+		b.servingSize = size
+		klog.Infof("buildMap [%d, %d): total=%s (wal=%s, vindex=%s) (no update)", from, to, durationTotal, durationWal, durationVIndex)
+		return nil
+	}
 
-	// This publish occurs within the indexMu lock intentionally.
-	// This allows Lookup to always assume that the last leaf in the Output Log is the
-	// one that commits to the current state of the index.
-	startPublish := time.Now()
-	err = b.publish(ctx, cpRaw)
-	b.buildPublishDuration.Record(ctx, time.Since(startPublish).Seconds())
+	// Publish outside the lock
+	err = b.publish(ctx, cpRaw, predictedHash)
+	if err != nil {
+		return fmt.Errorf("publish(): %w", err)
+	}
+
+	// Apply changes and update MPT version under lock
+	b.indexMu.Lock()
+	defer b.indexMu.Unlock()
+
+	for _, cv := range mptChanges {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := b.vindex.Set(cv.Key, cv.Val); err != nil {
+			return fmt.Errorf("Set(): %w", err)
+		}
+	}
+
+	if _, err := b.vindex.Snap(int64(size)); err != nil {
+		return fmt.Errorf("Snap(): %w", err)
+	}
+	b.servingSize = size
+
 	b.buildTotalDuration.Record(ctx, time.Since(startWal).Seconds())
-	return err
+	klog.Infof("buildMap [%d, %d): total=%s (wal=%s, vindex=%s)", from, to, durationTotal, durationWal, durationVIndex)
+	return nil
 }
 
 // checkpointUnsafe parses a checkpoint without performing any signature verification.
