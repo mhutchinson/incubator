@@ -256,42 +256,43 @@ func TestVerifiableIndex_concurrency(t *testing.T) {
 
 			// Regularly perform lookups in the index.
 			eg.Go(func() error {
-				var kh [sha256.Size]byte
-				var resp api.LookupResponse
-				var indices []uint64
-
-				kh = sha256.Sum256([]byte("bar"))
-				resp, err = vi.Lookup(t.Context(), kh)
-				if err != nil {
-					return err
-				}
-				indices, _, err = client.VerifyLookupResponse(kh, resp, v, v, "")
-				if err != nil {
-					return fmt.Errorf("failed to verify vindex response: %v", err)
-				}
-				if got, want := indices, []uint64{1, 2}; !cmp.Equal(got, want) {
-					return fmt.Errorf("expected %v but got %v", want, got)
-				}
-
-				kh = sha256.Sum256([]byte("banana"))
-				resp, err = vi.Lookup(t.Context(), kh)
-				if err != nil {
-					return err
-				}
-				indices, _, err = client.VerifyLookupResponse(kh, resp, v, v, "")
-				if err != nil {
-					return fmt.Errorf("failed to verify vindex response: %v", err)
-				}
-				if indices != nil {
-					return fmt.Errorf("expected no results but got %+v", resp.IndexValue)
-				}
-
 				for {
 					select {
 					case <-ctx.Done():
 						return nil
-					case <-time.After(8 * time.Millisecond):
+					default:
 					}
+					var kh [sha256.Size]byte
+					var resp api.LookupResponse
+					var indices []uint64
+
+					kh = sha256.Sum256([]byte("bar"))
+					resp, err = vi.Lookup(t.Context(), kh)
+					if err != nil {
+						return err
+					}
+					indices, _, err = client.VerifyLookupResponse(kh, resp, v, v, "")
+					if err != nil {
+						return fmt.Errorf("failed to verify vindex response: %v", err)
+					}
+					if got, want := indices, []uint64{1, 2}; !cmp.Equal(got, want) {
+						return fmt.Errorf("expected %v but got %v", want, got)
+					}
+
+					kh = sha256.Sum256([]byte("banana"))
+					resp, err = vi.Lookup(t.Context(), kh)
+					if err != nil {
+						return err
+					}
+					indices, _, err = client.VerifyLookupResponse(kh, resp, v, v, "")
+					if err != nil {
+						return fmt.Errorf("failed to verify vindex response: %v", err)
+					}
+					if indices != nil {
+						return fmt.Errorf("expected no results but got %+v", resp.IndexValue)
+					}
+
+					time.Sleep(5 * time.Millisecond)
 				}
 			})
 
@@ -437,4 +438,134 @@ func BenchmarkBuild_InMemory(b *testing.B) {
 
 func BenchmarkBuild_OnDisk(b *testing.B) {
 	runBenchmark(b, vindex.Options{PersistIndex: true})
+}
+
+func TestVerifiableIndex_recovery(t *testing.T) {
+	ctx := t.Context()
+	s, v, err := fnote.NewEd25519SignerVerifier(skey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputLog := &inMemoryTreeSource{
+		t:      testonly.New(rfc6962.DefaultHasher),
+		leaves: make([][]byte, 0),
+		s:      s,
+		v:      v,
+	}
+	inputLog.Append("foo: 2")
+
+	mapFn := func(leaf []byte) [][sha256.Size]byte {
+		key, _, found := bytes.Cut(leaf, []byte(":"))
+		if !found {
+			panic("colon not found")
+		}
+		return [][sha256.Size]byte{sha256.Sum256(key)}
+	}
+
+	// Create temp dir
+	dir, err := os.MkdirTemp("", "vindex-recovery-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	outputLogDir := path.Join(dir, "outputlog")
+	outputLog, outputCloser, err := vindex.NewOutputLog(ctx, outputLogDir, s, v, vindex.OutputLogOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vi, err := vindex.NewVerifiableIndex(ctx, inputLog, mapFn, outputLog, dir, vindex.Options{
+		PersistIndex: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := vi.Update(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now MPT and OutputLog are in sync at size 1.
+	// Close vi to flush MPT version 1 to disk before backing up.
+	if err := vi.Close(); err != nil {
+		t.Fatal(err)
+	}
+	outputCloser(ctx)
+
+	// Copy MPT files (version 1)
+	backupDir := path.Join(dir, "mpt_backup")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copyFile := func(src, dst string) {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copyFile(path.Join(dir, "mpt.tree1"), path.Join(backupDir, "mpt.tree1"))
+	copyFile(path.Join(dir, "mpt.tree2"), path.Join(backupDir, "mpt.tree2"))
+	copyFile(path.Join(dir, "mpt.disk"), path.Join(backupDir, "mpt.disk"))
+
+	// Reopen with new data to trigger version 2
+	outputLog, outputCloser, err = vindex.NewOutputLog(ctx, outputLogDir, s, v, vindex.OutputLogOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vi, err = vindex.NewVerifiableIndex(ctx, inputLog, mapFn, outputLog, dir, vindex.Options{
+		PersistIndex: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inputLog.Append("bar: 5")
+	if err := vi.Update(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Now MPT and OutputLog are at version 2.
+	if err := vi.Close(); err != nil {
+		t.Fatal(err)
+	}
+	outputCloser(ctx)
+
+	// Simulate crash/revert: restore MPT files from backup (version 1)
+	// Output Log remains at version 2 (with "bar" entry).
+	// MPT is reverted to version 1 (only "foo" entry).
+	copyFile(path.Join(backupDir, "mpt.tree1"), path.Join(dir, "mpt.tree1"))
+	copyFile(path.Join(backupDir, "mpt.tree2"), path.Join(dir, "mpt.tree2"))
+	copyFile(path.Join(backupDir, "mpt.disk"), path.Join(dir, "mpt.disk"))
+
+	// Restart OutputLog and VerifiableIndex
+	outputLog, outputCloser, err = vindex.NewOutputLog(ctx, outputLogDir, s, v, vindex.OutputLogOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { outputCloser(ctx) }()
+
+	// This should trigger recovery and catch up MPT to version 2 (Output Log size)
+	vi, err = vindex.NewVerifiableIndex(ctx, inputLog, mapFn, outputLog, dir, vindex.Options{
+		PersistIndex: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = vi.Close() }()
+
+	// Verify recovery: "bar" lookup should work and be verifiable
+	kh := sha256.Sum256([]byte("bar"))
+	resp, err := vi.Lookup(ctx, kh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indices, _, err := client.VerifyLookupResponse(kh, resp, v, v, "")
+	if err != nil {
+		t.Fatalf("failed to verify vindex response after recovery: %v", err)
+	}
+	if got, want := indices, []uint64{1}; !cmp.Equal(got, want) {
+		t.Errorf("expected %v but got %v", want, got)
+	}
 }

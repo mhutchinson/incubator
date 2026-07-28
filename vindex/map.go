@@ -287,10 +287,69 @@ func NewVerifiableIndex(ctx context.Context, inputLog InputLog, mapFn MapFn, out
 		buildPublishDuration: buildPublishDuration,
 		buildTotalDuration:   buildTotalDuration,
 	}
-	// If we persisted the index then we don't need to rebuild it
-	if err := b.buildMap(ctx, !opts.PersistIndex); err != nil {
-		return nil, fmt.Errorf("failed to build map: %v", err)
+	// Startup Recovery/Sync
+	mptVersionInt, _ := tree.Version()
+	N_mpt := uint64(mptVersionInt)
+	if mptVersionInt < 0 {
+		N_mpt = 0
 	}
+
+	olcp, err := outputLog.Checkpoint(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get output log checkpoint: %v", err)
+	}
+
+	var N_out uint64
+	if len(olcp) > 0 {
+		cp, err := outputLog.Parse(olcp)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse output log checkpoint: %v", err)
+		}
+		if cp.Size > 0 {
+			data, _, err := outputLog.Lookup(ctx, cp.Size-1, cp.Size)
+			if err != nil {
+				return nil, fmt.Errorf("failed to lookup last leaf in output log: %v", err)
+			}
+			_, inCp, err := UnmarshalLeaf(data)
+			if err != nil {
+				return nil, fmt.Errorf("failed to unmarshal output leaf: %v", err)
+			}
+			_, inSize, _, err := checkpointUnsafe(inCp)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse input checkpoint: %v", err)
+			}
+			N_out = inSize
+		}
+	}
+
+	N_wal := size
+
+	if N_mpt > N_out {
+		return nil, fmt.Errorf("MPT version (%d) is ahead of Output Log (%d), database may be corrupted", N_mpt, N_out)
+	}
+
+	if N_mpt < N_out {
+		klog.Infof("Recovering MPT: catching up from %d to %d (output log size)", N_mpt, N_out)
+		// Phase 1: Catch up MPT to N_out, don't publish
+		if err := b.buildMap(ctx, N_out, true, false); err != nil {
+			return nil, fmt.Errorf("failed to recover MPT to output log size: %v", err)
+		}
+		b.confirmedCP = olcp
+	} else {
+		// Phase 1b: Build b.data only, no MPT update, no publish
+		if err := b.buildMap(ctx, N_out, false, false); err != nil {
+			return nil, fmt.Errorf("failed to build initial map: %v", err)
+		}
+		b.confirmedCP = olcp
+	}
+
+	// Phase 2: Catch up to WAL tail (update MPT, publish)
+	if N_wal > N_out {
+		if err := b.buildMap(ctx, N_wal, true, true); err != nil {
+			return nil, fmt.Errorf("failed to catch up to WAL tail: %v", err)
+		}
+	}
+
 	return b, nil
 }
 
@@ -480,9 +539,10 @@ type VerifiableIndex struct {
 	db        *pebble.DB
 	outputLog OutputLog
 
-	indexMu sync.RWMutex // covers vindex and data
-	vindex  mpt.Tree
-	data    map[[sha256.Size]byte][]uint64
+	indexMu     sync.RWMutex // covers vindex, data, and confirmedCP
+	vindex      mpt.Tree
+	data        map[[sha256.Size]byte][]uint64
+	confirmedCP []byte
 
 	buildWalDuration     metric.Float64Histogram
 	buildVIndexDuration  metric.Float64Histogram
@@ -497,19 +557,18 @@ type VerifiableIndex struct {
 
 // Close ensures that any open connections are closed before returning.
 func (b *VerifiableIndex) Close() error {
-	return errors.Join(b.mapper.close(), b.db.Close())
+	return errors.Join(b.mapper.close(), b.db.Close(), b.vindex.Close())
 }
 
 // Lookup returns the values stored for the given key.
 func (b *VerifiableIndex) Lookup(ctx context.Context, key [sha256.Size]byte) (api.LookupResponse, error) {
 	b.indexMu.RLock()
 	defer b.indexMu.RUnlock()
+	olcp := slices.Clone(b.confirmedCP)
 
 	result := api.LookupResponse{}
-
-	olcp, err := b.outputLog.Checkpoint(ctx)
-	if err != nil {
-		return result, err
+	if len(olcp) == 0 {
+		return result, errors.New("map is empty")
 	}
 	result.OutputLogCP = olcp
 	cp, err := b.outputLog.Parse(olcp)
@@ -542,7 +601,7 @@ func (b *VerifiableIndex) Lookup(ctx context.Context, key [sha256.Size]byte) (ap
 	if err != nil {
 		return result, fmt.Errorf("failed to get inclusion proof from vindex: %v", err)
 	}
-	allIndices := b.data[key]
+	allIndices := slices.Clone(b.data[key])
 
 	cutoff := slices.IndexFunc(allIndices, func(idx uint64) bool {
 		return idx >= size
@@ -570,11 +629,11 @@ func (b *VerifiableIndex) Lookup(ctx context.Context, key [sha256.Size]byte) (ap
 		val = sum.Sum(nil)
 	}
 
-	snap := mpt.Snapshot{
+	mptSnap := mpt.Snapshot{
 		Version: int64(size),
 		Hash:    mapRoot,
 	}
-	if err := mpt.Verify(snap, key[:], val, expectFound, viProof); err != nil {
+	if err := mpt.Verify(mptSnap, key[:], val, expectFound, viProof); err != nil {
 		return result, fmt.Errorf("failed to verify proof: %v", err)
 	}
 	result.IndexProof = viProof
@@ -589,54 +648,8 @@ func (b *VerifiableIndex) Update(ctx context.Context) error {
 	if err := b.mapper.syncFromInputLog(ctx); err != nil {
 		return err
 	}
-	return b.buildMap(ctx, true)
-}
-
-// publish creates an outputLog entry with the provisional next VIndex root hash.
-// This returns once it is published, and then the serving state can be updated.
-func (b *VerifiableIndex) publish(ctx context.Context, inCp []byte, hash mpt.Hash) error {
-	startPublish := time.Now()
-	defer func() {
-		b.buildPublishDuration.Record(ctx, time.Since(startPublish).Seconds())
-	}()
-	outIdx, rawCp, err := b.outputLog.Append(ctx, MarshalLeaf(hash, inCp))
-	if err != nil {
-		return fmt.Errorf("failed to append to output log: %v", err)
-	}
-	if klog.V(1).Enabled() {
-		_, inSize, _, err := checkpointUnsafe(inCp)
-		if err != nil {
-			klog.Error(err)
-			return nil
-		}
-		_, outSize, _, err := checkpointUnsafe(rawCp)
-		if err != nil {
-			klog.Error(err)
-			return nil
-		}
-		klog.V(1).Infof("Published checkpoint for input log size %d into output log at index %d, and got checkpoint for output log size %d", inSize, outIdx, outSize)
-	}
-
-	return nil
-}
-
-// buildMap reads from the WAL until the file has been consumed and the map has been
-// built up the provided size.
-// TODO(mhutchinson): tighten the semantics here. What is the provided size?
-// It does double duty: rebuilding the log to a previous size (output log): this doesn't
-// need to update the OL, but normal usage should in the mutex as described below.
-func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error {
-	startWal := time.Now()
-	updatedKeys := make(map[[sha256.Size]byte]struct{}) // Allows us to efficiently update vindex after first init
-
-	// Load the last input log checkpoint we synced to, verified, and flushed the mapped
-	// entries into the WAL.
 	cpRaw, closer, err := b.db.Get([]byte(dbLatestCheckpointKey))
 	if err != nil {
-		if err == pebble.ErrNotFound {
-			// If the key isn't there then nothing to do.
-			return nil
-		}
 		return fmt.Errorf("failed to read latest checkpoint: %v", err)
 	}
 	defer logClose(closer)
@@ -644,8 +657,68 @@ func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error 
 	if err != nil {
 		return fmt.Errorf("failed to parse checkpoint: %v", err)
 	}
+	return b.buildMap(ctx, size, true, true)
+}
 
-	from, to := b.servingSize, size
+// publish creates an outputLog entry with the provisional next VIndex root hash.
+// This returns once it is published, returning the new output log checkpoint.
+func (b *VerifiableIndex) publish(ctx context.Context, inCp []byte, hash mpt.Hash) ([]byte, error) {
+	startPublish := time.Now()
+	defer func() {
+		b.buildPublishDuration.Record(ctx, time.Since(startPublish).Seconds())
+	}()
+	outIdx, rawCp, err := b.outputLog.Append(ctx, MarshalLeaf(hash, inCp))
+	if err != nil {
+		return nil, fmt.Errorf("failed to append to output log: %v", err)
+	}
+	if klog.V(1).Enabled() {
+		_, inSize, _, err := checkpointUnsafe(inCp)
+		if err != nil {
+			klog.Error(err)
+		} else {
+			_, outSize, _, err := checkpointUnsafe(rawCp)
+			if err != nil {
+				klog.Error(err)
+			} else {
+				klog.V(1).Infof("Published checkpoint for input log size %d into output log at index %d, and got checkpoint for output log size %d", inSize, outIdx, outSize)
+			}
+		}
+	}
+
+	return rawCp, nil
+}
+
+// buildMap reads from the WAL until the file has been consumed and the map has been
+// built up the provided size.
+func (b *VerifiableIndex) buildMap(ctx context.Context, to uint64, updateIndex bool, publish bool) error {
+	startWal := time.Now()
+	updatedKeys := make(map[[sha256.Size]byte]struct{}) // Allows us to efficiently update vindex after first init
+
+	mptVersionInt, _ := b.vindex.Version()
+	mptVersion := uint64(mptVersionInt)
+	if mptVersionInt < 0 {
+		mptVersion = 0
+	}
+
+	var cpRaw []byte
+	if publish {
+		var err error
+		var closer io.Closer
+		cpRaw, closer, err = b.db.Get([]byte(dbLatestCheckpointKey))
+		if err != nil {
+			return fmt.Errorf("failed to read latest checkpoint: %v", err)
+		}
+		defer logClose(closer)
+		_, cpSize, _, err := checkpointUnsafe(cpRaw)
+		if err != nil {
+			return fmt.Errorf("failed to parse checkpoint: %v", err)
+		}
+		if cpSize != to {
+			return fmt.Errorf("checkpoint size %d does not match target size %d", cpSize, to)
+		}
+	}
+
+	from := b.servingSize
 	if from == to {
 		klog.V(1).Infof("buildMap [%d, %d): nothing to do", from, to)
 		return nil
@@ -680,7 +753,9 @@ func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error 
 				idxes := b.data[h]
 				idxes = append(idxes, idx)
 				b.data[h] = idxes
-				updatedKeys[h] = struct{}{}
+				if updateIndex && idx >= mptVersion {
+					updatedKeys[h] = struct{}{}
+				}
 			}
 		}()
 	}
@@ -748,15 +823,19 @@ func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error 
 
 	if !updateIndex {
 		// If we're not updating the index, then update the servingSize state and return.
-		b.servingSize = size
+		b.servingSize = to
 		klog.Infof("buildMap [%d, %d): total=%s (wal=%s, vindex=%s) (no update)", from, to, durationTotal, durationWal, durationVIndex)
 		return nil
 	}
 
-	// Publish outside the lock
-	err = b.publish(ctx, cpRaw, predictedHash)
-	if err != nil {
-		return fmt.Errorf("publish(): %w", err)
+	var newCP []byte
+	if publish {
+		// Publish outside the lock
+		var err error
+		newCP, err = b.publish(ctx, cpRaw, predictedHash)
+		if err != nil {
+			return fmt.Errorf("publish(): %w", err)
+		}
 	}
 
 	// Apply changes and update MPT version under lock
@@ -774,10 +853,13 @@ func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error 
 		}
 	}
 
-	if _, err := b.vindex.Snap(int64(size)); err != nil {
+	if _, err := b.vindex.Snap(int64(to)); err != nil {
 		return fmt.Errorf("Snap(): %w", err)
 	}
-	b.servingSize = size
+	b.servingSize = to
+	if publish {
+		b.confirmedCP = newCP
+	}
 
 	b.buildTotalDuration.Record(ctx, time.Since(startWal).Seconds())
 	klog.Infof("buildMap [%d, %d): total=%s (wal=%s, vindex=%s)", from, to, durationTotal, durationWal, durationVIndex)
