@@ -4,8 +4,8 @@ filippo.io/mldsa v0.0.0-20260711112038-ff3f469cee29 h1:11cJmDX5FvZu/znhVjfwxs9jZ
 filippo.io/mldsa v0.0.0-20260711112038-ff3f469cee29/go.mod h1:32qQ5yj3R24Eu03iWFWchdC3OB653wPvoepWejkefbY=
 filippo.io/sunlight v0.9.0 h1:YQnOlIjRuTsXzsXJdm+MMivu6OndV94iq/sMDASOn4k=
 filippo.io/sunlight v0.9.0/go.mod h1:o/a7PJt6Bw0bYhWnZDC8hHAUEQShVxUgsvltrHF/KoQ=
-filippo.io/torchwood v0.9.1-0.20260708154658-e0a6396dd50c h1:t259W9JzlCso86LB0V92ZmRJluFg1wEsiH4OonKAB5U=
-filippo.io/torchwood v0.9.1-0.20260708154658-e0a6396dd50c/go.mod h1:kKEN0olmFcNGfsPWT3M46wig9CUz7/vHIAENPh9pLXc=
+filippo.io/torchwood v0.9.1-0.20260728161618-07e3c0e1ee8b h1:OWrkLnVEaw2VZ+8zB012fHKFCXTk7bt5hfuL/PhIH2s=
+filippo.io/torchwood v0.9.1-0.20260728161618-07e3c0e1ee8b/go.mod h1:u+0A0NvzAChCxKyNkynYfMvIz0BAq9BGz0LyLpBe6SU=
 github.com/DataDog/zstd v1.4.5 h1:EndNeuB0l9syBZhut0wns3gV1hL8zX8LIu6ZiVHWLIQ=
 github.com/DataDog/zstd v1.4.5/go.mod h1:1jcaCB/ufaK+sKp1NBhlGmpz41jOoPQ35bpF36t7BBo=
 github.com/Microsoft/go-winio v0.5.2/go.mod h1:WpS1mjBmmwHBEWmogvA2mj8546UReBk4v8QkMxJ6pZY=
