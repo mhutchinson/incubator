@@ -243,6 +243,9 @@ The server exports metrics via Prometheus on the `/metrics` endpoint.
 Key areas covered by the metrics include:
 - **Map Function Keys**: Tracks the number of keys returned by the `MapFn` for each leaf (`vindex_map_fn_keys`).
 - **Sync Performance**: Histograms tracking the duration of fetching, mapping, and processing leaves during the synchronization phase (under `vindex_sync_*`).
-- **Build Performance**: Histograms tracking the duration of various steps in the build process, including WAL processing, MPT updates, publishing to the Output Log, and total build time (under `vindex_build_*`).
+- **Build Performance**: Histograms tracking the duration of various steps in the build process, including chunk storage writes, MPT updates, publishing to the Output Log, and total build time (under `vindex_build_*`).
+
+> [!NOTE]
+> For the production-ready VIndex v1 architecture with Zero-WAL direct commits, 240k+ leaves/sec throughput, and bundled WASM mapping, see [**`vindex/v1`**](../../v1/README.md) and [**Benchmarks**](../../v1/docs/BENCHMARKS.md).
 
 

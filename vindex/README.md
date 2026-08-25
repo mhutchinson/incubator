@@ -1,6 +1,9 @@
 ## Verifiable Index
 
-Status: Working Prototype of an end-to-end verifiable index for transparency logs. See [Milestones](#milestones) for detailed feature progress.
+> [!IMPORTANT]
+> **Plan of Record (PoR)**: For the production-ready VIndex v1 specification, architecture, benchmarks, and WASM SDK, see [**`vindex/v1`**](./v1/README.md) and [**System Architecture (`vindex/v1/docs/ARCHITECTURE.md`)**](./v1/docs/ARCHITECTURE.md).
+
+Status: Working Prototype and v1 Production Design of an end-to-end verifiable index for transparency logs.
 
 There is a complete solution provided for the [Go Module Proxy (SumDB) log](./cmd/sumdbindex/).
 
@@ -44,7 +47,7 @@ This verifiable map can be applied to any log where users have a need to enumera
 * CT: domain owners wish to query for all certs matching a domain they own
 * [SumDB](./cmd/sumdbindex/): package owners want to find all releases for a package they maintain
 
-Indices exist for both ecosystems at the moment, but they aren’t verifiable.
+Indices exist for both ecosystems at the moment, but they aren’t verifiable. See [**`vindex/v1/docs/APPLICATIONS.md`**](./v1/docs/APPLICATIONS.md) for full ecosystem profiles.
 
 ## Core Idea; TL;DR
 
@@ -54,9 +57,9 @@ The Verifiable Index has 3 data structures involved (and is informally called a 
 2. The _Verifiable Index_ containing pointers back into the _Input Log_
 3. The _Output Log_ that contains a list of all revisions of the map
 
-The Input Log likely aready exists before the Verifiable Index is added, but the Output Log is new, and required in order to make the Verifiable Index historically verifiable.
+The Input Log likely already exists before the Verifiable Index is added, but the Output Log is new, and required in order to make the Verifiable Index historically verifiable.
 For example, in Certificate Transparency, the Input Log could be any one of the CT Logs.
-In order to make certificates in a log be efficiently looked up by domain, an operator can spin up Verifiable Index and a corresponding Output Log.
+In order to make certificates in a log be efficiently looked up by domain, an operator can spin up a Verifiable Index and a corresponding Output Log.
 The Index would map domain names to indices in the Input Log where the cert is for this domain.
 
 > [!TIP]
@@ -69,144 +72,50 @@ The Index would map domain names to indices in the Input Log where the cert is f
 
 ### Constructing
 
-1. Log data is consumed leaf by leaf  
-2. Each log leaf is parsed using a [MapFn](#mapfn-specified-in-universal-language) that specifies all of the keys in the map to which this relates  
-   1. e.g. for CT, this would be all of the domains that relate to a cert.  
-   2. The raw domains are not output, but are hashed. If privacy is important, a VRF could be used here.  
-3. The output from the MapFn stage represents a sequence of update operations to the map  
-   1. This output stream can be serialized for data recovery (see [Write Ahead Map Transaction Log](#write-ahead-map-transaction-log))
-4. The map is computed for these update operations and a root is calculated
-5. The root hash is written as a new leaf into the Output Log, along with the checkpoint from the Input Log that was consumed to create this revision
-6. The Output Log is witnessed, and an Output Log Checkpoint is made available with witness signatures
+1. Log data is consumed tile by tile (256 leaves per entry bundle)
+2. Each tile is parsed using a [`map_bundle`](./v1/mapfn/README.md) WebAssembly function that extracts canonical Claim Subject preimages (e.g., domain names, package paths)
+3. The host computes hardware-accelerated SHA-256 key hashes (`KeyHash = SHA256(preimage)`) using SIMD extensions (x86 SHA-NI / ARM Crypto)
+4. Mapped key entries are streamed directly into Pebble inverted chunk storage records (`'c'`) without intermediate WAL overhead
+5. An in-memory Binary Merkle Patricia Trie (MPT) is updated and the new root hash is written as a leaf into the Tessera Output Log
+6. The Output Log is witnessed, and an Output Log Checkpoint is made available with witness cosignatures
 
-### Reading
+### Reading & Verifying
 
-Users looking up values in the map need to know about the MapFn in order to know what the correct key hash is for, e.g. `maps.google.com`.
-The values returned for a verifiable point lookup under this key would be a list of `uint64` values that represent indices into the log.
-To find the certs for these values, the original log is queried at these indices.
+Given a key to read, a read operation queries `GET /vindex/lookup/{keyhash}`:
+- Returns the latest matching leaf indices and a Merkle prefix compact range
+- Returns an MPT inclusion/non-inclusion proof to `MapRoot`
+- Returns a witnessed Output Log Checkpoint and Output Log inclusion proof
 
-Given a key to read, a read operation needs to return:
- - A witnessed Output Log Checkpoint
- - The latest value in this log, with an inclusion proof to the Output Log Checkpoint
-   - The value in this log commits to the Input Log state, and also contains a Verifiable Index root hash
- - The value at the given key in the Verifiable Index, and an inclusion proof
+Verifying this involves verifying:
+- The Output Log Checkpoint is signed by the Map Operator and sufficient witnesses
+- The inclusion proof in the Output Log ties `MapRoot` to the Output Log Checkpoint
+- The inclusion proof in the MPT ties the index mini-log to `MapRoot`
+- The RFC 6962 Compact Range recalculation matches the mini-log root
 
-Verifying this involves verifying the following chain:
- - The Output Log Checkpoint is signed by the Map Operator, and sufficient witnesses
- - The inclusion proof in the Output Log: this ties the Map Root Hash to the Output Log Checkpoint
- - The inclusion proof in the Verifiable Index: this ties the indices returned to the key and the Map Root Hash
+---
 
-### Verifying
+## Sub-Problems & Architecture Evolutions
 
-The correct construction of the map can be verified by any other party.
-The only requirement is compute resources to be able to build the map, and a clear understanding of the MapFn (hence the importance for this to be universally specified).
-The verifier builds a map at the same size as the verifiable index and if the map checkpoint has the same root hash then both maps are equivalent and the map has been verified for correct construction.
+### Bundled WASM MapFn & Host Hardware Cryptography
 
-## Architecture
+The VIndex v1 Plan of Record (PoR) standardizes on a bundled WebAssembly mapping ABI ([`map_bundle`](./v1/mapfn/README.md)):
+- **Bundled Execution**: Ingests 256-leaf tiles in a single FFI crossing, reducing boundary transitions from 768 to 2–3 per tile (< 1% CPU).
+- **Host Hardware Hashing**: Sandboxed guest modules emit canonical Claim Subject preimages; the Go host computes SHA-256 using native SIMD acceleration (**Intel SHA-NI** or **ARMv8 Crypto**), eliminating the ~55% software crypto bottleneck.
+- **Prefix Extensibility**: Preserving preimages on the host enables future prefix-trie search capabilities without guest ABI changes.
 
-![Architecture Diagram](./vindex-arch.png)
+### Zero-WAL Direct Commit Architecture
 
-## Sub-Problems
+Early prototypes staged records in an intermediate Write-Ahead Log (WAL). Production profiling revealed that double-writing to a WAL caused severe tail latency spikes (up to 1,214 ms) and disk compaction churn. 
 
-### MapFn Specified in Universal Language
+VIndex v1 replaces the WAL with a **Zero-WAL direct commit pipeline**:
+- Inverted chunks (`'c'`) are written directly to Pebble DB with synchronous fsync (`pebble.Sync`).
+- Startup recovery replays un-synced MPT state directly from local verified tile caches (`torchwood.PermanentCache`) with O(1) point seeks (`GetSubRoot`), achieving **2.4 ms warm recovery** and **240,467 leaves/sec** sustained throughput.
+- Cached tiles are pruned behind `SafeWatermark = mptDurableSize` via a background `TileReaper`.
 
-The verifiable index is constructed by taking each leaf in turn from the Input Log.
-Each leaf entry is "mapped" (the terminology is borrowed from [MapReduce](https://en.wikipedia.org/wiki/MapReduce#Map_function)), which outputs all of the locations in the index that this leaf should be found.
-For example, in CT this would take a `[]byte`, parse it as a certificate, and output the domains that this cert covers.
+---
 
-Being able to specify which keys are relevant to any particular entry in the log is critical to allow a verifier to check for correct construction of the map. Ideally this MapFn would be specified in a universal way, to allow the verifier to be running a different technology stack than the core map operator. i.e. having the Go implementation be the specification is undesirable, as it puts a lot of tax on the verifier to reproduce this behaviour identically in another environment.
+## Status & Milestones
 
-The current plan is to use WASM ([go docs](https://go.dev/wiki/WebAssembly)), however other options could be considered (e.g. a formal spec, or a functional language that can be transpiled).
-
-The current implementation in [map.go](./map.go) takes a `MapFn` interface:
-
-```
-// MapFn takes the raw leaf data from a log entry and outputs the SHA256 hashes
-// of the keys at which this leaf should be indexed under.
-// A leaf can be recorded at any number of entries, including no entries (in which case an empty slice must be returned).
-//
-// MapFn is expected to consume any error states that it encounters in some way that
-// makes sense to the particular ecosystem. This might mean outputting any invalid leaves
-// at a known locations (e.g. all 0s), or not outputting any entry. Any panics will cause
-// the mapping process to terminate.
-type MapFn func([]byte) [][sha256.Size]byte
-```
-
-Clients currently pass in implementations purely written in Go, however the [Milestones](#milestones) tracks adding WASM support.
-
-> [!IMPORTANT]
-> This describes the MapFn as returning key hashes.
-> We _may_ want to have the map return the raw key (e.g. `maps.google.com`) so that a prefix trie can be constructed.
-> See https://github.com/transparency-dev/incubator/issues/33 for discussion and to provide feedback.
-
-> [!IMPORTANT]
-> The `MapFn` is fixed for the life of the Verifiable Index.
-> There are strategies that could be employed to allow updates, but these are out of scope for any early drafts.
-
-### Write Ahead Map Transaction Log
-
-Having a compact append-only transaction log allows the map process to restart and pick up from where it last crashed efficiently. It also neatly divides the problem space: before this stage you have downloading logs and applying the MapFn, and after this stage you have the challenges of maintaining an efficient map data structure for updates and reads.
-
-The core idea is to output at most a single record (row) for each entry in the log.
-A valid row has:
- 1. the first token being the log index (string representation of uint64)
- 1. the following (optional) space-separated values being the key hashes under which this index should appear
- 1. a newline terminator
-
-Some use cases may have lots of entries in the log that do not map to any value, and so this supports omitting a log index if it has no updates required in the map.
-However, an empty value can be output as a form of sentinel to provide a milepost on restarts that prevents going back over large numbers of empty entries from the log.
-
-```
-0 HEX_HASH_1 HEX_HASH_2
-2 HEX_HASH_52
-3 HEX_HASH_99
-4
-6 HEX_HASH_2
-```
-
-In the above example, there is no map value for the entries at index 1, 4, or 5 in the log.
-It is undetermined whether index 7+ is present, and thus anyone replaying this log would need to assume that this needs to be recomputed starting from index 7.
-
-### Turning Log into Efficient Map
-
-The [WAL](#write-ahead-map-transaction-log) can be transformed directly into the data structures needed for serving lookups.
-This is implemented using two data structures that are maintained in lockstep:
- - A Verifiable Prefix Trie based on [AKD](https://github.com/facebook/akd): https://github.com/FiloSottile/torchwood/tree/main/mpt; this maintains only the Merkle tree
- - A standard Go map; this stores the actual data, i.e. it maps each key to the list of all relevant indices
-
-Keys in the map are hashes, according to whatever strategy [MapFn](#mapfn-specified-in-universal-language) returns.
-Values are an ordered list of indices.
-
-> [!NOTE]
-> The current mechanism for hashing the list of indices writes all values out as a single block, and hashes this with a single SHA256.
-> An alternative would be to build a Merkle tree of these values.
-> This would be slightly more complex conceptually, but could allow for incremental updating of values, and more proofs.
-
-## Status
-
-Known applications:
-  - [./cmd/sumdbindex/](./cmd/sumdbindex/) contains a binary that builds a verifiable index from the contents of the [Go SumDB](https://sum.golang.org/).
-  - [./cmd/logandmap/](./cmd/logandmap/) contains a demo of running a [tlog-tiles][] log using [Tessera][], and keeping the contents of that log synced to a VIndex
-
-## Milestones
-
-
-|  #  | Step                                                      | Status |
-| :-: | --------------------------------------------------------- | :----: |
-|  1  | Public code base and documentation for prototype          |   ✅   |
-|  2  | Implementation of in-memory Merkle Radix Tree             |   ✅   |
-|  3  | Incremental update                                        |   ✅   |
-|  4  | Verify that mapped data matches Input Log Checkpoint      |   ✅   |
-|  5  | Output log                                                |   ✅   |
-|  6  | Proofs served on Lookup                                   |   ✅   |
-|  7  | Storage backed verifiable-map                             |   ✅   |
-|  8  | MapFn defined in WASM                                     |   ❌   |
-|  9  | Support reading directly from Input Log instead of Clone  |   ✅   |
-|  10 | Example written for indexing SumDB                        |   ✅   |
-|  11 | Example written for hosting a log and VIndex together     |   ✅   |
-|  12 | Example written for indexing CT                           |   ⚠️   |
-|  13 | Replace Merkle Tree with a faster implementation          |   ❌   |
-|  14 | Promote this from the `incubator` repo                    |   ❌   |
-|  N  | Production ready                                          |   ❌   |
+For the latest v1 production roadmap and milestones, refer to the [**VIndex v1 Documentation Index**](./v1/README.md).
 
 
