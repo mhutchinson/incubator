@@ -1,6 +1,6 @@
 # Verifiable Index Applications
 
-This document outlines the various ecosystems and use cases where a [Verifiable Index](./README.md) can be applied to provide efficient, trustless querying over large append-only transparency logs.
+This document outlines the various ecosystems and use cases where a [Verifiable Index](./ARCHITECTURE.md) can be applied to provide efficient, trustless querying over large append-only transparency logs.
 
 ## Certificate Transparency (CT)
 
@@ -8,7 +8,7 @@ In the context of Certificate Transparency, the Verifiable Index (VIndex) addres
 
 ### The Problem
 A domain owner wants to know every certificate issued for their domain to detect unauthorized issuance. Today, they must either:
-1. Download, and process all massive CT logs themselves; OR
+1. Download and process all massive CT logs themselves; OR
 2. Trust a centralized third-party search tool (like `crt.sh`), which could theoretically omit results due to error or malice.
 
 ### The Solution
@@ -51,22 +51,60 @@ The primary mission of a domain monitor is to detect unauthorized certificates *
 * **Deployment Path**: Which deployment model (CA-integrated vs. Mirror-operated) will be widely adopted by the ecosystem?
 * **VIndex Lifecycle & Size Management**: If primary logs grow infinitely but prune older certificates, how should an unbounded VIndex be managed?
   * Should the VIndex be periodically rolled over (creating temporal epochs)?
-  * Can individual sub-logs within the VIndex be safely pruned over time to reclaim storage? (See [VIndex Pruning & Storage Reclamation](./README.md#vindex-pruning--storage-reclamation))
+  * Can individual sub-logs within the VIndex be safely pruned over time to reclaim storage? (See [VIndex Pruning & Storage Reclamation](./ARCHITECTURE.md#vindex-pruning--storage-reclamation))
 
 ---
 
 ## Go Software Supply Chain (SumDB)
 
-*To be documented.*
+The Go Module Database (`sum.golang.org`) records hashes for all released Go module versions.
+* **The Problem**: A package maintainer or security scanner wanting to verify or audit all published versions of a specific module path (e.g. `github.com/gin-gonic/gin`) must scan tens of millions of records or trust third-party mirrors.
+* **The VIndex Solution**:
+  * **Input Log**: Go SumDB tile log.
+  * **MapFn**: Parses SumDB leaf lines (`<module> <version> <hash>`) and maps the module path string to the leaf index.
+  * **Guarantees**: Verifiers query a module path and receive all historical version publications with a tamper-proof cryptographic proof binding the list to the SumDB checkpoint.
 
 ---
 
 ## Sigstore
 
-*To be documented.*
+Sigstore provides public transparency logging for software signatures, attestations, and provenance records (via Rekor).
+* **The Problem**: Software consumers want to verify all signatures associated with a developer's identity (OIDC email), a specific artifact digest, or a Git commit hash without scraping the full Rekor log.
+* **The VIndex Solution**:
+  * **Input Log**: Rekor transparency log.
+  * **MapFn**: Parses entry payloads (hashedrekord, intoto attestations) to index artifact SHA-256 hashes and signer identities.
+  * **Guarantees**: Provides instant, verifiable lookup of all signatures ever published for a specific artifact digest or identity.
 
 ---
 
 ## Sigsum
 
-*To be documented.*
+Sigsum is a minimal, non-general-purpose transparency log for SSH key signatures and small commitments.
+* **The Problem**: Clients need to verify that a specific key has signed specific submissions without traversing the full Sigsum log.
+* **The VIndex Solution**:
+  * **Input Log**: Sigsum log tiles.
+  * **MapFn**: Indexes submitter public key hashes to leaf indices.
+  * **Guarantees**: O(1) verifiable discovery of all submissions signed by a specific public key.
+
+---
+
+## Claim Subject Maps & Pre-Image Canonicalization
+
+In terms of the [Claimant Model](https://github.com/google/trillian/blob/master/docs/claimantmodel/Maps.md), VIndex operates as a **Claim Subject Map (CSM)** or **Map of Logs (Mog)** over an append-only log. The keys in VIndex are **Claim Subjects** (the specific entities a claim or log entry is about, such as a domain name, module path, or artifact hash), and the value at each key is a mini-log of leaf pointers.
+
+### The Role of Discoverability
+The core security property of a Claim Subject Map is **Discoverability**: a verifier must be able to discover all claims regarding a Claim Subject without having to scan the entire underlying log.
+
+Discoverability requires that the mapping from a real-world entity to its map key is **unambiguous and deterministically agreed upon** by both the indexer (`MapFn`) and the verifier. Because VIndex endpoints and MPT commitments operate over 32-byte SHA-256 hashes (`KeyHash = SHA256(canonicalSubjectBytes)`), if canonicalization rules diverge, claims become undiscoverable to verifiers (resulting in false non-inclusion proofs).
+
+### Recommended Canonicalization Guidelines
+
+While specific ecosystems define their own domain-specific identity representations, index operators and client SDKs should adhere to the following recommended canonicalization profiles:
+
+| Application | Claim Subject Type | Recommended Canonicalization Profile | KeyHash Formula |
+| :--- | :--- | :--- | :--- |
+| **CT & MTC** | Domain Name | 1. Strip trailing dot (`.`): `example.com.` -> `example.com`<br>2. ASCII Case Folding: `strings.ToLower(domain)`<br>3. Internationalized Domain Names (IDN): Convert Unicode to ASCII Punycode via IDNA2008 / UTS #46 before hashing (`bücher.example` -> `xn--bcher-kva.example`) | `SHA256(canonical_domain_ascii_bytes)` |
+| **Go SumDB** | Go Module Path | Canonical Go module path casing; apply standard Go toolchain module path escaping (`golang.org/x/mod/module.EscapePath` or UTF-8 lowercase path) | `SHA256(canonical_module_path_bytes)` |
+| **Sigstore** | Artifact Digest | Format as lowercase hex string prefixed with algorithm name: `sha256:<64_hex_digits>` | `SHA256("sha256:" + lowercase_hex)` |
+| **Sigstore** | Signer Identity | Lowercase, whitespace-trimmed OIDC email or URI string | `SHA256(canonical_identity_bytes)` |
+| **Sigsum** | Ed25519 Key | Raw 32-byte public key or raw ASCII hex string | `SHA256(raw_pubkey_bytes)` |
