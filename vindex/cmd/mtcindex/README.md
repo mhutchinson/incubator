@@ -3,7 +3,7 @@
 `mtcindex` is a verifiable indexer for Merkle Tree Certificates (MTC) logs. It processes leaf entries from an MTC log, parses the certificates, and indexes them by domain name in a verifiable map. This allows users to query for all certificates associated with a domain verifiably and efficiently, without downloading the entire log.
 
 For details on the Merkle Tree Certificates specification, see the [MTC Draft](https://datatracker.ietf.org/doc/draft-davidben-tls-merkle-tree-certs/).
-For details on the Verifiable Index architecture (the "Map Sandwich"), see the [root VIndex README](../../README.md).
+For details on the Verifiable Index architecture (the "Map Sandwich"), see the [root VIndex README](../../README.md) and [VIndex v1 PoR Documentation](../../v1/README.md).
 
 ## How it works
 

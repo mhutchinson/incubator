@@ -28,11 +28,10 @@ go run ./vindex/cmd/ct \
 Running this demo has the following estimated system requirements (based on indexing ~180M certs from a staging log):
 *   **Architecture:** **64-bit OS** (Linux/Unix). The MPT library reserves a large virtual address space (16 TB) and cannot run on 32-bit systems.
 *   **RAM:** **32 GB+** (observed ~31 GB physical RAM usage). The current prototype stores the key-value index in a raw Go map in memory.
-*   **CPU:** **8+ cores** (actively utilizes ~6 cores during ingestion).
-*   **Disk:** **100 GB+ SSD** (uses ~45 GB for WAL and MPT files, fast I/O is required).
+*   **Disk:** **100 GB+ SSD** (uses fast local NVMe storage for Pebble inverted chunks, tile cache, and MPT files).
 
 > [!NOTE]
-> The high memory usage is a limitation of the current prototype's in-memory key-value store. The planned [v1 architecture](../../docs/v1/IMPLEMENTATION.md) will move this store to a disk-backed Pebble database, which is expected to drastically reduce RAM requirements to approximately 6-8 GB.
+> For the production-ready VIndex v1 architecture with Zero-WAL direct commits and bundled WASM mapping, see [**`vindex/v1`**](../../v1/README.md).
 
 Running the above will run a web server hosting the following URLs:
  - `/vindex/lookup` - the provisional [vindex lookup API](./api/api.go)
