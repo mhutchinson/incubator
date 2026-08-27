@@ -63,6 +63,7 @@ var (
 	inputOverrideUrl = flag.String("input_override_url", "", "Set this to read from a different URL than the local proxy. Supports file paths. Intended for performance testing. Note this log MUST be presented as tlog-tiles format.")
 	chunkSize        = flag.Uint64("chunk_size", 65536, "Logical chunk size for inverted index.")
 	pollInterval     = flag.Duration("poll_interval", 10*time.Second, "Polling interval for input log updates.")
+	enableUI         = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
 )
 
 func main() {
@@ -133,6 +134,7 @@ func run(ctx context.Context) error {
 	})
 
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
+	readSrv.SetEnableUI(*enableUI)
 	mux := http.NewServeMux()
 	readSrv.RegisterRoutes(mux)
 	mux.Handle("/inputlog/", sumProxy)

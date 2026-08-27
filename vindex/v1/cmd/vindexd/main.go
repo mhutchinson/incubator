@@ -62,6 +62,7 @@ var (
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
+	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
 )
 
 func main() {
@@ -196,6 +197,7 @@ func run(ctx context.Context) error {
 
 	// 6. Start Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
+	readSrv.SetEnableUI(*enableUI)
 	readMux := http.NewServeMux()
 	readSrv.RegisterRoutes(readMux)
 	httpServer := &http.Server{
