@@ -22,11 +22,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"github.com/tetratelabs/wazero/sys"
 )
 
 var (
@@ -74,7 +78,9 @@ func NewWASMHost(ctx context.Context, wasmBytes []byte, poolSize int) (*WASMHost
 		poolSize = 1
 	}
 
-	r := wazero.NewRuntime(ctx)
+	r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithMemoryLimitPages(1024).WithCloseOnContextDone(true))
+	wasi_snapshot_preview1.MustInstantiate(ctx, r)
+
 	compiled, err := r.CompileModule(ctx, wasmBytes)
 	if err != nil {
 		_ = r.Close(ctx)
