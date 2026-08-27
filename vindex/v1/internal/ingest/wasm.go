@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -73,9 +74,13 @@ type wasmInstance struct {
 }
 
 // NewWASMHost compiles the guest bytecode and initializes a pool of instantiated WASM modules.
+// If poolSize <= 0, it defaults to runtime.GOMAXPROCS(0) - 1 (minimum 1).
 func NewWASMHost(ctx context.Context, wasmBytes []byte, poolSize int) (*WASMHost, error) {
 	if poolSize <= 0 {
-		poolSize = 1
+		poolSize = runtime.GOMAXPROCS(0) - 1
+		if poolSize < 1 {
+			poolSize = 1
+		}
 	}
 
 	r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithMemoryLimitPages(1024).WithCloseOnContextDone(true))

@@ -73,3 +73,13 @@ func TestMapSumDBLeaf_EmptyOrMalformed(t *testing.T) {
 		}
 	}
 }
+
+func BenchmarkMapSumDBLeaf(b *testing.B) {
+	leaf := []byte("golang.org/x/mod v0.40.0 h1:testHash123=\ngolang.org/x/mod v0.40.0/go.mod h1:testHash456=\n")
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = MapSumDBLeaf(leaf)
+	}
+}

@@ -25,6 +25,7 @@ import (
 	"math/bits"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sync"
 	"time"
 
@@ -50,6 +51,7 @@ type Config struct {
 	TileCacheDir       string
 	ChunkSize          uint64
 	BundleSize         uint64
+	Workers            int
 	PollInterval       time.Duration
 	InputLogURL        string
 	InputLogOrigin     string
@@ -63,9 +65,14 @@ type Config struct {
 
 // DefaultConfig returns standard default configuration values.
 func DefaultConfig() Config {
+	workers := runtime.GOMAXPROCS(0) - 1
+	if workers < 1 {
+		workers = 1
+	}
 	return Config{
 		ChunkSize:    kvstore.ChunkSize,
 		BundleSize:   ingest.DefaultBundleSize,
+		Workers:      workers,
 		PollInterval: 10 * time.Second,
 	}
 }
@@ -128,6 +135,12 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 	}
 	if cfg.BundleSize == 0 {
 		cfg.BundleSize = ingest.DefaultBundleSize
+	}
+	if cfg.Workers <= 0 {
+		cfg.Workers = runtime.GOMAXPROCS(0) - 1
+		if cfg.Workers < 1 {
+			cfg.Workers = 1
+		}
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 10 * time.Second
@@ -219,7 +232,7 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 	// 8. Initialize Ingestion Pipeline
 	var pipeline *ingest.IngestionPipeline
 	if fetcher != nil && mapper != nil {
-		pipeline = ingest.NewPipeline(fetcher, cache, mapper, 0)
+		pipeline = ingest.NewPipeline(fetcher, cache, mapper, cfg.Workers)
 	}
 
 	// 9. Initialize Coordinator

@@ -33,11 +33,19 @@ func init() {
 
 // MapSumDBLeaf parses a Go SumDB log leaf, filtering pseudo-versions and returning canonical module path hashes.
 func MapSumDBLeaf(data []byte) [][sha256.Size]byte {
-	var results [][sha256.Size]byte
-	seen := make(map[[sha256.Size]byte]struct{})
+	var results [8][sha256.Size]byte
+	n := 0
 
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
+	for len(data) > 0 {
+		var line []byte
+		idx := bytes.IndexByte(data, '\n')
+		if idx >= 0 {
+			line = data[:idx]
+			data = data[idx+1:]
+		} else {
+			line = data
+			data = nil
+		}
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
@@ -70,11 +78,18 @@ func MapSumDBLeaf(data []byte) [][sha256.Size]byte {
 		}
 
 		h := sha256.Sum256(modPath)
-		if _, exists := seen[h]; !exists {
-			seen[h] = struct{}{}
-			results = append(results, h)
+		duplicate := false
+		for i := 0; i < n; i++ {
+			if results[i] == h {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && n < len(results) {
+			results[n] = h
+			n++
 		}
 	}
 
-	return results
+	return results[:n]
 }
