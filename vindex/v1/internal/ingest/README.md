@@ -19,18 +19,6 @@ The **Ingestion Pipeline** (`vindex/v1/internal/ingest`) is responsible for stre
 - **No Cross-Leaf State Retention**: `MapFn` is strictly stateless across invocations. No mutable state persists inside guest modules between leaves.
 - **No Direct Storage Mutation**: Ingestion has zero dependencies on Pebble DB, MPT, or Output Log schemas; it strictly outputs monotonically ordered `MappedBatch` channels.
 
-### 1.3 Alternatives Considered
-
-- **Input Log Ingestion & Tile Authentication**:
-  - **Option A (Selected) - `filippo.io/torchwood`**: End-to-end cryptographic tile and leaf Merkle tree authentication against target checkpoint root (`tree.Hash`), built-in `torchwood.PermanentCache` for Zero-WAL startup recovery, origin signature and witness policy validation (`torchwood.VerifyCheckpoint`), and modular format adapters (`WithTilePath`, `WithCutEntry`).
-  - **Option B (Rejected) - Raw / Custom Tile Fetching**: Lacks standardized tile Merkle proof verification; custom cryptographic validation is error-prone and adds unneeded maintenance overhead.
-- **Mapping Execution Engine**:
-  - **Option A (Selected) - Wazero WebAssembly Sandboxes**: Hermetic, deterministic execution across heterogeneous host platforms, hardware memory boundary enforcement, zero cgo overhead, strict CPU/memory isolation.
-  - **Option B (Rejected) - Go Plugins (`plugin.Open`)**: Requires exact compiler/dependency matching, unsafe (unbounded memory access can corrupt host state or crash process), non-deterministic host behavior can break consensus.
-- **Ingestion Batch Granularity**:
-  - **Option A (Selected) - Native 256-Leaf Entry Bundles**: Aligns with Tessera's physical storage layout, fetching full tiles in single I/O operations without unbundling overhead.
-  - **Option B (Rejected) - Leaf-by-Leaf Streaming**: Massive HTTP request amplification and high CPU serialization overhead.
-
 ---
 
 ## 2. Architecture & Pipeline Topology
@@ -75,16 +63,7 @@ The Ingestion Pipeline is structured as a 3-stage asynchronous pipeline with Go 
 
 ---
 
-## 3. Package API & Responsibilities
-
-### Responsibilities
-- **Input Log Authentication & Validation**: Validating checkpoint origin signatures, enforcing witness policy quorums via `torchwood.VerifyCheckpoint(raw, policy)`, and authenticating tree tiles and leaf hashes against `tree.Hash`.
-- **Authenticated Entry Bundle Acquisition**: Streaming authenticated entry tiles via `torchwood.Client.Entries(ctx, tree, start)`, verifying Level-0 tile hashes against `tlog.RecordHash(leaf)`, and caching verified non-partial tiles via `torchwood.PermanentCache`.
-- **Format Adaptation**: Adapting log layouts (`tlog-tiles`, `static-ct`, `sumdb`) via `torchwood.WithTilePath` and `torchwood.WithCutEntry`.
-- **WASM Map Sandbox Management**: Spooling a pool of isolated Wazero runtime instances executing `map_leaf(ptr, len)`.
-- **Key Hash Extraction & Deduplication**: Parsing leaves into 32-byte SHA-256 search key hashes, sorting lexicographically, and deduplicating per leaf.
-- **Monotonic Resequencing**: Buffering unordered mapped batches in a min-heap priority queue to deliver gapless, strictly ascending batches downstream.
-- **Tile Cache Garbage Collection (`TileReaper`)**: Pruning cached tiles whose upper bound is below the safe watermark `SafeWatermark = mptDurableSize`. Note: `TileReaper` runs concurrently in the background with `SafeWatermark = mptDurableSize` initialized to `S_OUT` via `mptMgr.Sync()` upon startup recovery completion.
+## 3. Package API & Go Interfaces
 
 ### Go Interfaces & Types
 
@@ -165,11 +144,11 @@ func (p *Pipeline) Close() error
 
 ---
 
-## 4. 3-Stage Pipeline Design
+## 4. 3-Stage Pipeline Execution Mechanics
 
-### Stage 1: TileFetcher & Cache
+### 4.1 Stage 1: TileFetcher & Cache
 - **Workload Profile**: I/O bound (network latency or local disk reads).
-- **Concurrency**: Configurable pool of 32–128 concurrent fetch workers.
+- **Concurrency Budget**: Configurable pool of 32–128 concurrent fetch workers.
 - **Checkpoint Origin Signature & Witness Policy**:
   - Validates checkpoint note authenticity via `torchwood.VerifyCheckpoint(raw, policy)`.
   - Enforces mandatory verification of the log origin signature against trusted public keys before accepting any checkpoint.
@@ -183,39 +162,62 @@ func (p *Pipeline) Close() error
   - Acts as the immutable log of record powering Zero-WAL startup recovery without network egress.
 - **Format Adapters**:
   - Configures log format path conventions via `torchwood.WithTilePath` and entry boundary slicing via `torchwood.WithCutEntry` for standard formats (`tlog-tiles`, `static-ct`, and `sumdb`).
-- **Batching**: Authenticated raw leaves are unpacked into `LeafBundle` slices of exactly 256 contiguous leaves, stamped with `BundleIdx = StartLeafIdx / 256`.
+- **Batching Transformation**: Authenticated raw leaves are unpacked into `LeafBundle` slices of exactly 256 contiguous leaves, stamped with `BundleIdx = StartLeafIdx / 256`.
 
-### Stage 2: MapWorkerPool & WASM Sandbox
+### 4.2 Stage 2: MapWorkerPool & WASM Sandbox
 - **Workload Profile**: CPU bound (WebAssembly execution, parsing, cryptographic hashing).
-- **Specification**: Complete ABI, memory protocol, and SDK specification detailed in [**WASM MapFn Plugin SDK & Host Runtime**](../../mapfn/README.md).
-- **CPU Partitioning**: Strictly sized to max(1, GOMAXPROCS - 1) workers. 1 dedicated CPU core is reserved for Pebble chunk writes (`KVIndexer`), MPT root publishing (`OutputPublisher`), and live read queries.
-- **WASM Guest ABI & Memory Contract**:
-  - **Export**: `map_leaf(leaf_ptr: uint32, leaf_len: uint32) -> (out_ptr: uint32, out_len: uint32)` (packed 64-bit integer `(uint64(out_ptr) << 32) | uint64(out_len)`).
-  - **Input**: Host writes raw leaf bytes to guest memory starting at `leaf_ptr` allocated via `allocate(size)`.
-  - **Output**: Contiguous array of 32-byte SHA-256 key hashes `[]Hash(MapKey)`. `out_len` MUST be an exact multiple of 32 bytes (`out_len % 32 == 0`).
-  - **Validation**: Host asserts `out_len % 32 == 0` and `[out_ptr .. out_ptr+out_len)` is within guest memory.
-  - **Host Post-Processing**: Hashes are sorted via `bytes.Compare` and deduplicated with `slices.Compact` to guarantee strictly unique keys per leaf.
-  - **Deterministic Error Policy (`HALT`)**: Any guest panic, memory violation, or trap immediately halts the daemon to prevent unverified witness state divergence.
+- **Host CPU Partitioning**: Strictly sized to `max(1, GOMAXPROCS - 1)` workers. 1 dedicated CPU core is reserved for Pebble chunk writes (`KVIndexer`), MPT root publishing (`OutputPublisher`), and live read queries.
+- **WASM Guest ABI & Runtime Delegation**: Low-level WebAssembly guest ABI exports (`map_leaf`, `allocate`, `deallocate`), linear memory layouts, memory safety bounds, and SDK bindings are fully detailed in [**WASM MapFn Plugin SDK & Host Runtime**](../../mapfn/README.md).
+- **Host Execution & Deduplication Mechanics**:
+  - Host allocates a guest memory buffer via `allocate(size)`, writes raw leaf bytes, and invokes `map_leaf(ptr, len)`.
+  - Host verifies return values: asserts output length is a multiple of 32 bytes (`out_len % 32 == 0`) and memory range `[out_ptr .. out_ptr+out_len)` falls strictly within guest memory boundaries.
+  - Host extracts 32-byte SHA-256 key hashes, sorts them lexicographically via `bytes.Compare`, and deduplicates using `slices.Compact` to guarantee strictly unique keys per leaf before constructing `MappedBatch`.
+- **Deterministic Error Policy (`HALT`)**: Any guest panic, linear memory violation, or execution timeout (e.g. 100ms per-leaf deadline) triggers an immediate daemon `HALT` to prevent unverified witness state divergence.
 
-### Stage 3: Resequencer & Output Channel
+### 4.3 Stage 3: Resequencer & Output Channel
 - **Mechanism**: In-memory priority min-heap indexed by `BundleIdx`.
 - **Serialization Guarantee**: While map workers execute concurrently in parallel across multiple cores, the `Resequencer` re-serializes completed batches into strictly ascending chronological order (`nextBatch.StartLeafIdx == expectedStartLeafIdx`) before passing them downstream to the KV committer.
-- **Implementation Note (Backpressure)**: To keep heap memory bounded when parallel worker runtimes vary, the pipeline applies upstream backpressure via a bounded lookahead window (e.g. max 128 bundles) to pause tile dispatching if a single worker straggles. Downstream channel buffers also backpressure Stage 3 during disk I/O commit pauses.
+- **Backpressure Mechanism**: To keep heap memory bounded when parallel worker runtimes vary, the pipeline applies upstream backpressure via a bounded lookahead window (e.g. max 128 bundles) to pause tile dispatching if a single worker straggles. Downstream channel buffers also backpressure Stage 3 during disk I/O commit pauses.
 
-### Note: Pluggable Adaptive Transport (Non-Load-Bearing)
+### 4.4 Pluggable Adaptive Transport (Non-Load-Bearing)
 For aggressive initial catch-up against rate-limited CDNs, `TileFetcher` can optionally accept a custom `http.RoundTripper` (via `http.Client.Transport`) implementing global token bucket rate-limiting or AIMD adaptive concurrency. This sits entirely at the HTTP transport layer and is orthogonal to the pipeline invariants.
 
 ---
 
 ## 5. Tile Boundary Alignment & Checkpoint Clamping
 
-### Invariant
+### 5.1 Invariant
 > Ingestion batch sizes, cache bundle capacities (`bundleSz`), and logical chunk rollover thresholds (`chunkSize`) MUST be integer multiples of the Tessera entry bundle width (256).
 
 > **Performance Note**: While parallel map workers process at 256-leaf tile granularity, the Coordinator aggregates mapped batches to `DefaultCommitBatchSize = 4096` (16 tiles) before committing to Pebble, amortizing iterator creation and lock acquisition overhead by 16x.
 
 - **Tessera Alignment**: Tessera entry bundles store entries in blocks of 256 (2^8). When batch boundaries align with `256 * k` (k=1 for `LeafBundle`, k=256 for 65,536-leaf Pebble chunks), every fetch spans an exact integer range of entry bundles `[S/256 .. E/256)`, eliminating partial bundle fetches and redundant network requests.
-- **Unaligned Target Checkpoints**:
+
+### 5.2 Checkpoint Clamping Diagram (Non-Aligned Target Sizes)
+
+When an upstream target checkpoint has a non-aligned size (e.g. `targetSize = 500`), the ingestion pipeline fetches full 256-leaf entry bundles but clamps leaf processing at the exact target boundary:
+
+```text
+Target Checkpoint Size: 500 Leaves
+Tile Capacity (bundleSz): 256 Leaves
+
+Entry Tile 0 (BundleIdx 0): [0 .. 255] (Full Tile: 256 Leaves)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Leaves 0 .............................................................. 255 │
+└─────────────────────────────────────────────────────────────────────────────┘
+▲                                                                             ▲
+startLeafIdx = 0                                                endLeafIdx = 256
+
+Entry Tile 1 (BundleIdx 1): [256 .. 499] (Clamped Tile: 244 Leaves)
+┌───────────────────────────────────────────────────────────┬─────────────────┐
+│ Leaves 256 .......................................... 499 │ 500...511 (Skip)│
+└───────────────────────────────────────────────────────────┴─────────────────┘
+▲                                                           ▲
+startLeafIdx = 256                                          targetSize = 500
+                                                            count = min(256, 500 - 256) = 244
+```
+
+- **Unaligned Target Checkpoints Mechanics**:
   1. **Clamping**: The final bundle in a target batch is clamped to the exact checkpoint size `targetCP.Size` (`count = min(bundleSz, targetSize - currIdx)`).
   2. **KV Metadata**: `KVIndexer` commits `m_kv_size` to the exact non-aligned checkpoint size upon completing a target batch.
   3. **Conservative Retention**: `TileReaper` only prunes tiles whose full range `(tileIdx + 1) * 256 <= SafeWatermark`.
@@ -292,4 +294,18 @@ SafeWatermark = mptDurableSize
 - `vindex_ingest_map_worker_duration_seconds` (Histogram): Per-leaf execution time within WASM runtime.
 - `vindex_ingest_wasm_memory_allocated_bytes` (Gauge): Memory consumed by Wazero instances.
 - `vindex_ingest_tile_reaper_deleted_tiles_total` (Counter): Cumulative tiles pruned.
+
+---
+
+## 10. Design Rationale & Alternatives Considered
+
+- **Input Log Ingestion & Tile Authentication**:
+  - **Option A (Selected) - `filippo.io/torchwood`**: End-to-end cryptographic tile and leaf Merkle tree authentication against target checkpoint root (`tree.Hash`), built-in `torchwood.PermanentCache` for Zero-WAL startup recovery, origin signature and witness policy validation (`torchwood.VerifyCheckpoint`), and modular format adapters (`WithTilePath`, `WithCutEntry`).
+  - **Option B (Rejected) - Raw / Custom Tile Fetching**: Lacks standardized tile Merkle proof verification; custom cryptographic validation is error-prone and adds unneeded maintenance overhead.
+- **Mapping Execution Engine**:
+  - **Option A (Selected) - Wazero WebAssembly Sandboxes**: Hermetic, deterministic execution across heterogeneous host platforms, hardware memory boundary enforcement, zero cgo overhead, strict CPU/memory isolation.
+  - **Option B (Rejected) - Go Plugins (`plugin.Open`)**: Requires exact compiler/dependency matching, unsafe (unbounded memory access can corrupt host state or crash process), non-deterministic host behavior can break consensus.
+- **Ingestion Batch Granularity**:
+  - **Option A (Selected) - Native 256-Leaf Entry Bundles**: Aligns with Tessera's physical storage layout, fetching full tiles in single I/O operations without unbundling overhead.
+  - **Option B (Rejected) - Leaf-by-Leaf Streaming**: Massive HTTP request amplification and high CPU serialization overhead.
 

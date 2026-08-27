@@ -15,21 +15,6 @@ The **Read Server Subsystem** (`vindex/v1/internal/server`) serves verifiable in
 - **No Identity Auth / ACLs**: Serves public cryptographic proofs openly over HTTP. Client authentication, authorization, and per-tenant rate-limiting are out of scope (delegated to edge reverse proxies if required).
 - **No Plaintext String Lookups**: Serves lookups exclusively by exact 32-byte hex key hashes (`/vindex/lookup/{hash}`). Pre-image hashing (e.g. domain names or certificate fingerprints) is performed client-side.
 
-### 1.3 Alternatives Considered
-- **Paging Model & Traversal Direction**:
-  - **Selected - Backward Paging (`before=X&limit=M`)**:
-    - **Merkle Log Prefix Property**: Merkle tree compact ranges natively commit to a contiguous prefix of history (`0 .. K-1`). Returning the latest tail entries alongside a single `prefix-compact-range-v1` allows O(log N) cryptographic verification of all prior history in a single response, without requiring complex arbitrary suffix/middle sub-tree proofs.
-    - **Access Pattern & Recency Bias**: Transparency log auditing is heavily biased toward the most recent entries (new certificates, latest package releases, fresh signatures). Earlier entries are typically stale, superseded, or already observed by recurring index auditors. Backward paging delivers the freshest data on Page 1 immediately.
-    - **Storage & Traversal Alignment**: Inverted chunk storage (`'c' + KeyHash + ^chunkNum`) naturally positions the active, newest chunk first, enabling O(1) seek and chronological reverse traversal.
-  - **Rejected - Forward Paging (`start=X&limit=M`)**: Forward paging would require either returning unverified future state, maintaining complex arbitrary suffix sub-tree proofs, or forcing clients to traverse millions of historical entries to reach the latest state.
-- **Wire Protocol & Framing**:
-  - **Selected - C2SP Multi-Section text/plain Framing**: Standardized in transparency ecosystem (signed-note, tlog-checkpoint), human-readable, curl-friendly, zero Base64 JSON overhead, simple line-scanner parsing.
-  - **Rejected - REST / JSON**: Unnecessary serialization overhead, Base64 bloat on binary hashes and cryptographic proofs, lacks native C2SP log format alignment.
-  - **Rejected - gRPC / Protobuf**: Requires compiled client SDKs, incompatible with lightweight curl-based inspection and transparent web auditing.
-- **Sub-Log Merkle Proof Construction**:
-  - **Selected - On-the-Fly Compact Range Accumulation**: Reconstructs `prefix-compact-range-v1` dynamically from 64K chunk boundaries during storage lookup. Keeps storage compact without writing internal Merkle node records.
-  - **Rejected - Storing Full Merkle Trees per Key in Storage**: Incurs > 4x storage amplification to persist all intermediate Merkle tree branch hashes.
-
 ---
 
 ## 2. Package API & Responsibilities
@@ -124,9 +109,9 @@ func (v *ClientVerifier) VerifyResponse(ctx context.Context, keyHash [sha256.Siz
 
 ## 4. `tlog-vindex` C2SP Wire Protocol Specification
 
-### 1. Protocol Conventions
+### 4.1 Protocol Conventions
 - **Content-Type**: `text/plain; charset=utf-8`.
-- **Framing**: Sections delimited by `— <section-name>[ <arguments>] —` (Unicode U+2014 or ASCII `---`).
+- **Framing**: Sections delimited by `— <section-name>[ <arguments>] —` (Unicode U+2014 em dash or ASCII `---`).
 - **Section Order**:
   1. `— vindex/v1 —` (Mandatory)
   2. `— output-log-leaf-v1 <leaf_index> —` (Mandatory)
@@ -135,9 +120,31 @@ func (v *ClientVerifier) VerifyResponse(ctx context.Context, keyHash [sha256.Siz
   5. `— prefix-compact-range-v1 <covered_size> —` (Optional, present when earlier occurrences exist prior to this page)
   6. `— indices-v1 [next_before] —` (Mandatory)
 
+### 4.2 Section Grammar Table
+
+The following table formally defines the grammar, argument parameters, optionality, line positions, and data types for all 6 wire sections:
+
+| Section Header | Header Arguments | Optionality | Line / Field | Field Name | Type / Encoding | Description & Validation Rules |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `— vindex/v1 —` | *None* | **Mandatory** | Line 1 | `OutputLogOrigin` | `string` (UTF-8) | Output Log checkpoint origin ID (e.g. `example.com/vindex/output`). |
+| | | | Line 2 | `OutputLogTreeSize` | `uint64` (decimal ASCII) | Output Log tree size committed at time of query serving snapshot. |
+| | | | Line 3 | `OutputLogRootHash` | `[32]byte` (RFC 4648 Base64) | Merkle tree root hash of the Output Log at `OutputLogTreeSize`. |
+| | | | Line 4 | `Separator` | `\n` (blank line) | Signed-note header separator dividing body from witness signatures. |
+| | | | Line 5+ | `WitnessSignatures` | `string` (`— <origin> <sig>`) | One or more signed-note witness cosignatures verifying Lines 1–3. |
+| `— output-log-leaf-v1 <leaf_index> —` | `<leaf_index>` (`uint64` decimal) | **Mandatory** | Line 1 | `MapRoot` | `[32]byte` (64-char lowercase hex) | Binary Merkle Patricia Trie root hash committed at this Output Log leaf. |
+| | | | Line 2 | `InputLogOrigin` | `string` (UTF-8) | Input Log origin ID embedded in the state commitment. |
+| | | | Line 3 | `InputLogSize` | `uint64` (decimal ASCII) | Watermark Input Log tree size indexed by `MapRoot`. |
+| | | | Line 4 | `InputLogRootHash` | `[32]byte` (RFC 4648 Base64) | Merkle tree root hash of the Input Log at `InputLogSize`. |
+| | | | Line 5 | `Separator` | `\n` (blank line) | Signed-note separator dividing Input Log checkpoint from signatures. |
+| | | | Line 6+ | `InputLogSignatures` | `string` (`— <origin> <sig>`) | One or more Input Log witness cosignatures. |
+| `— output-log-proof-v1 —` | *None* | **Mandatory** | Lines 1..K | `AuditPathHashes` | `[32]byte` (RFC 4648 Base64, 1/line) | RFC 6962 Merkle audit path proving `leaf_index` in Output Log. Empty (0 lines) if `OutputLogTreeSize == 1`. |
+| `— mpt-proof-v1 <proof_type> —` | `<proof_type>` (`inclusion` \| `non-inclusion`) | **Mandatory** | Line 1 | `SerializedMPTProof` | `bytes` (RFC 4648 Base64) | Serialized MPT proof. If `inclusion`, proves `KeyHash -> MiniLogRoot` against `MapRoot`. If `non-inclusion`, proves key absence. |
+| `— prefix-compact-range-v1 <covered_size> —` | `<covered_size>` (`uint64` decimal) | **Optional** (present when `covered_size > 0`) | Lines 1..M | `CompactRangeHashes` | `[32]byte` (RFC 4648 Base64, 1/line) | RFC 6962 compact range hashes committing to the cumulative sub-log prefix `0 .. covered_size-1`. |
+| `— indices-v1 [next_before] —` | `[next_before]` (`uint64` decimal, optional) | **Mandatory** | Lines 1..N | `MatchedIndices` | `uint64` (decimal ASCII, 1/line) | Monotonically ascending Input Log leaf indices (`idx_0 < idx_1 < ...`). Empty if non-inclusion or no entries in window. |
+
 ---
 
-## 5. Protocol Examples
+## 5. Wire Protocol Examples & Cryptographic Annotations
 
 ### Example 1: Tip Query (Page 1 with `next_before`)
 `GET /vindex/lookup/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855?limit=3`
@@ -175,6 +182,16 @@ y1A3C5E7G9I1K3M5O7Q9S1U3W5Y7a9c1e3g5i7k9m1o=
 98412
 ```
 
+#### Cryptographic Guarantee Breakdown (Example 1):
+- **`— vindex/v1 —` (Section '— vindex/v1 —')**: Standard C2SP signed note checkpoint. Proves that Output Log root `qU/V...` at tree size 100 has been publicly witnessed and signed by `example.com/witness/alpha`.
+- **`— output-log-leaf-v1 99 —` (Section '— output-log-leaf-v1 —')**: Output Log leaf payload at index 99. Authenticates the `MapRoot` (`7f83b165...`) and binds it cryptographically to the Input Log checkpoint (`example.com/inputlog` at watermark size 500,000, root `fN7y3K...`, witnessed by `example.com/inputlog/witness`).
+- **`— output-log-proof-v1 —` (Section '— output-log-proof-v1 —')**: RFC 6962 audit path hashes. Proves mathematically that leaf 99 is included within the witnessed Output Log root at size 100.
+- **`— mpt-proof-v1 inclusion —` (Section '— mpt-proof-v1 —')**: Sparse binary Merkle Patricia Trie proof. Proves that `keyhash` exists in `MapRoot` and commits to `MiniLogRoot`.
+- **`— prefix-compact-range-v1 48190 —` (Section '— prefix-compact-range-v1 —')**: RFC 6962 compact range hashes committing to the cumulative sub-log prefix of the earlier 48,190 occurrences (`0 .. 48189`).
+- **`— indices-v1 48190 —` (Section '— indices-v1 —')**: Returns the newest 3 matched Input Log leaf indices [48190, 51200, 98412]. When client initializes a compact range with the prefix hashes and appends `LeafHash(48190)`, `LeafHash(51200)`, and `LeafHash(98412)`, the computed root matches `MiniLogRoot`. The header argument `48190` signals that more historical records exist and provides the cursor for the next query (`before=48190`).
+
+---
+
 ### Example 2: Backward Continuation Query (Page 2 reaching beginning)
 `GET /vindex/lookup/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855?before=48190&limit=3`
 
@@ -206,6 +223,13 @@ BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7
 2095
 ```
 
+#### Cryptographic Guarantee Breakdown (Example 2):
+- **Omission of `prefix-compact-range-v1`**: Because this continuation page encompasses the earliest occurrences of `keyhash` in the log (indices 104 and 2095), `covered_size == 0` and no earlier prefix exists.
+- **`— indices-v1 —` (Section '— indices-v1 —')**: Header lacks a `next_before` argument, signaling that the beginning of the index history (genesis) has been reached.
+- **Inductive Verification**: The client appends `LeafHash(104)` and `LeafHash(2095)` to an empty compact range. The resulting range state matches the target `prefix-compact-range-v1 48190` cached from Page 1, proving complete historical continuity without gap or omission.
+
+---
+
 ### Example 3: Non-Inclusion Query (Key never appeared in log)
 `GET /vindex/lookup/0000000000000000000000000000000000000000000000000000000000000000`
 
@@ -234,6 +258,12 @@ CAkK
 
 — indices-v1 —
 ```
+
+#### Cryptographic Guarantee Breakdown (Example 3):
+- **`— mpt-proof-v1 non-inclusion —` (Section '— mpt-proof-v1 —')**: Contains an MPT proof demonstrating that the queried 32-byte hash `0000...00` falls on an empty trie branch or intermediate prefix boundary in `MapRoot`.
+- **`— indices-v1 —` (Section '— indices-v1 —')**: Empty index list. The client confirms non-inclusion by asserting that the non-inclusion proof verifies against `MapRoot` and `indices-v1` contains 0 entries.
+
+---
 
 ### Example 4: Paginated Query Prior to Oldest Occurrence (`before <= min_index`)
 `GET /vindex/lookup/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855?before=100&limit=100`
@@ -270,31 +300,82 @@ BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7
 
 ## 6. Client Verification Specification
 
+The client verification protocol executes across two distinct tiers: **Tier 1 (Page 1 / Tip Verification)** anchoring the query directly against the signed Output Log checkpoint, and **Tier 2 (Continuation Page Verification)** chaining backward inductively against previous prefix compact ranges.
+
+### 6.1 Two-Tier Verification Flowchart
+
 ```text
-[1. Parse Sections & Verify Output Log Checkpoint (vindex/v1)]
-                      │
-                      ▼
-[2. Verify Output Log Inclusion (output-log-leaf-v1 + output-log-proof-v1)]
-                      │
-                      ├──────────────────────────┐
-                      ▼                          ▼
-               Extract MapRoot           Extract InputLogSize
-                      │                          │
-                      ▼                          ▼
-       [3. Inspect mpt-proof-v1 Type]   [Filter returned indices]
-       ├── non-inclusion:                         │
-       │   Verify MPT Non-Inclusion               │
-       │   Assert indices-v1 is empty (Stop)      │
-       └── inclusion:                             │
-           Verify MPT Inclusion Proof             ▼
-           Extract MiniLogRoot        [4. Accumulate CompactRange]
-                      │              (prefix-compact-range-v1 + LeafHash(idx))
-                      │                          │
-                      └──────────┬───────────────┘
-                                 ▼
-                     [5. Assert Equality]
-                     MiniLogRoot == CompactRange.Root
+================================================================================
+TIER 1: PAGE 1 (TIP) VERIFICATION (before == nil)
+================================================================================
+
+[Wire Response: Page 1]
+         │
+         ▼
+[1. Verify Output Log Checkpoint (vindex/v1)] ──► Validates Output Log Root
+         │
+         ▼
+[2. Verify Output Log Leaf (output-log-leaf-v1 + output-log-proof-v1)]
+         │
+         ├────────────────────────────────────────┬────────────────────────┐
+         ▼                                        ▼                        ▼
+  Extract MapRoot                       Extract InputLogSize       Extract InputLog Root
+         │                                        │                        │
+         ▼                                        ▼                        ▼
+[3. Verify mpt-proof-v1 against MapRoot]   [Assert indices < InputLogSize]  [Verify Input Log CP]
+         │
+         ├────────────────────────────────────────┐
+         │ (if non-inclusion)                     │ (if inclusion)
+         ▼                                        ▼
+   [Assert indices-v1 is empty]             Extract MiniLogRoot
+   [Verification Complete: KEY ABSENT]            │
+                                                  ▼
+                                           [4. Init CompactRange from prefix-compact-range-v1 (size: covered_size)]
+                                                  │
+                                                  ▼
+                                           [5. Append LeafHash(idx) for idx in indices-v1]
+                                                  │
+                                                  ▼
+                                           [6. Assert CompactRange.Root() == MiniLogRoot]
+                                                  │
+                                                  ▼
+                                           [7. Cache prefix-compact-range-v1 as Target for Continuation]
+                                                  │
+                                                  ▼
+                                           [Verification Complete: PAGE 1 VALID]
+
+
+================================================================================
+TIER 2: CONTINUATION PAGE VERIFICATION (before == X, inductive step)
+================================================================================
+
+[Wire Response: Continuation Page (before=X)]
+         │
+         ▼
+[1. Parse Continuation Page Sections]
+         │
+         ├─────────────────────────────────────────────────────────────────┐
+         ▼                                                                 ▼
+[Validate indices-v1 < before & strictly ascending]               [Extract covered_size from header]
+         │                                                                 │
+         └────────────────────────────────┬────────────────────────────────┘
+                                          ▼
+                   [2. Init fresh CompactRange from continuation prefix-compact-range-v1]
+                                          │
+                                          ▼
+                   [3. Append LeafHash(idx) for idx in continuation indices-v1]
+                                          │
+                                          ▼
+                   [4. Assert resulting CompactRange == Cached previous_prefix_compact_range]
+                                          │
+                                          ▼
+                   [5. Update Cached Target = continuation prefix-compact-range-v1]
+                                          │
+                                          ▼
+                   [Repeat until covered_size == 0 (Genesis reached)]
 ```
+
+### 6.2 Step-by-Step Verification Protocol
 
 1. **Parse Response Sections**: Parse sections delimited by `— <section-name> [args] —`.
 2. **Output Log Checkpoint Verification (`vindex/v1`)**: Validate witness signatures on signed note.
@@ -329,7 +410,24 @@ BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7
 
 ---
 
-## 8. Operational Health Probes & Subsystem Metrics
+## 8. Alternatives Considered
+
+For comprehensive discussion of architectural trade-offs across storage engines, commit pipelines, and trie structures, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-architectural-decisions--alternatives-considered).
+
+- **Paging Model & Traversal Direction**:
+  - **Selected - Backward Paging (`before=X&limit=M`)**: Merkle tree compact ranges natively commit to a contiguous prefix of history (`0 .. K-1`). Returning the latest tail entries alongside a single `prefix-compact-range-v1` allows O(log N) cryptographic verification of all prior history in a single response. Traversal naturally aligns with inverted chunk storage (`'c' + KeyHash + ^chunkNum`). For detailed rationale, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-architectural-decisions--alternatives-considered).
+  - **Rejected - Forward Paging (`start=X&limit=M`)**: Requires either returning unverified future state, maintaining complex arbitrary suffix sub-tree proofs, or forcing clients to traverse millions of historical entries to reach the latest state.
+- **Wire Protocol & Framing**:
+  - **Selected - C2SP Multi-Section text/plain Framing**: Standardized in transparency ecosystem (signed-note, tlog-checkpoint), human-readable, curl-friendly, zero Base64 JSON overhead, simple line-scanner parsing.
+  - **Rejected - REST / JSON**: Unnecessary serialization overhead, Base64 bloat on binary hashes and cryptographic proofs, lacks native C2SP log format alignment.
+  - **Rejected - gRPC / Protobuf**: Requires compiled client SDKs, incompatible with lightweight curl-based inspection and transparent web auditing.
+- **Sub-Log Merkle Proof Construction**:
+  - **Selected - On-the-Fly Compact Range Accumulation**: Reconstructs `prefix-compact-range-v1` dynamically from 64K chunk boundaries during storage lookup. Keeps storage compact without writing internal Merkle node records.
+  - **Rejected - Storing Full Merkle Trees per Key in Storage**: Incurs > 4x storage amplification to persist all intermediate Merkle tree branch hashes.
+
+---
+
+## 9. Operational Health Probes & Subsystem Metrics
 
 ### Operational Probes
 - `GET /healthz`: Process liveness (HTTP 200).
@@ -344,9 +442,8 @@ BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7
 
 ---
 
-## 9. Conformance Testing & Wire Verification
+## 10. Conformance Testing & Wire Verification
 
 - **Golden File Test Fixtures**: Validating responses against golden file test cases for all 3 scenarios (Page 1 with `next_before`, Continuation with prefix compact range, Non-Inclusion).
 - **ClientVerifier Tamper Suite**: Testing `ClientVerifier` against corrupted MPT proofs, altered indices, forged witness signatures, and mismatched mini-log roots to assert 100% rejection.
 - **HTTP Endpoint Fuzzing**: Fuzzing query parameters (`before`, `limit`) and hex hash formats.
-

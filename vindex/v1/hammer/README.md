@@ -4,6 +4,10 @@
 
 The **VIndex Hammer (`vindex-hammer`)** is a dedicated integration testbed, load generator, and cryptographic invariant verifier designed to simulate high-throughput transparency log ecosystems, stress test the VIndex daemon (`vindexd`), and actively detect state divergence, data loss, and race conditions under sustained concurrent load.
 
+`vindex-hammer` operates as an independent external process that bounds `vindexd` in a controlled "Map Sandwich" test harness:
+1. **Upstream Input Log**: Hosts a local POSIX `tlog-tiles` Input Log with an automated sequencer and drip-feed proxy.
+2. **Downstream Verifier**: Emits continuous concurrent query workloads against `vindexd`'s HTTP Read API and cryptographically validates all returned proofs against the witnessed Output Log checkpoints.
+
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            vindex-hammer Process                            │
@@ -37,28 +41,21 @@ The **VIndex Hammer (`vindex-hammer`)** is a dedicated integration testbed, load
 
 ---
 
-## 2. Architecture & Design
+## 2. Core Components
 
-`vindex-hammer` operates as an independent external process that bounds `vindexd` in a controlled "Map Sandwich" test harness:
-
-1. **Upstream Input Log**: Hosts a local POSIX `tlog-tiles` Input Log with an automated sequencer and drip-feed proxy.
-2. **Downstream Verifier**: Emits continuous concurrent query workloads against `vindexd`'s HTTP Read API and cryptographically validates all returned proofs against the witnessed Output Log checkpoints.
-
----
-
-## 3. Core Components
-
-### 3.1 Synthetic Leaf Generator (`vindex/v1/hammer/generator.go`)
+### 2.1 Synthetic Leaf Generator (`vindex/v1/hammer/generator.go`)
 
 Generates structured synthetic entries mimicking transparency log workloads (such as Go SumDB records: `<module> <version> h1:<hash>`):
 
-- **Key Distributions**:
-  - **Zipfian / Pareto (alpha > 1)**: Simulates realistic package ecosystem traffic where 1% of modules (e.g. `golang.org/x/sys`, `github.com/gin-gonic/gin`) account for >80% of log entries, repeatedly rolling over 64k index chunks.
+- **Key Distributions & Stress Points**:
+  - **Zipfian / Pareto (`alpha > 1`, `--zipf_s=1.2`)**: Simulates realistic package ecosystem traffic where 1% of hot keys account for >80% of log entries. Zipfian skew specifically stresses:
+    - **`kvstore` 64K Chunk Rollover (`^chunkNum`)**: As hot keys accumulate tens of thousands of occurrences, `kvstore` repeatedly crosses 65,536-index boundaries, forcing chunk finalization (`^0`), next chunk allocation (`^1`), SSTable flushes, and prefix compact range updates. The hammer verifies that multi-chunk reverse scans reconstruct complete sub-log histories without data loss.
+    - **MPT Split-Locking & Branch Mutations**: High-frequency updates to identical key prefixes stress binary MPT path compression, branch splitting, and root ratcheting (`mptMgr.mu.RLock()` / `mpt.Predict`), asserting zero trie corruption, race conditions, or lock contention against concurrent read queries.
   - **Uniform**: Distributes keys evenly across a bounded keyspace `[0, K)` to test wide MPT fanout and prefix Bloom filter lookups.
   - **Non-Inclusion Keys**: Keys generated with a distinct prefix (`nonexistent/<id>`) that are never submitted to the Input Log, exercising MPT non-inclusion proof generation and client verification.
 - **Deterministic Key Naming**: Each key index `k` maps to `module-<k>`, enabling predictable querying and reproducible test runs from a single PRNG seed.
 
-### 3.2 Tessera Sequencer (`vindex/v1/hammer/sequencer.go`)
+### 2.2 Tessera Sequencer (`vindex/v1/hammer/sequencer.go`)
 
 Manages a real Tessera POSIX append-only log:
 
@@ -68,7 +65,7 @@ Manages a real Tessera POSIX append-only log:
 - Appends generated leaves at a rate controlled by a token-bucket rate limiter (`--write_rate`).
 - As newly published checkpoints are confirmed by the awaiter, enqueues them into a thread-safe `CheckpointQueue`.
 
-### 3.3 Drip-Feed Server (`vindex/v1/hammer/server.go`)
+### 2.3 Drip-Feed Server (`vindex/v1/hammer/server.go`)
 
 An HTTP server presenting the local POSIX log as a standard `tlog-tiles` Input Log to `vindexd`:
 
@@ -79,7 +76,7 @@ An HTTP server presenting the local POSIX log as a standard `tlog-tiles` Input L
   - **Burst Mode**: Holds queued checkpoints and releases batches of size B (`--burst_size`) every interval, simulating upstream batching.
   - **Pause Mode**: Pauses checkpoint release for a given duration to allow `vindexd` to idle, followed by a large catchup burst to test ingestion recovery.
 
-### 3.4 Verifying Concurrent Readers (`vindex/v1/hammer/reader.go`)
+### 2.4 Verifying Concurrent Readers (`vindex/v1/hammer/reader.go`)
 
 A pool of concurrent worker goroutines querying `vindexd` using `vindex/v1/client.Client` / `server.ClientVerifier`:
 
@@ -97,7 +94,7 @@ A pool of concurrent worker goroutines querying `vindexd` using `vindex/v1/clien
   - Maintains a concurrent history map `KeyHash -> (lastInputLogSize, []uint64)`.
   - Asserts that for any subsequent lookup at S_new >= S_old, the returned index set I_new is a superset of I_old and the common prefix is identical (`I_new[:len(I_old)] == I_old`).
 
-### 3.5 Real-Time Metrics Analyzer (`vindex/v1/hammer/analyzer.go`)
+### 2.5 Real-Time Metrics Analyzer & Terminal Dashboard (`vindex/v1/hammer/analyzer.go`)
 
 Aggregates operational metrics across all generator and reader workers:
 
@@ -110,11 +107,44 @@ Aggregates operational metrics across all generator and reader workers:
   - `CryptoProofFailures`: MPT, Merkle tree, or signature invalid.
   - `BoundsViolations`: Index >= `InputLogSize` or < 0.
   - `NonInclusionViolations`: Non-empty index list for non-existent key.
-- **Live Terminal Dashboard**: Renders unpadded, structured ANSI status updates every second.
+- **Live Terminal Dashboard**: Renders unpadded, structured ANSI status updates every second:
+
+```text
+================================================================================
+                       VINDEX HAMMER LIVE STATUS DASHBOARD
+================================================================================
+Elapsed Time:     00:02:45                  Target URL:     http://localhost:8080
+Run Status:       RUNNING                   Storage Dir:    /tmp/hammer_posix
+Key Distribution: ZIPF (s=1.20, N=50000)    Reader Workers: 16
+--------------------------------------------------------------------------------
+INGESTION & SEQUENCER PIPELINE
+--------------------------------------------------------------------------------
+Sequencer Size:      2,450,120 leaves       Write Rate:     1,004.2 leaves/sec
+Checkpoints Emitted: 4,900 CP               Drip Mode:      STEADY (2.0 CP/sec)
+vindexd InputLogSize: 2,448,500 leaves      Ingestion Lag:  1,620 leaves (1.6s)
+Output Log Size:     4,897 CP               Lag Status:     HEALTHY
+--------------------------------------------------------------------------------
+READER QUERY WORKLOAD & LATENCY
+--------------------------------------------------------------------------------
+Total Queries:       82,450                 Read Rate:      498.7 QPS
+Successful Queries:  82,450 (100.0%)        Failed Queries: 0 (0.0%)
+Workload Mix:        60% Hot | 25% Uniform | 10% Non-Inc | 5% Paginated
+
+Latency (HDR):       P50: 1.2ms   P90: 2.8ms   P99: 5.4ms   Max: 12.1ms
+--------------------------------------------------------------------------------
+CRYPTOGRAPHIC & SYSTEM INVARIANT AUDIT
+--------------------------------------------------------------------------------
+[PASS] MonotonicityViolations:      0 (0.00%)  — Index subsets strictly monotonic
+[PASS] CryptoProofFailures:         0 (0.00%)  — MPT & Output Log roots verified
+[PASS] BoundsViolations:            0 (0.00%)  — Indices strictly < InputLogSize
+[PASS] NonInclusionViolations:      0 (0.00%)  — Non-existent keys returned empty
+[PASS] MiniLogEqualityFailures:     0 (0.00%)  — Compact ranges equal trie values
+================================================================================
+```
 
 ---
 
-## 4. Invariant Checklist
+## 3. Invariant Checklist
 
 | Invariant | Description | Failure Impact |
 | :--- | :--- | :--- |
@@ -126,7 +156,7 @@ Aggregates operational metrics across all generator and reader workers:
 
 ---
 
-## 5. CLI Usage & Flags
+## 4. CLI Usage & Flags
 
 ```bash
 # Build the hammer

@@ -43,7 +43,7 @@ The **WASM MapFn Plugin SDK & Host Runtime** (`vindex/v1/mapfn`) defines the san
    - **Zero Host Clocks**: System time returns a deterministic constant (e.g. Unix epoch 0); no access to monotonic or real-time clocks.
    - **Zero Host RNG**: Random sources return deterministic pseudorandom or zeroed bytes.
 3. **Stateless Invocations**: `MapFn` is pure and stateless. No mutable state persists inside guest modules across consecutive leaves.
-4. **Key-Only Indexing & Claim Subjects**: VIndex v1 indexes 32-byte cryptographic hashes of **Claim Subjects** (`KeyHash = SHA256(CanonicalSubjectBytes)`). Values are not stored in the index; clients resolve full payloads by querying the Input Log at the returned leaf index. Host runtime performs no schema guessing or dynamic type reflection. To guarantee discoverability, guest modules and client verifiers should adhere to consistent canonicalization rules (case folding, Punycode, trailing dot stripping) as discussed in [APPLICATIONS.md](../docs/APPLICATIONS.md#claim-subject-maps--pre-image-canonicalization).
+4. **Key-Only Indexing & Claim Subjects**: VIndex v1 indexes 32-byte cryptographic hashes of **Claim Subjects** (`KeyHash = SHA256(CanonicalSubjectBytes)`). Values are not stored in the index; clients resolve full payloads by querying the Input Log at the returned leaf index. Host runtime performs no schema guessing or dynamic type reflection. To guarantee discoverability, guest modules and client verifiers should adhere to consistent domain-specific canonicalization rules (case folding, Punycode, trailing dot stripping) as specified in [APPLICATIONS.md](../docs/APPLICATIONS.md#claim-subject-maps--pre-image-canonicalization) and [Claim Subject Maps](../docs/APPLICATIONS.md#recommended-canonicalization-guidelines).
 
 ### 1.2 Non-Requirements & Out of Scope
 
@@ -55,7 +55,9 @@ The **WASM MapFn Plugin SDK & Host Runtime** (`vindex/v1/mapfn`) defines the san
 
 ## 2. WASM ABI & Memory Management Protocol
 
-The WASM ABI defines the low-level calling convention and memory layout between the Go host and guest plugins.
+Mathematically, a Map Function is a pure, deterministic function `f(leaf_bytes) -> []KeyHash`, mapping an arbitrary byte slice `leaf_bytes` (such as an X.509 certificate, package record, or checkpoint) to a sequence of 32-byte cryptographic hashes `[]KeyHash`, where each `KeyHash = SHA256(canonical_subject)`. `MapFn` contains zero side effects, accesses no external state, and satisfies referential transparency: for any input `b`, `f(b)` is invariant across time, platform, and runtime execution.
+
+The WASM ABI defines the low-level calling convention, 64-bit register bit packing, and memory layout between the Go host and guest plugins.
 
 ### 2.1 Exported Function Signatures
 
@@ -225,6 +227,10 @@ import (
 	"unsafe"
 )
 
+// ============================================================================
+// 1. WASM ABI & Memory Management Boilerplate
+// ============================================================================
+
 var (
 	inputBuf  [65536]byte
 	outputBuf [8192]byte
@@ -242,7 +248,7 @@ func allocate(size uint32) uint32 {
 func mapLeaf(ptr, length uint32) uint64 {
 	data := inputBuf[:length]
 	
-	// Example: Extract subject domain or package name
+	// Delegate to domain-specific key extraction logic
 	keys := extractSearchKeys(data)
 	if len(keys) == 0 {
 		return 0
@@ -269,6 +275,18 @@ func main() {
 	// Block main to maintain wasip1 reactor lifecycle
 	select {}
 }
+
+// ============================================================================
+// 2. Custom Key Extraction Business Logic
+// ============================================================================
+
+// extractSearchKeys parses domain-specific payload bytes and extracts canonical search keys.
+// Adhere to canonicalization rules defined in docs/APPLICATIONS.md.
+func extractSearchKeys(data []byte) []string {
+	// Example: Extract subject domain name, package path, or artifact digest
+	// Return canonicalized string identifiers to be hashed as SHA256(canonical_subject)
+	return []string{string(data)}
+}
 ```
 
 Compilation:
@@ -280,6 +298,75 @@ GOOS=wasip1 GOARCH=wasm go build -o mapfn.wasm main.go
 
 TinyGo generates ultra-compact WASM binaries (< 50 KB) with minimal startup latency:
 
+```go
+//go:build tinygo
+
+package main
+
+import (
+	"crypto/sha256"
+	"unsafe"
+)
+
+// ============================================================================
+// 1. WASM ABI & Memory Management Boilerplate
+// ============================================================================
+
+var (
+	inputBuf  [65536]byte
+	outputBuf [8192]byte
+)
+
+//export allocate
+func allocate(size uint32) uint32 {
+	if int(size) > len(inputBuf) {
+		return 0
+	}
+	return uint32(uintptr(unsafe.Pointer(&inputBuf[0])))
+}
+
+//export map_leaf
+func mapLeaf(ptr, length uint32) uint64 {
+	data := inputBuf[:length]
+	
+	// Delegate to domain-specific key extraction logic
+	keys := extractSearchKeys(data)
+	if len(keys) == 0 {
+		return 0
+	}
+
+	outPtr := uint32(uintptr(unsafe.Pointer(&outputBuf[0])))
+	var outOffset int
+
+	for _, k := range keys {
+		h := sha256.Sum256([]byte(k))
+		copy(outputBuf[outOffset:outOffset+32], h[:])
+		outOffset += 32
+	}
+
+	return (uint64(outPtr) << 32) | uint64(outOffset)
+}
+
+//export reset
+func reset() {
+	// Zero scratch state if needed
+}
+
+func main() {}
+
+// ============================================================================
+// 2. Custom Key Extraction Business Logic
+// ============================================================================
+
+// extractSearchKeys parses domain-specific payload bytes and extracts canonical search keys.
+// Adhere to canonicalization rules defined in docs/APPLICATIONS.md.
+func extractSearchKeys(data []byte) []string {
+	// Example: Extract subject domain name, package path, or artifact digest
+	return []string{string(data)}
+}
+```
+
+Compilation:
 ```bash
 tinygo build -o mapfn.wasm -target=wasi -no-debug -opt=2 main.go
 ```
@@ -289,6 +376,10 @@ tinygo build -o mapfn.wasm -target=wasi -no-debug -opt=2 main.go
 ```rust
 use std::slice;
 use sha2::{Sha256, Digest};
+
+// ============================================================================
+// 1. WASM ABI & Memory Management Boilerplate
+// ============================================================================
 
 static mut INPUT_BUF: [u8; 65536] = [0; 65536];
 static mut OUTPUT_BUF: [u8; 8192] = [0; 8192];
@@ -305,7 +396,8 @@ pub extern "C" fn allocate(size: u32) -> u32 {
 pub extern "C" fn map_leaf(ptr: u32, len: u32) -> u64 {
     let input = unsafe { slice::from_raw_parts(ptr as *const u8, len as usize) };
     
-    let keys = parse_keys(input);
+    // Delegate to domain-specific key extraction logic
+    let keys = extract_search_keys(input);
     if keys.is_empty() {
         return 0;
     }
@@ -325,7 +417,24 @@ pub extern "C" fn map_leaf(ptr: u32, len: u32) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn reset() {}
+pub extern "C" fn reset() {
+    // Clear scratch arenas if needed
+}
+
+// ============================================================================
+// 2. Custom Key Extraction Business Logic
+// ============================================================================
+
+/// extract_search_keys parses domain-specific payload bytes and extracts canonical search keys.
+/// Adhere to canonicalization rules defined in docs/APPLICATIONS.md.
+fn extract_search_keys(data: &[u8]) -> Vec<String> {
+    // Example: Parse X.509 certificate, package record, or provenance payload
+    // Return canonicalized string identifiers to be hashed as SHA256(canonical_subject)
+    match std::str::from_utf8(data) {
+        Ok(s) => vec![s.to_string()],
+        Err(_) => vec![],
+    }
+}
 ```
 
 Compilation:
