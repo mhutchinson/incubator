@@ -153,6 +153,74 @@ func (p *OutputPublisher) PublishBatch(ctx context.Context, modifiedSubRoots map
 	return newState, nil
 }
 
+// PublishDirect publishes a pre-snapped MPT mapRoot to the Output Log and promotes serving state.
+// Used during initial / genesis ingestion where mutations were applied directly via SetBatch.
+func (p *OutputPublisher) PublishDirect(ctx context.Context, mapRoot [sha256.Size]byte, inputLogCP *log.Checkpoint, rawInputLogCP []byte) (*ServingState, error) {
+	if inputLogCP == nil && len(rawInputLogCP) > 0 {
+		parsed, err := ParseCheckpointHeader(rawInputLogCP)
+		if err == nil {
+			inputLogCP = parsed
+		}
+	}
+	var inputLogSize uint64
+	if inputLogCP != nil {
+		inputLogSize = inputLogCP.Size
+	}
+
+	// 1. Format StateCommitment: hex(MapRoot) + "\n" + rawInputLogCP + "\n"
+	hexRoot := hex.EncodeToString(mapRoot[:])
+	trimmedInCP := bytes.TrimRight(rawInputLogCP, "\n")
+	leafData := []byte(hexRoot + "\n" + string(trimmedInCP) + "\n")
+
+	// 2. Append to Output Log
+	leafIdx, rawCP, err := p.outputLog.Append(ctx, leafData)
+	if err != nil {
+		return nil, fmt.Errorf("outputLog.Append failed: %w", err)
+	}
+	metrics.OutputTreeSize.Set(float64(leafIdx + 1))
+
+	// 3. Submit to remote witnesses if configured
+	if p.witness != nil {
+		witStart := time.Now()
+		witnessedCP, err := p.witness.Witness(ctx, rawCP)
+		metrics.WitnessWaitSeconds.Observe(time.Since(witStart).Seconds())
+		if err != nil {
+			metrics.WitnessErrorsTotal.Inc()
+			return nil, fmt.Errorf("witness failed: %w", err)
+		}
+		if len(witnessedCP) > 0 {
+			rawCP = witnessedCP
+		}
+	}
+
+	// 4. Parse Output Log checkpoint
+	outCP, err := ParseCheckpointHeader(rawCP)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse output log checkpoint: %w", err)
+	}
+
+	// 5. Fetch inclusion proof for Output Log leaf
+	proof, err := p.outputLog.InclusionProof(ctx, leafIdx, outCP.Size)
+	if err != nil {
+		return nil, fmt.Errorf("outputLog.InclusionProof failed: %w", err)
+	}
+
+	// 6. Construct and store new ServingState
+	newState := &ServingState{
+		OutputLogIndex: leafIdx,
+		OutputLogSize:  outCP.Size,
+		OutputLogCP:    outCP,
+		RawCheckpoint:  rawCP,
+		OutputLogProof: proof,
+		InputLogCP:     inputLogCP,
+		RawInputLogCP:  rawInputLogCP,
+		InputLogSize:   inputLogSize,
+		MapRoot:        mapRoot,
+	}
+	p.SetServingState(newState)
+	return newState, nil
+}
+
 func countWitnessSignatures(rawCP []byte) int {
 	if len(rawCP) == 0 {
 		return 0

@@ -170,3 +170,57 @@ func TestPublishBatch_RootPredictionMismatch_Panics(t *testing.T) {
 	_, _ = pub.PublishBatch(ctx, subRoots, inputCP, rawInputCP)
 }
 
+func TestPublisher_PublishDirect(t *testing.T) {
+	ctx := context.Background()
+	mptMgr := NewMem()
+	outLog := newMockOutputLog("example.com/outputlog")
+	wit := &mockWitness{witnessName: "witness.example.com"}
+
+	pub := NewOutputPublisher(nil, mptMgr, outLog, wit)
+
+	key1 := sha256.Sum256([]byte("key1"))
+	val1 := sha256.Sum256([]byte("val1"))
+	subRoots := map[[32]byte][32]byte{key1: val1}
+
+	// Apply mutations directly via SetBatch and Snap
+	if err := mptMgr.SetBatch(subRoots); err != nil {
+		t.Fatalf("SetBatch failed: %v", err)
+	}
+	mapRoot, err := mptMgr.Snap(500)
+	if err != nil {
+		t.Fatalf("Snap failed: %v", err)
+	}
+
+	rawInputCP := []byte("example.com/inputlog\n500\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	inputCP := &log.Checkpoint{
+		Origin: "example.com/inputlog",
+		Size:   500,
+		Hash:   make([]byte, 32),
+	}
+
+	state, err := pub.PublishDirect(ctx, mapRoot, inputCP, rawInputCP)
+	if err != nil {
+		t.Fatalf("PublishDirect failed: %v", err)
+	}
+
+	if state.InputLogSize != 500 {
+		t.Errorf("state.InputLogSize = %d, want 500", state.InputLogSize)
+	}
+	if state.MapRoot != mapRoot {
+		t.Errorf("state.MapRoot = %x, want %x", state.MapRoot, mapRoot)
+	}
+	if state.OutputLogSize != 1 {
+		t.Errorf("state.OutputLogSize = %d, want 1", state.OutputLogSize)
+	}
+
+	// Verify serving state was promoted
+	activeState := pub.GetServingState()
+	if activeState == nil {
+		t.Fatal("GetServingState() returned nil, want promoted state")
+	}
+	if activeState.MapRoot != mapRoot {
+		t.Errorf("activeState.MapRoot = %x, want %x", activeState.MapRoot, mapRoot)
+	}
+}
+
+

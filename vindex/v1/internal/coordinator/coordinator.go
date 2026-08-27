@@ -390,7 +390,11 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, 0)
 	}
 
-	allModifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+	isGenesis := (c.pub.GetServingState() == nil)
+	var allModifiedSubRoots map[[sha256.Size]byte][sha256.Size]byte
+	if !isGenesis {
+		allModifiedSubRoots = make(map[[sha256.Size]byte][sha256.Size]byte)
+	}
 	startTime := time.Now()
 	startProgressSize := startLogSize
 	lastLogSize := startLogSize
@@ -413,8 +417,15 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		}
 		metrics.KVCommittedSize.Set(float64(res.NewKVSize))
 		metrics.LeavesIndexedTotal.Add(float64(pendingBatch.Count))
-		for k, v := range res.ModifiedSubRoots {
-			allModifiedSubRoots[k] = v
+		if isGenesis {
+			// Direct MPT mutation during initial ingestion (0 heap accumulation)
+			if err := c.mptMgr.SetBatch(res.ModifiedSubRoots); err != nil {
+				return fmt.Errorf("mpt direct SetBatch failed: %w", err)
+			}
+		} else {
+			for k, v := range res.ModifiedSubRoots {
+				allModifiedSubRoots[k] = v
+			}
 		}
 		metrics.IndexingLag.Set(float64(targetCP.Size - res.NewKVSize))
 		if res.NewKVSize-lastLogSize >= logInterval || res.NewKVSize == targetCP.Size {
@@ -469,8 +480,18 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		Size:   targetCP.Size,
 		Hash:   targetCP.Hash[:],
 	}
-	if _, err := c.pub.PublishBatch(ctx, allModifiedSubRoots, logCP, targetCP.Raw); err != nil {
-		return fmt.Errorf("publish error: %w", err)
+	if isGenesis {
+		mapRoot, err := c.mptMgr.Snap(int64(targetCP.Size))
+		if err != nil {
+			return fmt.Errorf("mpt snap failed: %w", err)
+		}
+		if _, err := c.pub.PublishDirect(ctx, mapRoot, logCP, targetCP.Raw); err != nil {
+			return fmt.Errorf("publish direct error: %w", err)
+		}
+	} else {
+		if _, err := c.pub.PublishBatch(ctx, allModifiedSubRoots, logCP, targetCP.Raw); err != nil {
+			return fmt.Errorf("publish error: %w", err)
+		}
 	}
 	metrics.IndexingLag.Set(0)
 	return nil

@@ -962,6 +962,49 @@ func TestRecover_Phase2PartialTileFetch(t *testing.T) {
 	}
 }
 
+func TestSyncOnce_GenesisMode_DirectMPTMutation(t *testing.T) {
+	ctx := context.Background()
+	coord, _, mptMgr, pub, _, outLog, fetcher := setupRecoveryEnvironment(t)
+	coord.SetCommitBatchSize(20) // Flush every 20 leaves to test multiple batch direct Set calls
+
+	// ServingState is nil at start (Genesis mode)
+	if pub.GetServingState() != nil {
+		t.Fatal("expected nil serving state at genesis")
+	}
+
+	// Run SyncOnce: should apply direct SetBatch on each batch and Snap at the end
+	if err := coord.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce failed in genesis mode: %v", err)
+	}
+
+	state := pub.GetServingState()
+	if state == nil {
+		t.Fatal("expected non-nil serving state after SyncOnce")
+	}
+	if state.InputLogSize != 200 {
+		t.Fatalf("state.InputLogSize = %d, want 200", state.InputLogSize)
+	}
+	if mptMgr.PersistedSize() != 200 {
+		t.Fatalf("mpt persisted size = %d, want 200", mptMgr.PersistedSize())
+	}
+
+	outSize, err := outLog.Size(ctx)
+	if err != nil || outSize != 1 {
+		t.Fatalf("outLog.Size = %d, want 1", outSize)
+	}
+
+	// Assert that tree root contains all 200 leaves
+	for i := 0; i < 200; i++ {
+		kh := sha256.Sum256(fetcher.leaves[i])
+		proof, _, exists, err := mptMgr.Prove(kh)
+		if err != nil || !exists || len(proof) == 0 {
+			t.Fatalf("Prove failed for leaf %d: exists=%v, err=%v", i, exists, err)
+		}
+	}
+}
+
+
+
 
 
 

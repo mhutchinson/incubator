@@ -164,6 +164,41 @@ func (m *Manager) Update(keyHash [sha256.Size]byte, valHash [sha256.Size]byte) e
 	return nil
 }
 
+// SetBatch applies mutations directly to the working tree under writeMu without creating a snapshot.
+func (m *Manager) SetBatch(mutations map[[sha256.Size]byte][sha256.Size]byte) error {
+	if len(mutations) == 0 {
+		return nil
+	}
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	m.treeMu.Lock()
+	defer m.treeMu.Unlock()
+
+	for k, v := range mutations {
+		if err := m.tree.Set(torchmpt.Key(k), torchmpt.Val(v)); err != nil {
+			return fmt.Errorf("tree.Set failed for key %x: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// Snap creates a snapshot at the specified version, updates currentRoot, and returns the root hash.
+func (m *Manager) Snap(version int64) ([sha256.Size]byte, error) {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	m.treeMu.Lock()
+	defer m.treeMu.Unlock()
+
+	snap, err := m.tree.Snap(version)
+	if err != nil {
+		return [sha256.Size]byte{}, fmt.Errorf("tree.Snap failed: %w", err)
+	}
+	m.currentRoot = [sha256.Size]byte(snap.Hash)
+	return m.currentRoot, nil
+}
+
 // Commit applies mutations to the MPT under the write lock and returns the new root hash.
 func (m *Manager) Commit(mutations map[[sha256.Size]byte][sha256.Size]byte) ([sha256.Size]byte, error) {
 	return m.CommitWithVersion(mutations, -1)

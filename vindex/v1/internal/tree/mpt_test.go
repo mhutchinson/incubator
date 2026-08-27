@@ -201,3 +201,37 @@ func BenchmarkMPT_ReadContentionDuringSync(b *testing.B) {
 		}
 	})
 }
+
+func TestMPT_SetBatchAndSnap(t *testing.T) {
+	mgr := NewMem()
+
+	mutations := make(map[[sha256.Size]byte][sha256.Size]byte)
+	for i := 0; i < 200; i++ {
+		k := sha256.Sum256([]byte(fmt.Sprintf("genesis_key_%d", i)))
+		v := sha256.Sum256([]byte(fmt.Sprintf("genesis_val_%d", i)))
+		mutations[k] = v
+	}
+
+	// Compare SetBatch + Snap with Commit
+	predictedRoot, err := mgr.Predict(mutations)
+	if err != nil {
+		t.Fatalf("Predict failed: %v", err)
+	}
+
+	if err := mgr.SetBatch(mutations); err != nil {
+		t.Fatalf("SetBatch failed: %v", err)
+	}
+
+	snappedRoot, err := mgr.Snap(200)
+	if err != nil {
+		t.Fatalf("Snap failed: %v", err)
+	}
+
+	if snappedRoot != predictedRoot {
+		t.Fatalf("snappedRoot %x != predictedRoot %x", snappedRoot, predictedRoot)
+	}
+	if mgr.PersistedVersion() != 200 {
+		t.Fatalf("PersistedVersion = %d, want 200", mgr.PersistedVersion())
+	}
+}
+
