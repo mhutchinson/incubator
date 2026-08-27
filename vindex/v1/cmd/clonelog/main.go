@@ -43,9 +43,11 @@ import (
 var (
 	logURL           = flag.String("log_url", "https://bootstrap-mtca-shard3.cloudflareresearch.com/", "Base URL of the remote tlog-tiles log")
 	outDir           = flag.String("out_dir", "", "Local directory to store mirrored log tiles (required)")
-	numWorkers       = flag.Int("workers", 64, "Number of concurrent download workers")
-	maxRetries       = flag.Int("max_retries", 10, "Maximum retry attempts per tile on transient network/server errors")
-	progressInterval = flag.Duration("progress_interval", 5*time.Second, "Interval for logging periodic progress")
+	numWorkers          = flag.Int("workers", 64, "Number of concurrent download workers")
+	maxRetries          = flag.Int("max_retries", 10, "Maximum retry attempts per tile on transient network/server errors")
+	progressInterval    = flag.Duration("progress_interval", 5*time.Second, "Interval for logging periodic progress")
+	tileLevel           = flag.Int("tile_level", -1, "Tile level to clone (0..63 for tree tiles, -1 for entry bundles)")
+	useLocalCheckpoint  = flag.Bool("use_local_checkpoint", false, "Use existing local checkpoint file to determine tree size without overwriting it")
 )
 
 type cloneStats struct {
@@ -101,22 +103,47 @@ func run(ctx context.Context) error {
 		Timeout:   60 * time.Second,
 	}
 
-	klog.Infof("Fetching checkpoint from %s ...", baseURL.String())
-	checkpointBytes, treeSize, err := fetchAndSaveCheckpoint(ctx, httpClient, baseURL, *outDir, *maxRetries)
-	if err != nil {
-		return fmt.Errorf("failed to fetch checkpoint: %w", err)
+	var treeSize uint64
+	if *useLocalCheckpoint {
+		cpPath := filepath.Join(*outDir, "checkpoint")
+		cpBytes, err := os.ReadFile(cpPath)
+		if err != nil {
+			return fmt.Errorf("failed to read local checkpoint %q: %w", cpPath, err)
+		}
+		treeSize, err = parseCheckpointTreeSize(cpBytes)
+		if err != nil {
+			return fmt.Errorf("failed to parse local checkpoint: %w", err)
+		}
+		klog.Infof("Using local checkpoint: treeSize = %d (checkpoint size: %d bytes)", treeSize, len(cpBytes))
+	} else {
+		klog.Infof("Fetching checkpoint from %s ...", baseURL.String())
+		checkpointBytes, ts, err := fetchAndSaveCheckpoint(ctx, httpClient, baseURL, *outDir, *maxRetries)
+		if err != nil {
+			return fmt.Errorf("failed to fetch checkpoint: %w", err)
+		}
+		treeSize = ts
+		klog.Infof("Fetched checkpoint successfully: treeSize = %d (checkpoint size: %d bytes)", treeSize, len(checkpointBytes))
 	}
-	klog.Infof("Fetched checkpoint successfully: treeSize = %d (checkpoint size: %d bytes)", treeSize, len(checkpointBytes))
 
-	bundleWidth := uint64(layout.EntryBundleWidth)
-	if bundleWidth == 0 {
-		bundleWidth = 256
-	}
 	numBundles := uint64(0)
 	if treeSize > 0 {
-		numBundles = (treeSize + bundleWidth - 1) / bundleWidth
+		if *tileLevel >= 0 {
+			shift := uint(uint64(*tileLevel) + 1) * 8
+			tileWidth := uint64(1) << shift
+			numBundles = (treeSize + tileWidth - 1) / tileWidth
+		} else {
+			bundleWidth := uint64(layout.EntryBundleWidth)
+			if bundleWidth == 0 {
+				bundleWidth = 256
+			}
+			numBundles = (treeSize + bundleWidth - 1) / bundleWidth
+		}
 	}
-	klog.Infof("Starting clone of %d entry bundles (%d total certs) to %s across %d workers", numBundles, treeSize, *outDir, *numWorkers)
+	if *tileLevel >= 0 {
+		klog.Infof("Starting clone of %d level-%d tree tiles to %s across %d workers", numBundles, *tileLevel, *outDir, *numWorkers)
+	} else {
+		klog.Infof("Starting clone of %d entry bundles (%d total certs) to %s across %d workers", numBundles, treeSize, *outDir, *numWorkers)
+	}
 
 	var stats cloneStats
 	startTime := time.Now()
@@ -163,8 +190,14 @@ func run(ctx context.Context) error {
 				}
 
 				totalMB := float64(dlBytes) / (1024 * 1024)
-				klog.Infof("[Progress %5.1f%%] %d/%d tiles (%d downloaded, %d skipped) | %d certs (%.1f MB) | Rate: %.2f MB/s, %.0f certs/s | Elapsed: %s",
-					pct, totalProcessed, numBundles, dlTiles, skTiles, dlCerts, totalMB, rateMB, rateCerts, time.Since(startTime).Truncate(time.Second))
+				if *tileLevel >= 0 {
+					rateTiles := float64(deltaCerts) / deltaSec
+					klog.Infof("[Progress %5.1f%%] %d/%d tiles (%d downloaded, %d skipped) | %.1f MB | Rate: %.2f MB/s, %.0f tiles/s | Elapsed: %s",
+						pct, totalProcessed, numBundles, dlTiles, skTiles, totalMB, rateMB, rateTiles, time.Since(startTime).Truncate(time.Second))
+				} else {
+					klog.Infof("[Progress %5.1f%%] %d/%d tiles (%d downloaded, %d skipped) | %d certs (%.1f MB) | Rate: %.2f MB/s, %.0f certs/s | Elapsed: %s",
+						pct, totalProcessed, numBundles, dlTiles, skTiles, dlCerts, totalMB, rateMB, rateCerts, time.Since(startTime).Truncate(time.Second))
+				}
 
 				lastBytes = dlBytes
 				lastCerts = dlCerts
@@ -324,10 +357,21 @@ func bundleCertsCount(bIdx, treeSize uint64) uint64 {
 }
 
 func downloadBundle(ctx context.Context, client *http.Client, baseURL *url.URL, outDir string, bIdx, treeSize uint64, retries int, stats *cloneStats) error {
-	p := layout.PartialTileSize(0, bIdx, treeSize)
-	relPath := layout.EntriesPath(bIdx, p)
+	var p uint8
+	var relPath, fullRelPath string
+	certsInBundle := uint64(1)
+	if *tileLevel >= 0 {
+		lvl := uint64(*tileLevel)
+		p = layout.PartialTileSize(lvl, bIdx, treeSize)
+		relPath = layout.TilePath(lvl, bIdx, p)
+		fullRelPath = layout.TilePath(lvl, bIdx, 0)
+	} else {
+		p = layout.PartialTileSize(0, bIdx, treeSize)
+		relPath = layout.EntriesPath(bIdx, p)
+		fullRelPath = layout.EntriesPath(bIdx, 0)
+		certsInBundle = bundleCertsCount(bIdx, treeSize)
+	}
 	destPath := filepath.Join(outDir, relPath)
-	certsInBundle := bundleCertsCount(bIdx, treeSize)
 
 	// Check if already downloaded on restart
 	if info, err := os.Stat(destPath); err == nil && info.Size() > 0 {
@@ -336,7 +380,7 @@ func downloadBundle(ctx context.Context, client *http.Client, baseURL *url.URL, 
 		return nil
 	}
 	if p != 0 {
-		fullPath := filepath.Join(outDir, layout.EntriesPath(bIdx, 0))
+		fullPath := filepath.Join(outDir, fullRelPath)
 		if info, err := os.Stat(fullPath); err == nil && info.Size() > 0 {
 			stats.skippedTiles.Add(1)
 			stats.skippedCerts.Add(certsInBundle)
@@ -377,7 +421,6 @@ func downloadBundle(ctx context.Context, client *http.Client, baseURL *url.URL, 
 		// Fallback for partial tiles if server converted them to full tiles
 		if resp.StatusCode == http.StatusNotFound && p != 0 {
 			_ = resp.Body.Close()
-			fullRelPath := layout.EntriesPath(bIdx, 0)
 			fullURL := baseURL.JoinPath(fullRelPath).String()
 			fullReq, fullErr := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 			if fullErr == nil {

@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +38,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/hammer"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/coordinator"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
@@ -57,13 +60,15 @@ var (
 	dbPath             = flag.String("db_path", "", "NVMe path for Pebble DB (Disk A).")
 	mptDir             = flag.String("mpt_dir", "", "Isolated NVMe path for MPT mmap files (Disk B).")
 	wasmPath           = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary.")
-	mapper             = flag.String("mapper", "identity", "Leaf mapper implementation: identity or ct.")
+	mapper             = flag.String("mapper", "identity", "Leaf mapper implementation: identity, ct, or sumdb.")
 	listenAddr         = flag.String("listen_addr", ":8080", "HTTP Read Server address.")
 	metricsAddr        = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
 	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
+	backfill           = flag.Bool("backfill", false, "Run in standalone batch backfill mode to catch up to target checkpoint, publish root, and exit.")
+	backfillCheckpoint = flag.String("backfill_checkpoint", "", "Optional target checkpoint file path or note-signed text for backfill. If unset, fetches latest from input log.")
 )
 
 func main() {
@@ -104,7 +109,7 @@ func run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to read WASM binary %q: %w", *wasmPath, err)
 		}
-		host, err := ingest.NewWASMHost(ctx, wasmBytes, 4)
+		host, err := ingest.NewWASMHost(ctx, wasmBytes, 0)
 		if err != nil {
 			return fmt.Errorf("failed to initialize WASM host: %w", err)
 		}
@@ -112,12 +117,14 @@ func run(ctx context.Context) error {
 		leafMapper = host
 	} else {
 		switch *mapper {
+		case "sumdb":
+			leafMapper = &sumdbLeafMapper{}
 		case "ct":
 			leafMapper = &ctLeafMapper{}
 		case "identity", "":
 			leafMapper = &defaultIdentityMapper{}
 		default:
-			return fmt.Errorf("unknown mapper %q (expected identity, ct)", *mapper)
+			return fmt.Errorf("unknown mapper %q (expected identity, ct, sumdb)", *mapper)
 		}
 	}
 
@@ -151,20 +158,20 @@ func run(ctx context.Context) error {
 		metrics.TileCacheBytes.Set(float64(sz))
 	}
 
+	var verifier note.Verifier
+	if *inputLogPubKey != "" {
+		v, err := note.NewVerifier(*inputLogPubKey)
+		if err != nil {
+			return fmt.Errorf("failed to create input log verifier: %w", err)
+		}
+		verifier = v
+	}
+
 	var fetcher ingest.TileFetcher
 	if *inputLogURL != "" {
 		u, err := url.Parse(*inputLogURL)
 		if err != nil {
 			return fmt.Errorf("invalid input log URL %q: %w", *inputLogURL, err)
-		}
-
-		var verifier note.Verifier
-		if *inputLogPubKey != "" {
-			v, err := note.NewVerifier(*inputLogPubKey)
-			if err != nil {
-				return fmt.Errorf("failed to create input log verifier: %w", err)
-			}
-			verifier = v
 		}
 
 		tf, err := hammer.NewTiledFetcher(u, verifier, *inputLogOrigin, nil)
@@ -196,7 +203,50 @@ func run(ctx context.Context) error {
 		defer func() { _ = metricsServer.Close() }()
 	}
 
-	// 6. Start Read Server
+	// 6. Run 3-Phase Crash Recovery
+	coord := coordinator.NewCoordinator(db, mptMgr, outputLog, pub, idxer, fetcher, tileCache, leafMapper)
+	klog.Info("Running 3-phase startup recovery...")
+	if err := coord.Recover(ctx); err != nil {
+		return fmt.Errorf("startup recovery failed: %w", err)
+	}
+	klog.Info("Startup recovery completed successfully.")
+
+	// 7. Handle Standalone Backfill Mode
+	if *backfill {
+		var targetCP *log.Checkpoint
+		if *backfillCheckpoint != "" {
+			cpBytes, err := os.ReadFile(*backfillCheckpoint)
+			if err != nil {
+				// Treat value as raw text if not a file
+				cpBytes = []byte(*backfillCheckpoint)
+			}
+			if verifier != nil {
+				parsed, _, _, err := log.ParseCheckpoint(cpBytes, *inputLogOrigin, verifier)
+				if err != nil {
+					return fmt.Errorf("failed to verify backfill checkpoint signature: %w", err)
+				}
+				targetCP = parsed
+			} else {
+				parsed, err := parseCheckpointHeaderOnly(cpBytes)
+				if err != nil {
+					return fmt.Errorf("failed to parse backfill checkpoint: %w", err)
+				}
+				targetCP = parsed
+			}
+			klog.Infof("Target backfill checkpoint provided: origin=%q size=%d", targetCP.Origin, targetCP.Size)
+		}
+
+		startTime := time.Now()
+		klog.Info("Starting coordinator backfill execution...")
+		if err := coord.Backfill(ctx, targetCP); err != nil {
+			return fmt.Errorf("backfill failed: %w", err)
+		}
+		elapsed := time.Since(startTime)
+		klog.Infof("Backfill completed successfully in %v.", elapsed)
+		return nil
+	}
+
+	// 8. Start Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
 	readSrv.SetEnableUI(*enableUI)
 	readMux := http.NewServeMux()
@@ -214,21 +264,13 @@ func run(ctx context.Context) error {
 	}()
 	defer func() { _ = httpServer.Close() }()
 
-	// 7. Run 3-Phase Crash Recovery
-	coord := coordinator.NewCoordinator(db, mptMgr, outputLog, pub, idxer, fetcher, tileCache, leafMapper)
-	klog.Info("Running 3-phase startup recovery...")
-	if err := coord.Recover(ctx); err != nil {
-		return fmt.Errorf("startup recovery failed: %w", err)
-	}
-	klog.Info("Startup recovery completed successfully.")
-
-	// 8. Start Background Tile Reaper
+	// 9. Start Background Tile Reaper
 	tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
 	go func() {
 		_ = tileReaper.Run(ctx, 60*time.Second)
 	}()
 
-	// 9. Start Ingestion & Commit Pipeline Loop
+	// 10. Start Ingestion & Commit Pipeline Loop
 	if fetcher != nil {
 		klog.Infof("Starting zero-WAL ingestion pipeline polling %q every %v", *inputLogURL, *pollInterval)
 		if err := coord.Run(ctx, *pollInterval); err != nil && !errors.Is(err, context.Canceled) {
@@ -240,6 +282,27 @@ func run(ctx context.Context) error {
 
 	klog.Info("Shutting down vindexd gracefully...")
 	return nil
+}
+
+func parseCheckpointHeaderOnly(rawCP []byte) (*log.Checkpoint, error) {
+	lines := strings.Split(string(bytes.TrimRight(rawCP, "\n")), "\n")
+	if len(lines) < 3 {
+		return nil, fmt.Errorf("checkpoint header has %d lines, want at least 3", len(lines))
+	}
+	origin := lines[0]
+	size, err := strconv.ParseUint(lines[1], 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid size %q: %w", lines[1], err)
+	}
+	hashBytes, err := base64.StdEncoding.DecodeString(lines[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 hash %q: %w", lines[2], err)
+	}
+	return &log.Checkpoint{
+		Origin: origin,
+		Size:   size,
+		Hash:   hashBytes,
+	}, nil
 }
 
 type defaultIdentityMapper struct{}
@@ -281,6 +344,230 @@ func (m *ctLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedE
 
 func (m *ctLeafMapper) Close(_ context.Context) error { return nil }
 
+type sumdbLeafMapper struct{}
+
+func (m *sumdbLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
+	keys := mapSumDBLeaf(leaf)
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	entries := make([]ingest.MappedEntry, len(keys))
+	for i, k := range keys {
+		entries[i] = ingest.MappedEntry{KeyHash: k}
+	}
+	return entries, nil
+}
+
+func (m *sumdbLeafMapper) MapBundle(_ context.Context, leaves [][]byte) ([][]ingest.MappedEntry, error) {
+	results := make([][]ingest.MappedEntry, len(leaves))
+	for i, leaf := range leaves {
+		keys := mapSumDBLeaf(leaf)
+		if len(keys) > 0 {
+			entries := make([]ingest.MappedEntry, len(keys))
+			for j, k := range keys {
+				entries[j] = ingest.MappedEntry{KeyHash: k}
+			}
+			results[i] = entries
+		}
+	}
+	return results, nil
+}
+
+func (m *sumdbLeafMapper) Close(_ context.Context) error { return nil }
+
+func mapSumDBLeaf(data []byte) [][sha256.Size]byte {
+	var results [8][sha256.Size]byte
+	n := 0
+
+	for len(data) > 0 {
+		var line []byte
+		idx := bytes.IndexByte(data, '\n')
+		if idx >= 0 {
+			line = data[:idx]
+			data = data[idx+1:]
+		} else {
+			line = data
+			data = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		modEnd := bytes.IndexByte(line, ' ')
+		if modEnd == -1 {
+			continue
+		}
+		modPath := line[:modEnd]
+
+		verStart := modEnd + 1
+		if verStart >= len(line) {
+			continue
+		}
+		verLen := bytes.IndexByte(line[verStart:], ' ')
+		var verBytes []byte
+		if verLen == -1 {
+			verBytes = line[verStart:]
+		} else {
+			verBytes = line[verStart : verStart+verLen]
+		}
+		verBytes = bytes.TrimSuffix(verBytes, []byte("/go.mod"))
+
+		// Filter out ephemeral pseudo-versions
+		if isPseudoVersion(verBytes) {
+			continue
+		}
+
+		h := sha256.Sum256(modPath)
+		duplicate := false
+		for i := 0; i < n; i++ {
+			if results[i] == h {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate && n < len(results) {
+			results[n] = h
+			n++
+		}
+	}
+
+	return results[:n]
+}
+
+func isPseudoVersion(v []byte) bool {
+	if len(v) < 30 || v[0] != 'v' {
+		return false
+	}
+	if idx := bytes.IndexByte(v, '+'); idx != -1 {
+		build := v[idx+1:]
+		if len(build) == 0 {
+			return false
+		}
+		for _, b := range build {
+			if !isIdentChar(b) && b != '.' {
+				return false
+			}
+		}
+		v = v[:idx]
+	}
+	lastDash := bytes.LastIndexByte(v, '-')
+	if lastDash == -1 {
+		return false
+	}
+	rev := v[lastDash+1:]
+	if len(rev) == 0 {
+		return false
+	}
+	for _, b := range rev {
+		if !isAlnum(b) {
+			return false
+		}
+	}
+	rest := v[:lastDash]
+	secondDash := bytes.LastIndexByte(rest, '-')
+	if secondDash == -1 {
+		return false
+	}
+	var timestamp, prefix []byte
+	dotAfterDash := bytes.LastIndexByte(rest[secondDash:], '.')
+	if dotAfterDash != -1 {
+		dotPos := secondDash + dotAfterDash
+		timestamp = rest[dotPos+1:]
+		prefix = rest[:dotPos]
+	} else {
+		timestamp = rest[secondDash+1:]
+		prefix = rest[:secondDash]
+	}
+	if len(timestamp) != 14 {
+		return false
+	}
+	for _, b := range timestamp {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	if dotAfterDash == -1 {
+		return isMajorDotZeroDotZero(prefix)
+	}
+	if !bytes.HasSuffix(prefix, []byte(".0")) && !bytes.HasSuffix(prefix, []byte("-0")) {
+		return false
+	}
+	dashIdx := bytes.IndexByte(prefix, '-')
+	if dashIdx == -1 {
+		return false
+	}
+	return isBaseSemver(prefix[:dashIdx])
+}
+
+func isMajorDotZeroDotZero(s []byte) bool {
+	if len(s) < 6 || s[0] != 'v' || !bytes.HasSuffix(s, []byte(".0.0")) {
+		return false
+	}
+	major := s[1 : len(s)-4]
+	if len(major) == 0 || (len(major) > 1 && major[0] == '0') {
+		return false
+	}
+	for _, b := range major {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isBaseSemver(s []byte) bool {
+	if len(s) < 6 || s[0] != 'v' {
+		return false
+	}
+	s = s[1:]
+	dot1 := bytes.IndexByte(s, '.')
+	if dot1 <= 0 {
+		return false
+	}
+	major := s[:dot1]
+	if len(major) > 1 && major[0] == '0' {
+		return false
+	}
+	for _, b := range major {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	s = s[dot1+1:]
+	dot2 := bytes.IndexByte(s, '.')
+	if dot2 <= 0 {
+		return false
+	}
+	minor := s[:dot2]
+	if len(minor) > 1 && minor[0] == '0' {
+		return false
+	}
+	for _, b := range minor {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	patch := s[dot2+1:]
+	if len(patch) == 0 || (len(patch) > 1 && patch[0] == '0') {
+		return false
+	}
+	for _, b := range patch {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlnum(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func isIdentChar(b byte) bool {
+	return isAlnum(b) || b == '-'
+}
+
 type localOutputLog struct {
 	mu     sync.Mutex
 	origin string
@@ -290,11 +577,30 @@ type localOutputLog struct {
 }
 
 func newLocalOutputLog(origin, dir string, signer note.Signer) *localOutputLog {
-	return &localOutputLog{
+	l := &localOutputLog{
 		origin: origin,
 		dir:    dir,
 		signer: signer,
 	}
+	if dir != "" {
+		leavesPath := filepath.Join(dir, "leaves.dat")
+		data, err := os.ReadFile(leavesPath)
+		if err == nil && len(data) > 0 {
+			offset := 0
+			for offset+4 <= len(data) {
+				sz := int(binary.BigEndian.Uint32(data[offset : offset+4]))
+				offset += 4
+				if offset+sz > len(data) {
+					break
+				}
+				leaf := make([]byte, sz)
+				copy(leaf, data[offset:offset+sz])
+				l.leaves = append(l.leaves, leaf)
+				offset += sz
+			}
+		}
+	}
+	return l
 }
 
 func (l *localOutputLog) Append(_ context.Context, leafData []byte) (uint64, []byte, error) {
@@ -321,6 +627,13 @@ func (l *localOutputLog) Append(_ context.Context, leafData []byte) (uint64, []b
 	if l.dir != "" {
 		_ = os.MkdirAll(l.dir, 0o755)
 		_ = os.WriteFile(filepath.Join(l.dir, "checkpoint"), rawCP, 0o644)
+		if f, err := os.OpenFile(filepath.Join(l.dir, "leaves.dat"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(leafData)))
+			_, _ = f.Write(lenBuf[:])
+			_, _ = f.Write(leafData)
+			_ = f.Close()
+		}
 	}
 
 	return idx, rawCP, nil
