@@ -16,6 +16,7 @@
 package server
 
 import (
+	_ "embed"
 	"fmt"
 	"net/http"
 	"slices"
@@ -28,6 +29,9 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
 )
 
+//go:embed index.html
+var defaultIndexHTML []byte
+
 const (
 	defaultLookupLimit uint64 = 100
 	maxLookupLimit     uint64 = 1000
@@ -39,6 +43,7 @@ type ReadServer struct {
 	mptMgr    *tree.Manager
 	publisher *tree.OutputPublisher
 	chunkSize uint64
+	enableUI  bool
 }
 
 // NewReadServer creates a new ReadServer instance.
@@ -54,6 +59,7 @@ func NewReadServer(store kvstore.IndexStore, mptMgr *tree.Manager, pub *tree.Out
 		mptMgr:    mptMgr,
 		publisher: pub,
 		chunkSize: chunkSize,
+		enableUI:  true,
 	}
 }
 
@@ -65,8 +71,18 @@ func (s *ReadServer) ChunkSize() uint64 {
 	return s.chunkSize
 }
 
+// SetEnableUI configures whether the single-page HTML UI is served.
+func (s *ReadServer) SetEnableUI(enable bool) {
+	s.enableUI = enable
+}
+
 // RegisterRoutes registers HTTP endpoints on the provided ServeMux.
 func (s *ReadServer) RegisterRoutes(mux *http.ServeMux) {
+	if s.enableUI {
+		mux.HandleFunc("/", s.HandleUI)
+		mux.HandleFunc("/index.html", s.HandleUI)
+	}
+
 	mux.HandleFunc("/vindex/v1/checkpoint", s.HandleCheckpoint)
 	mux.HandleFunc("/checkpoint", s.HandleCheckpoint)
 
@@ -80,6 +96,23 @@ func (s *ReadServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.HandleHealthz)
 	mux.HandleFunc("/readyz", s.HandleReadyz)
 	mux.Handle("/metrics", promhttp.Handler())
+}
+
+// HandleUI handles GET / and /index.html requests serving the single-page HTML UI.
+func (s *ReadServer) HandleUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodGet {
+		_, _ = w.Write(defaultIndexHTML)
+	}
 }
 
 // HandleCheckpoint handles GET /vindex/v1/checkpoint.

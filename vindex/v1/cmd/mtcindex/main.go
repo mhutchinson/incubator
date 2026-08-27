@@ -65,6 +65,7 @@ var (
 	oneShot            = flag.Bool("oneshot", false, "Run once and exit")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Polling interval for input log updates")
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size for inverted index")
+	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html")
 )
 
 func main() {
@@ -184,6 +185,7 @@ func run(ctx context.Context) error {
 
 	// 7. HTTP Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
+	readSrv.SetEnableUI(*enableUI)
 	mux := http.NewServeMux()
 	readSrv.RegisterRoutes(mux)
 
