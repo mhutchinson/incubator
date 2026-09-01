@@ -82,6 +82,12 @@ The VIndex architecture is partitioned into modular subsystems located in [`vind
 
 ## 4. State Progression & Pipeline Invariants
 
+The vast majority of the design documents across this repository describe the default **Normal Serving Mode** (Mode 1), which enforces the active serving invariant:
+```text
+Ingestion Checkpoint >= Pebble Checkpoint >= Output Log Checkpoint >= Merkle Tree Checkpoint
+```
+(with `mpt.Predict` lock-free prediction, Output Log appending, and remote witness cosigning per batch).
+
 ### 4.1 Watermark Glossary
 
 | Watermark Symbol | Pipeline Plane | Definition & Invariant Role |
@@ -91,9 +97,9 @@ The VIndex architecture is partitioned into modular subsystems located in [`vind
 | `m_kv_size` (Committed KV Size) | KV Storage Plane (`internal/kvstore`) | Highest contiguous leaf index whose mapped search key chunks have been durably synced to Pebble DB (`pebble.Sync`). |
 | `Output_Size` / `Serving_Size` / `mptDurableSize` | State Commitment Plane (`internal/tree`) | Output Log tree size committed with witness cosignatures; equals the active serving MPT size exposed to readers. |
 
-### 4.2 Watermark Inequality Chain
+### 4.2 Watermark Inequality Chain (Normal Serving Mode)
 
-State progresses monotonically across the four pipeline planes:
+State progresses monotonically across the four pipeline planes in Normal Serving Mode:
 
 ```text
 Input Log Target CP >= Cached Tile Watermark >= m_kv_size >= Output Log Size >= MPT_Durable_Size
@@ -114,6 +120,39 @@ Input Log Target CP >= Cached Tile Watermark >= m_kv_size >= Output Log Size >= 
    Serving_Size == MPT_Size <= Output_Size
    ```
    Readers are strictly isolated from in-flight writes ahead of `Serving_Size` via watermark index filtering.
+
+### 4.4 Operational Modes & Alternative Catch-Up Pipeline
+
+#### Motivation
+During initial synchronization or bulk catch-up (e.g. ingesting tens of millions of historical leaves from genesis), live read queries are inactive (`/readyz` returns HTTP 503). In this scenario, running `mpt.Predict` across tens of millions of leaves causes two severe scalability bottlenecks:
+1. **Memory Accumulation**: Running `mpt.Predict` across tens of millions of leaves would accumulate massive in-memory mutation maps and incur substantial heap allocation and tree cloning overhead.
+2. **Witness Roundtrip Bottleneck**: Requiring tens of thousands of slow remote witness cosignature network RPCs (one per batch) introduces unnecessary latency and throttles bulk catch-up throughput.
+
+#### Catch-Up Ingestion Mode (Alternative Pipeline)
+To maximize throughput during bulk sync, `vindexd` supports an alternative **Catch-Up Ingestion Mode**:
+
+- **Pipeline Invariant**:
+  ```text
+  Ingestion Checkpoint >= Pebble Checkpoint == In-Memory MPT Checkpoint
+  ```
+  *(Output Log publication and remote witnessing are decoupled and disabled during catch-up).*
+- **Mechanics**: Ingestion streams batches into Pebble via `store.WriteBatch` and immediately updates the in-memory working tree via direct in-place `mpt.Set(...)` and `mpt.Snap(...)`.
+- **Memory Efficiency**: Working memory remains flat (O(1) heap overhead per batch in `mmap`), eliminating O(N) heap map bloat and avoiding `Predict` tree cloning overhead.
+- **Read Serving**: The HTTP read server returns `HTTP 503 Service Unavailable` (`/readyz` unhealthy).
+
+#### Mode Transition Sequence (Catch-Up Mode -> Normal Serving Mode)
+Upon reaching the target synchronization point, `vindexd` transitions explicitly from Catch-Up Mode into Normal Serving Mode:
+
+1. **Catch-Up Completion**: The catch-up loop completes all batch ingestion up to `Target_CP`.
+2. **Root Availability**: The MPT root is already computed in the working tree (`mpt.Root()`).
+3. **Output Log Append**: Append a single `StateCommitment` (`hex(MapRoot) + "\n" + Target_CP.Raw`) to the Output Log.
+4. **Remote Witness Cosigning**: Submit the checkpoint to remote witnesses and collect a cosignature quorum.
+5. **MPT Disk Fsync**: Fsync MPT working files to disk via `mptMgr.Sync()`.
+6. **Atomic State Ratchet**: Set the atomic `servingState` pointer to the witnessed checkpoint.
+7. **Readiness Probe Transition**: Flip `/readyz` to `HTTP 200 OK` and enter Normal Serving Mode with the active serving invariant established.
+
+> [!NOTE]
+> **Scope Note**: While this alternative Catch-Up Ingestion Mode is specified in Section 4.4, the vast majority of this documentation suite focuses on the steady-state Normal Serving Mode. The subsystem documentation will be expanded to cover catch-up pipeline variants as validated by implementation and experimentation.
 
 ---
 
@@ -277,7 +316,7 @@ Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is **st
 
 #### 1. Genesis Catch-Up Mode
 
-High-throughput fast-forward bulk ingestion from leaf 0 to a target checkpoint. In this mode, `vindexd` maximizes parallelism across Wazero WASM sandboxes, executes bundled tile mapping (`map_bundle`), bypasses per-batch witness roundtrips, and streams entries directly into Pebble DB and the in-memory MPT before activating serving endpoints.
+High-throughput fast-forward bulk ingestion from leaf 0 to a target checkpoint. In this mode, `vindexd` maximizes parallelism across Wazero WASM sandboxes, executes bundled tile mapping (`map_bundle`), bypasses per-batch witness roundtrips, and streams entries directly into Pebble DB and the in-memory MPT via direct `mpt.Set` and `mpt.Snap` operations before activating serving endpoints. See [Section 4.4](#44-operational-modes--alternative-catch-up-pipeline) for the complete Catch-Up Ingestion Mode pipeline invariants, memory efficiency mechanics, and atomic mode transition sequence.
 
 #### 2. Single-Host Disaster Recovery
 

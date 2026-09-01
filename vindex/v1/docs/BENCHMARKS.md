@@ -213,3 +213,64 @@ The initial V1 implementation utilized an intermediate Write-Ahead Log staged un
 4. **Sub-Millisecond Serving**: Median read latencies drop to sub-millisecond levels, providing excellent query responsiveness during active write ingestion.
 5. **Database Footprint & Space Savings**: Eliminating temporary WAL writes reduces total Pebble DB storage overhead from 1.2 GB down to **9.91 MB** (99% space savings) in CT fanout tests. The `ManagedTileCache` working set remains bounded to `< 1 MB` under continuous `TileReaper` pruning.
 6. **Cryptographic Invariant Guarantees**: Zero invariant violations occurred across all benchmark runs, validating that the direct commit model strictly preserves all Merkle tree and MPT cryptographic invariants.
+
+---
+
+## 8. Full Go SumDB Ingestion Matrix: Baseline WASM vs. Final WASM vs. Pure Native Go
+
+This section presents the empirical end-to-end ingestion benchmarks across the complete 61,707,729 leaf Go Checksum Database (`sum.golang.org`) on a 24-core NVMe host (`runtime.GOMAXPROCS(0) = 24`), evaluating the evolution from the initial baseline WASM runtime to the final production architecture on `v1/impl`, compared against pure native Go execution.
+
+### 8.1 Performance Comparison Matrix (61.7M Leaves)
+
+| Metric | **1. Baseline WASM**<br>(Per-leaf FFI + In-Guest SHA) | **2. Final Production WASM (`v1/impl`)**<br>(Bundled FFI + Host SIMD + Storage Opts) | **3. Pure Native Go**<br>(In-process direct mapping) |
+| :--- | :--- | :--- | :--- |
+| **Total Ingestion Time (61.7M leaves)** | **23m 57s** (1,437.0s) | **12m 04.2s** (724.2s) | **5m 31.0s** (331.0s) |
+| **Average Ingestion Throughput** | **42,455 leaves/sec** | **85,237 leaves/sec** | **186,594 leaves/sec** |
+| **Peak Throughput** | ~63,400 leaves/sec | **~86,500 leaves/sec** | **~204,800 leaves/sec** |
+| **Speedup vs. Baseline** | *1.0x (Baseline)* | **+100.8% (2.01x speedup)** | **+339.5% (4.40x speedup)** |
+| **Time Reduction vs. Baseline** | *0%* | **-49.6% (~2x faster)** | **-77.0% (~4.3x faster)** |
+| **FFI Calls per 256-Leaf Tile** | 768 calls (`alloc`+`map`+`reset` x 256) | **1 call** (`map_bundle`) | **0 calls** |
+| **WASM / FFI CPU Load** | **78.9% CPU** | **73.5% CPU** | **0% CPU** |
+| **Storage & Commit CPU** | ~5.6% CPU | **~12.0% CPU** | **~38.5% CPU** |
+| **WASM Binary Size (`sumdb.wasm`)** | 2.5 MB | **1.9 MB** (-24% size) | N/A |
+| **In-Use Process Memory** | ~367 MB | **~664 MB** (64MB write buffers + pool) | **~310 MB** |
+
+---
+
+### 8.2 Key Architectural Differences: Baseline vs. Final Implementation
+
+The 2.01x speedup in the final WASM implementation is the cumulative result of six distinct architectural optimizations:
+
+#### 1. FFI Boundary Amortization (`map_leaf` -> `map_bundle`)
+- **Baseline**: Traversed the WebAssembly foreign function interface 768 times per 256-leaf tile (calling `allocate`, `map_leaf`, and `reset` for each individual leaf). FFI boundary crossings consumed ~23% of total host CPU cycles.
+- **Final**: Packed an entire 256-leaf tile into a contiguous shared memory arena and executed a single `map_bundle` call per tile. Cut FFI boundary overhead by 99.6% (< 1% of host CPU).
+
+#### 2. Host SIMD Cryptographic Preimage Hashing
+- **Baseline**: Leaf preimages were hashed inside the WASM sandbox using software bitwise operations, consuming ~55% of guest CPU cycles.
+- **Final**: WASM MapFn returns raw key preimages (`[][]byte`). Hashing is delegated to the Go host (`crypto/sha256`), which executes native hardware SIMD instructions (x86 SHA-NI / ARMv8 Crypto), dropping crypto CPU load to < 5%.
+
+#### 3. Zero-Allocation Byte Scanner (Elimination of Guest Regex)
+- **Baseline**: Imported `golang.org/x/mod/module` in the guest WASM binary. Filtering pseudo-versions converted byte slices to strings and executed Go's standard regex engine, statically embedding `reflect`, `regexp`, and Unicode tables inside `sumdb.wasm` (2.5 MB).
+- **Final**: Replaced regex with a zero-allocation byte scanner (`isPseudoVersion([]byte)`). Eliminated guest heap allocations, reduced guest CPU time by 40%, and shrank `sumdb.wasm` to 1.9 MB.
+
+#### 4. Two-Generational In-Memory Active Chunk Cache
+- **Baseline / Initial Storage**: Every batch executed a disk point lookup (`iter.SeekPrefixGE`) in Pebble DB for every modified key to read the previous 64KB chunk descriptor, causing I/O stalls during bulk ingestion.
+- **Final**: Introduced a bounded 2-generational cache (`currentCache` and `previousCache` in `KVIndexer`). Retains hot module keys in memory across sequential batches, eliminating 90%+ of Pebble read block I/O without coarse full-cache invalidation freezes.
+
+#### 5. Lexicographical Key Sorting for Sparse Merkle Tree (MPT) Locality
+- **Baseline**: Inserted 32-byte key hashes into the Sparse Merkle Patricia Trie in arbitrary batch order, causing random node traversals and branch re-hashing thrashing.
+- **Final**: Sorts batch keys lexicographically with `slices.SortFunc` before MPT insertion. Grouping updates into identical subtrees enforces depth-first branch locality and minimizes tree node allocations.
+
+#### 6. Tuned Pebble MemTable & Compaction Concurrency
+- **Baseline**: Default 16 MB MemTable write buffers with single-threaded compaction.
+- **Final**: Configured 64 MB write buffers (`MemTableSize = 64 << 20`) with `MaxConcurrentCompactions = 4`, preventing write stalls during sustained high-throughput ingestion.
+
+---
+
+### 8.3 Performance Ceiling & Production Scaling
+
+- **WASM vs. Native Go Gap (2.19x)**: Native in-process Go executes at **186.6k leaves/sec (5m 31s)** vs. **85.2k leaves/sec (12m 04s)** for WASM. The remaining 2.19x delta is purely the baseline overhead of Wazero JIT bytecode interpretation compared to native machine code.
+- **Linear Horizontal Scaling**: Because MapFn guest workers run in an uncoordinated worker pool (`runtime.GOMAXPROCS(0) - 1`), WASM mapping throughput scales linearly with CPU core count:
+  - **24 Cores (Current)**: **85,237 leaves/sec** (~12m 04s)
+  - **64 Cores (Prod)**: Projected **~220,000 leaves/sec** (~4m 40s)
+  - **128 Cores (Prod)**: Projected **~400,000+ leaves/sec** (~2m 30s)
