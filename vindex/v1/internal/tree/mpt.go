@@ -169,13 +169,22 @@ func (m *Manager) SetBatch(mutations map[[sha256.Size]byte][sha256.Size]byte) er
 	if len(mutations) == 0 {
 		return nil
 	}
+	keys := make([][sha256.Size]byte, 0, len(mutations))
+	for k := range mutations {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b [sha256.Size]byte) int {
+		return bytes.Compare(a[:], b[:])
+	})
+
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
 	m.treeMu.Lock()
 	defer m.treeMu.Unlock()
 
-	for k, v := range mutations {
+	for _, k := range keys {
+		v := mutations[k]
 		if err := m.tree.Set(torchmpt.Key(k), torchmpt.Val(v)); err != nil {
 			return fmt.Errorf("tree.Set failed for key %x: %w", k, err)
 		}
