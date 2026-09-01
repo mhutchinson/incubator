@@ -85,6 +85,15 @@ func Open(dir string, opts *pebble.Options) (*DB, error) {
 			bloom.FilterPolicy(10).Name(): bloom.FilterPolicy(10),
 		}
 	}
+	if opts.MemTableSize == 0 {
+		opts.MemTableSize = 64 << 20 // 64 MB write buffer
+	}
+	if opts.MemTableStopWritesThreshold == 0 {
+		opts.MemTableStopWritesThreshold = 4
+	}
+	if opts.MaxConcurrentCompactions == nil {
+		opts.MaxConcurrentCompactions = func() int { return 4 }
+	}
 	if len(opts.Levels) == 0 {
 		opts.Levels = make([]pebble.LevelOptions, 7)
 		for i := range opts.Levels {
