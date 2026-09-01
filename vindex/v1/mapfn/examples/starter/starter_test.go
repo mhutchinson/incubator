@@ -15,19 +15,18 @@
 package main
 
 import (
-	"crypto/sha256"
+	"bytes"
 	"testing"
 )
 
 func TestMapLeaf(t *testing.T) {
 	input := []byte("sample leaf entry")
-	hashes := MapLeaf(input)
-	if len(hashes) != 1 {
-		t.Fatalf("expected 1 hash, got %d", len(hashes))
+	keys := MapLeaf(input)
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 key, got %d", len(keys))
 	}
-	expected := sha256.Sum256(input)
-	if hashes[0] != expected {
-		t.Fatalf("expected hash %x, got %x", expected, hashes[0])
+	if !bytes.Equal(keys[0], input) {
+		t.Fatalf("expected key %q, got %q", string(input), string(keys[0]))
 	}
 }
 

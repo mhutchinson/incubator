@@ -16,31 +16,30 @@
 package sdk
 
 var (
-	registeredMapFunc    MapFunc
-	registeredRawMapFunc RawMapFunc
+	registeredMapFunc       MapFunc
+	registeredRawMapFunc    RawMapFunc
+	registeredStringMapFunc StringMapFunc
 )
 
-// Register registers a structured MapFunc plugin.
+// Register registers a structured MapFunc plugin with preimages.
 func Register(fn MapFunc) {
+	registeredRawMapFunc = nil
+	registeredStringMapFunc = nil
 	registeredMapFunc = fn
 }
 
-// RegisterRaw registers a raw RawMapFunc plugin.
+// RegisterRaw registers a raw RawMapFunc plugin returning [][]byte preimages.
 func RegisterRaw(fn RawMapFunc) {
+	registeredMapFunc = nil
+	registeredStringMapFunc = nil
 	registeredRawMapFunc = fn
 }
 
-// ExecuteMap invokes the registered MapFunc or RawMapFunc with the input slice.
-func ExecuteMap(leaf []byte) (ptr uint32, length uint32) {
-	if registeredMapFunc != nil {
-		entries := registeredMapFunc(leaf)
-		return EncodeStructured(entries)
-	}
-	if registeredRawMapFunc != nil {
-		hashes := registeredRawMapFunc(leaf)
-		return EncodeRaw(hashes)
-	}
-	return 0, 0
+// RegisterStrings registers a plugin returning []string preimages.
+func RegisterStrings(fn StringMapFunc) {
+	registeredMapFunc = nil
+	registeredRawMapFunc = nil
+	registeredStringMapFunc = fn
 }
 
 //go:wasmexport allocate
@@ -48,14 +47,9 @@ func allocate(size uint32) uint32 {
 	return Allocate(size)
 }
 
-//go:wasmexport map_leaf
-func mapLeaf(inPtr, inLen uint32) uint64 {
-	var in []byte
-	if inLen > 0 {
-		in = GetInputSlice(inPtr, inLen)
-	}
-
-	outPtr, outLen := ExecuteMap(in)
+//go:wasmexport map_bundle
+func mapBundle(inPtr, inLen uint32) uint64 {
+	outPtr, outLen := ExecuteBundle(inPtr, inLen)
 	return (uint64(outPtr) << 32) | uint64(outLen)
 }
 
@@ -63,3 +57,10 @@ func mapLeaf(inPtr, inLen uint32) uint64 {
 func reset() {
 	Reset()
 }
+
+// Suppress unused warnings when compiled on non-WASM architectures.
+var (
+	_ = allocate
+	_ = mapBundle
+	_ = reset
+)

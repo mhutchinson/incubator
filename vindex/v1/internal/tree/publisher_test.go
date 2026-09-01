@@ -217,6 +217,7 @@ func TestPublisher_PublishDirect(t *testing.T) {
 	activeState := pub.GetServingState()
 	if activeState == nil {
 		t.Fatal("GetServingState() returned nil, want promoted state")
+		return
 	}
 	if activeState.MapRoot != mapRoot {
 		t.Errorf("activeState.MapRoot = %x, want %x", activeState.MapRoot, mapRoot)

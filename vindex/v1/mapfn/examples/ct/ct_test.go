@@ -18,7 +18,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
@@ -62,12 +61,13 @@ func buildRFC6962Leaf(entryType uint16, payload []byte) []byte {
 	binary.BigEndian.PutUint16(et[:], entryType)
 	buf = append(buf, et[:]...)
 
-	if entryType == 0 { // x509_entry
+	switch entryType {
+	case 0: // x509_entry
 		certLen := len(payload)
 		buf = append(buf, byte(certLen>>16), byte(certLen>>8), byte(certLen))
 		buf = append(buf, payload...)
 		buf = append(buf, 0x00, 0x00) // extensions length
-	} else if entryType == 1 { // precert_entry
+	case 1: // precert_entry
 		var keyHash [32]byte
 		buf = append(buf, keyHash[:]...)
 		tbsLen := len(payload)
@@ -82,10 +82,10 @@ func TestMapCTLeaf_X509Certificate(t *testing.T) {
 	certDer := generateTestCert(t, "example.com", []string{"foo.bar.example.com", "*.sub.example.org"})
 	leaf := buildRFC6962Leaf(0, certDer)
 
-	hashes := MapCTLeaf(leaf)
-	hashMap := make(map[[32]byte]bool)
-	for _, h := range hashes {
-		hashMap[h] = true
+	domains := MapCTLeaf(leaf)
+	domainMap := make(map[string]bool)
+	for _, d := range domains {
+		domainMap[d] = true
 	}
 
 	expectedDomains := []string{
@@ -97,19 +97,18 @@ func TestMapCTLeaf_X509Certificate(t *testing.T) {
 	}
 
 	for _, d := range expectedDomains {
-		h := sha256.Sum256([]byte(d))
-		if !hashMap[h] {
-			t.Errorf("expected domain %q (hash %x) in mapped entries", d, h)
+		if !domainMap[d] {
+			t.Errorf("expected domain %q in mapped entries", d)
 		}
 	}
 }
 
 func TestMapCTLeaf_EffectiveTLDPlusOne(t *testing.T) {
 	certDer := generateTestCert(t, "deep.sub.service.co.uk", nil)
-	hashes := MapCTLeaf(certDer)
-	hashMap := make(map[[32]byte]bool)
-	for _, h := range hashes {
-		hashMap[h] = true
+	domains := MapCTLeaf(certDer)
+	domainMap := make(map[string]bool)
+	for _, d := range domains {
+		domainMap[d] = true
 	}
 
 	expectedDomains := []string{
@@ -119,30 +118,27 @@ func TestMapCTLeaf_EffectiveTLDPlusOne(t *testing.T) {
 	}
 
 	for _, d := range expectedDomains {
-		h := sha256.Sum256([]byte(d))
-		if !hashMap[h] {
+		if !domainMap[d] {
 			t.Errorf("expected domain %q in mapped entries", d)
 		}
 	}
 
 	// Verify "co.uk" (public suffix) is NOT included as a sub-root
-	badH := sha256.Sum256([]byte("co.uk"))
-	if hashMap[badH] {
+	if domainMap["co.uk"] {
 		t.Errorf("unexpected public suffix 'co.uk' found in mapped entries")
 	}
 }
 
 func TestMapCTLeaf_PlaintextFallback(t *testing.T) {
 	plain := []byte("alpha.example.com\n*.beta.example.com\n")
-	hashes := MapCTLeaf(plain)
-	hashMap := make(map[[32]byte]bool)
-	for _, h := range hashes {
-		hashMap[h] = true
+	domains := MapCTLeaf(plain)
+	domainMap := make(map[string]bool)
+	for _, d := range domains {
+		domainMap[d] = true
 	}
 
 	for _, d := range []string{"alpha.example.com", "beta.example.com", "example.com"} {
-		h := sha256.Sum256([]byte(d))
-		if !hashMap[h] {
+		if !domainMap[d] {
 			t.Errorf("expected %q in mapped entries", d)
 		}
 	}

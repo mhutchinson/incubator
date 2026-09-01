@@ -66,11 +66,12 @@ type WASMHost struct {
 }
 
 type wasmInstance struct {
-	mod       api.Module
-	mapLeafFn api.Function
-	allocFn   api.Function
-	resetFn   api.Function
-	mem       api.Memory
+	mod         api.Module
+	mapBundleFn api.Function
+	mapLeafFn   api.Function
+	allocFn     api.Function
+	resetFn     api.Function
+	mem         api.Memory
 }
 
 // NewWASMHost compiles the guest bytecode and initializes a pool of instantiated WASM modules.
@@ -133,10 +134,11 @@ func (h *WASMHost) instantiateInstance(ctx context.Context) (*wasmInstance, erro
 		return nil, err
 	}
 
+	mapBundleFn := mod.ExportedFunction("map_bundle")
 	mapLeafFn := mod.ExportedFunction("map_leaf")
-	if mapLeafFn == nil {
+	if mapBundleFn == nil && mapLeafFn == nil {
 		_ = mod.Close(ctx)
-		return nil, fmt.Errorf("%w: exported function 'map_leaf' not found", ErrWasmHalt)
+		return nil, fmt.Errorf("%w: neither 'map_bundle' nor 'map_leaf' exported", ErrWasmHalt)
 	}
 
 	mem := mod.Memory()
@@ -153,15 +155,175 @@ func (h *WASMHost) instantiateInstance(ctx context.Context) (*wasmInstance, erro
 	resetFn := mod.ExportedFunction("reset")
 
 	return &wasmInstance{
-		mod:       mod,
-		mapLeafFn: mapLeafFn,
-		allocFn:   allocFn,
-		resetFn:   resetFn,
-		mem:       mem,
+		mod:         mod,
+		mapBundleFn: mapBundleFn,
+		mapLeafFn:   mapLeafFn,
+		allocFn:     allocFn,
+		resetFn:     resetFn,
+		mem:         mem,
 	}, nil
 }
 
+func packBundleInput(leaves [][]byte) []byte {
+	n := len(leaves)
+	if n == 0 || n > 256 {
+		return nil
+	}
+
+	headerLen := 4 + (n+1)*4
+	var payloadLen int
+	for _, l := range leaves {
+		payloadLen += len(l)
+	}
+
+	buf := make([]byte, headerLen+payloadLen)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(n))
+
+	var currentOffset uint32
+	binary.LittleEndian.PutUint32(buf[4:8], 0)
+	payloadDst := buf[headerLen:]
+	var writePos int
+
+	for i, l := range leaves {
+		copy(payloadDst[writePos:], l)
+		writePos += len(l)
+		currentOffset += uint32(len(l))
+		binary.LittleEndian.PutUint32(buf[4+(i+1)*4:4+(i+2)*4], currentOffset)
+	}
+
+	return buf
+}
+
+func (inst *wasmInstance) executeBundle(ctx context.Context, leaves [][]byte) ([][]MappedEntry, error) {
+	if inst.mapBundleFn != nil {
+		n := len(leaves)
+		if n == 0 {
+			return nil, nil
+		}
+		if n > 256 {
+			return nil, fmt.Errorf("%w: bundle size %d exceeds 256", ErrMalformedOutput, n)
+		}
+
+		packedInput := packBundleInput(leaves)
+		if inst.allocFn == nil {
+			return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
+		}
+
+		res, err := inst.allocFn.Call(ctx, uint64(len(packedInput)))
+		if err != nil {
+			return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
+		}
+		inPtr := uint32(res[0])
+		if inPtr == 0 {
+			return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
+		}
+
+		if !inst.mem.Write(inPtr, packedInput) {
+			return nil, fmt.Errorf("%w: failed to write bundle input to memory at ptr %d len %d",
+				ErrInvalidMemory, inPtr, len(packedInput))
+		}
+
+		callRes, err := inst.mapBundleFn.Call(ctx, uint64(inPtr), uint64(len(packedInput)))
+		if err != nil {
+			return nil, fmt.Errorf("%w: map_bundle execution failed: %v", ErrWasmHalt, err)
+		}
+		if len(callRes) == 0 {
+			return nil, fmt.Errorf("%w: map_bundle returned no result", ErrMalformedOutput)
+		}
+
+		packed := callRes[0]
+		outPtr := uint32(packed >> 32)
+		outLen := uint32(packed & 0xFFFFFFFF)
+		if outLen == 0 {
+			return make([][]MappedEntry, n), nil
+		}
+
+		outBuf, ok := inst.mem.Read(outPtr, outLen)
+		if !ok {
+			return nil, fmt.Errorf("%w: out_ptr=%d out_len=%d exceeds guest memory %d",
+				ErrInvalidMemory, outPtr, outLen, inst.mem.Size())
+		}
+
+		return decodeBundleOutput(outBuf, n)
+	}
+
+	// Fallback to legacy single-leaf map_leaf
+	results := make([][]MappedEntry, len(leaves))
+	for i, leaf := range leaves {
+		entries, err := inst.executeLeaf(ctx, leaf)
+		if err != nil {
+			return nil, fmt.Errorf("leaf %d in bundle: %w", i, err)
+		}
+		results[i] = entries
+
+		if inst.resetFn != nil && i+1 < len(leaves) {
+			if _, err := inst.resetFn.Call(ctx); err != nil {
+				return nil, fmt.Errorf("%w: reset failed on leaf %d: %v", ErrWasmHalt, i, err)
+			}
+		}
+	}
+	return results, nil
+}
+
+func decodeBundleOutput(outBuf []byte, expectedCount int) ([][]MappedEntry, error) {
+	if len(outBuf) < 4+expectedCount*4 {
+		return nil, fmt.Errorf("%w: bundle output length %d is too short for %d leaves", ErrMalformedOutput, len(outBuf), expectedCount)
+	}
+
+	leafCount := binary.LittleEndian.Uint32(outBuf[0:4])
+	if int(leafCount) != expectedCount {
+		return nil, fmt.Errorf("%w: bundle output leaf_count %d != expected %d", ErrMalformedOutput, leafCount, expectedCount)
+	}
+
+	keyCountsOffset := 4
+	preimagesOffset := 4 + expectedCount*4
+	results := make([][]MappedEntry, expectedCount)
+
+	for i := 0; i < expectedCount; i++ {
+		kCount := binary.LittleEndian.Uint32(outBuf[keyCountsOffset+i*4 : keyCountsOffset+(i+1)*4])
+		entries := make([]MappedEntry, 0, kCount)
+
+		for j := uint32(0); j < kCount; j++ {
+			if preimagesOffset+4 > len(outBuf) {
+				return nil, fmt.Errorf("%w: truncated key length header", ErrMalformedOutput)
+			}
+			keyLen := binary.LittleEndian.Uint32(outBuf[preimagesOffset : preimagesOffset+4])
+			preimagesOffset += 4
+
+			if preimagesOffset+int(keyLen) > len(outBuf) {
+				return nil, fmt.Errorf("%w: truncated key bytes", ErrMalformedOutput)
+			}
+			keyBytes := outBuf[preimagesOffset : preimagesOffset+int(keyLen)]
+			preimagesOffset += int(keyLen)
+
+			h := sha256.Sum256(keyBytes)
+			entries = append(entries, MappedEntry{KeyHash: h})
+		}
+
+		slices.SortFunc(entries, func(a, b MappedEntry) int {
+			return bytes.Compare(a.KeyHash[:], b.KeyHash[:])
+		})
+		entries = slices.CompactFunc(entries, func(a, b MappedEntry) bool {
+			return a.KeyHash == b.KeyHash
+		})
+		results[i] = entries
+	}
+
+	return results, nil
+}
+
 func (inst *wasmInstance) executeLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, error) {
+	if inst.mapBundleFn != nil {
+		res, err := inst.executeBundle(ctx, [][]byte{leaf})
+		if err != nil {
+			return nil, err
+		}
+		if len(res) == 0 {
+			return nil, nil
+		}
+		return res[0], nil
+	}
+
 	var inputPtr uint32
 	leafLen := uint32(len(leaf))
 	if leafLen > 0 {
@@ -223,7 +385,7 @@ func (inst *wasmInstance) executeLeaf(ctx context.Context, leaf []byte) ([]Mappe
 	return entries, nil
 }
 
-// MapLeaf executes the WASM map_leaf export against leaf payload and returns sorted, deduplicated entries.
+// MapLeaf executes the WASM map_leaf/map_bundle export against leaf payload and returns sorted, deduplicated entries.
 func (h *WASMHost) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, error) {
 	h.mu.Lock()
 	if h.closed {
@@ -387,21 +549,10 @@ func (h *WASMHost) MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEn
 		h.mu.Unlock()
 	}()
 
-	results := make([][]MappedEntry, len(leaves))
-	for i, leaf := range leaves {
-		entries, err := inst.executeLeaf(callCtx, leaf)
-		if err != nil {
-			modErr = fmt.Errorf("leaf %d in bundle: %w", i, err)
-			return nil, modErr
-		}
-		results[i] = entries
-
-		if inst.resetFn != nil && i+1 < len(leaves) {
-			if _, err := inst.resetFn.Call(callCtx); err != nil {
-				modErr = fmt.Errorf("%w: reset failed on leaf %d: %v", ErrWasmHalt, i, err)
-				return nil, modErr
-			}
-		}
+	results, err := inst.executeBundle(callCtx, leaves)
+	if err != nil {
+		modErr = err
+		return nil, modErr
 	}
 
 	return results, nil

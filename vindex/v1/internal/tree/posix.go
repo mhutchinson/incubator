@@ -95,7 +95,6 @@ type POSIXOutputLog struct {
 	shutdown  func(context.Context) error
 	cancel    context.CancelFunc
 	origin    string
-	signer    note.Signer
 	closeOnce sync.Once
 	closeErr  error
 }

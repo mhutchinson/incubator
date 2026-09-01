@@ -19,7 +19,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 
 	"github.com/transparency-dev/incubator/vindex/v1/mapfn/sdk"
 )
@@ -28,19 +27,18 @@ func main() {}
 
 func init() {
 	// Register the leaf mapping function.
-	// Use sdk.RegisterRaw for raw 32-byte key hashes, or sdk.Register for key+value entries.
+	// Use sdk.RegisterRaw for raw preimages, or sdk.Register for key+value entries.
 	sdk.RegisterRaw(MapLeaf)
 }
 
-// MapLeaf inspects a single log leaf and extracts one or more 32-byte search keys.
-func MapLeaf(leaf []byte) [][sha256.Size]byte {
+// MapLeaf inspects a single log leaf and extracts one or more canonical search key preimages.
+func MapLeaf(leaf []byte) [][]byte {
 	leaf = bytes.TrimSpace(leaf)
 	if len(leaf) == 0 {
 		return nil
 	}
 
-	// Example: hash the leaf payload directly as the search key.
+	// Example: return the leaf payload directly as the search key preimage.
 	// Replace this logic with your custom leaf parsing / key extraction.
-	keyHash := sha256.Sum256(leaf)
-	return [][sha256.Size]byte{keyHash}
+	return [][]byte{leaf}
 }

@@ -14,16 +14,17 @@
 
 package sdk
 
-import "crypto/sha256"
-
-// Entry represents a single search key and optional value produced by a MapFunc.
+// Entry represents a single search key preimage and optional value produced by a MapFunc.
 type Entry struct {
-	KeyHash [sha256.Size]byte
-	Value   []byte
+	Key   []byte // Search key preimage (e.g. "golang.org/x/mod", "example.com")
+	Value []byte // Optional value payload
 }
 
-// MapFunc maps a raw input log leaf to structured searchable entries.
+// MapFunc maps a raw input log leaf to structured searchable entries with preimages.
 type MapFunc func(leaf []byte) []Entry
 
-// RawMapFunc maps a raw input log leaf to raw 32-byte key hashes.
-type RawMapFunc func(leaf []byte) [][sha256.Size]byte
+// RawMapFunc maps a raw input log leaf to raw search key preimages.
+type RawMapFunc func(leaf []byte) [][]byte
+
+// StringMapFunc maps a raw input log leaf to search key string preimages.
+type StringMapFunc func(leaf []byte) []string

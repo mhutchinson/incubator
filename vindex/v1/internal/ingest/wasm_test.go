@@ -857,31 +857,190 @@ func TestWASMHost_MapBundle(t *testing.T) {
 	}
 }
 
-func TestWASMHost_MapBundle_TrapReplenishesPool(t *testing.T) {
-	ctx := context.Background()
-	// reset function body traps with unreachable (0x00)
-	wasmBytes := assembleWasmWithReset([]byte{0x00})
+func assembleMapBundleWasm(outputData []byte, outOffset uint32) []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00})
 
-	host, err := NewWASMHost(ctx, wasmBytes, 1)
+	typeSec := []byte{
+		0x03,                   // 3 types
+		0x60, 0x02, 0x7f, 0x7f, // type 0: func(i32, i32) -> i64
+		0x01, 0x7e,
+		0x60, 0x01, 0x7f, // type 1: func(i32) -> i32
+		0x01, 0x7f,
+		0x60, 0x00, 0x00, // type 2: func() -> ()
+	}
+	writeSection(&buf, 1, typeSec)
+
+	funcSec := []byte{0x03, 0x00, 0x01, 0x02} // 3 funcs
+	writeSection(&buf, 3, funcSec)
+
+	memSec := []byte{0x01, 0x00, 0x01} // memory: min 1 page
+	writeSection(&buf, 5, memSec)
+
+	var expSec bytes.Buffer
+	expSec.WriteByte(4) // 4 exports
+	expSec.WriteByte(6)
+	expSec.WriteString("memory")
+	expSec.WriteByte(0x02)
+	expSec.WriteByte(0x00)
+
+	expSec.WriteByte(10)
+	expSec.WriteString("map_bundle")
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(0x00)
+
+	expSec.WriteByte(8)
+	expSec.WriteString("allocate")
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(0x01)
+
+	expSec.WriteByte(5)
+	expSec.WriteString("reset")
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(0x02)
+	writeSection(&buf, 7, expSec.Bytes())
+
+	var codeSec bytes.Buffer
+	codeSec.Write(leb128U32(3)) // 3 function bodies
+
+	// Body 0: map_bundle
+	var mapBody bytes.Buffer
+	mapBody.Write(leb128U32(0))
+	packed := (uint64(outOffset) << 32) | uint64(len(outputData))
+	mapBody.WriteByte(0x42) // i64.const
+	mapBody.Write(leb128I64(int64(packed)))
+	mapBody.WriteByte(0x0b)
+
+	codeSec.Write(leb128U32(uint32(mapBody.Len())))
+	codeSec.Write(mapBody.Bytes())
+
+	// Body 1: allocate
+	var allocBody bytes.Buffer
+	allocBody.Write(leb128U32(0))
+	allocBody.WriteByte(0x41) // i32.const
+	allocBody.Write(leb128I64(100))
+	allocBody.WriteByte(0x0b)
+
+	codeSec.Write(leb128U32(uint32(allocBody.Len())))
+	codeSec.Write(allocBody.Bytes())
+
+	// Body 2: reset
+	var resetBody bytes.Buffer
+	resetBody.Write(leb128U32(0))
+	resetBody.WriteByte(0x0b)
+
+	codeSec.Write(leb128U32(uint32(resetBody.Len())))
+	codeSec.Write(resetBody.Bytes())
+
+	writeSection(&buf, 10, codeSec.Bytes())
+
+	if len(outputData) > 0 {
+		var dataSec bytes.Buffer
+		dataSec.Write(leb128U32(1))
+		dataSec.WriteByte(0x00)
+		dataSec.WriteByte(0x41)
+		dataSec.Write(leb128U32(outOffset))
+		dataSec.WriteByte(0x0b)
+		dataSec.Write(leb128U32(uint32(len(outputData))))
+		dataSec.Write(outputData)
+		writeSection(&buf, 11, dataSec.Bytes())
+	}
+
+	return buf.Bytes()
+}
+
+func TestWASMHost_MapBundle_PreimagesAndHardwareHashing(t *testing.T) {
+	ctx := context.Background()
+
+	// Pack bundle output for 3 leaves:
+	// Leaf 0: 2 keys: "golang.org/x/mod", "example.com"
+	// Leaf 1: 0 keys (filtered)
+	// Leaf 2: 1 key: "my-package"
+	var outBuf bytes.Buffer
+	var leafCount [4]byte
+	binary.LittleEndian.PutUint32(leafCount[:], 3)
+	outBuf.Write(leafCount[:])
+
+	// key_counts array (3 x uint32)
+	var kc [12]byte
+	binary.LittleEndian.PutUint32(kc[0:4], 2)
+	binary.LittleEndian.PutUint32(kc[4:8], 0)
+	binary.LittleEndian.PutUint32(kc[8:12], 1)
+	outBuf.Write(kc[:])
+
+	// Framed preimages:
+	// Leaf 0 Key 0: "golang.org/x/mod"
+	k0 := []byte("golang.org/x/mod")
+	var k0Len [4]byte
+	binary.LittleEndian.PutUint32(k0Len[:], uint32(len(k0)))
+	outBuf.Write(k0Len[:])
+	outBuf.Write(k0)
+
+	// Leaf 0 Key 1: "example.com"
+	k1 := []byte("example.com")
+	var k1Len [4]byte
+	binary.LittleEndian.PutUint32(k1Len[:], uint32(len(k1)))
+	outBuf.Write(k1Len[:])
+	outBuf.Write(k1)
+
+	// Leaf 2 Key 0: "my-package"
+	k2 := []byte("my-package")
+	var k2Len [4]byte
+	binary.LittleEndian.PutUint32(k2Len[:], uint32(len(k2)))
+	outBuf.Write(k2Len[:])
+	outBuf.Write(k2)
+
+	wasmBytes := assembleMapBundleWasm(outBuf.Bytes(), 2048)
+	host, err := NewWASMHost(ctx, wasmBytes, 2)
 	if err != nil {
 		t.Fatalf("NewWASMHost failed: %v", err)
 	}
 	defer func() { _ = host.Close(ctx) }()
 
-	// Calling MapBundle with 2 leaves should fail on reset between leaves, replenishing module
-	leaves := [][]byte{[]byte("leaf0"), []byte("leaf1")}
-	_, err = host.MapBundle(ctx, leaves)
-	if err == nil {
-		t.Fatal("expected error on trapping reset during bundle, got nil")
+	leaves := [][]byte{
+		[]byte("leaf0_payload"),
+		[]byte("leaf1_payload"),
+		[]byte("leaf2_payload"),
 	}
 
-	// Module pool must have been replenished: single leaf call should succeed
-	singleRes, err := host.MapLeaf(ctx, []byte("fresh_leaf"))
+	results, err := host.MapBundle(ctx, leaves)
 	if err != nil {
-		t.Fatalf("subsequent MapLeaf failed after replenishment: %v", err)
+		t.Fatalf("MapBundle failed: %v", err)
 	}
-	if len(singleRes) != 1 {
-		t.Fatalf("expected 1 entry, got %d", len(singleRes))
+
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+
+	// Verify Leaf 0: 2 keys, sorted and hashed via host SHA-256
+	h0 := sha256.Sum256(k0)
+	h1 := sha256.Sum256(k1)
+	if len(results[0]) != 2 {
+		t.Fatalf("leaf 0 expected 2 entries, got %d", len(results[0]))
+	}
+	// Check sorted order
+	var expected0, expected1 [32]byte
+	if bytes.Compare(h0[:], h1[:]) < 0 {
+		expected0, expected1 = h0, h1
+	} else {
+		expected0, expected1 = h1, h0
+	}
+	if results[0][0].KeyHash != expected0 || results[0][1].KeyHash != expected1 {
+		t.Fatalf("leaf 0 key hashes mismatch")
+	}
+
+	// Verify Leaf 1: 0 keys
+	if len(results[1]) != 0 {
+		t.Fatalf("leaf 1 expected 0 entries, got %d", len(results[1]))
+	}
+
+	// Verify Leaf 2: 1 key
+	h2 := sha256.Sum256(k2)
+	if len(results[2]) != 1 {
+		t.Fatalf("leaf 2 expected 1 entry, got %d", len(results[2]))
+	}
+	if results[2][0].KeyHash != h2 {
+		t.Fatalf("leaf 2 hash mismatch: got %x, want %x", results[2][0].KeyHash, h2)
 	}
 }
 

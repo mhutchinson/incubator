@@ -15,8 +15,6 @@
 package sdk
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"testing"
 )
@@ -78,111 +76,100 @@ func TestArena_AllocateOverflow(t *testing.T) {
 	Reset()
 }
 
-func TestEncodeRaw(t *testing.T) {
+func TestPackBundleInput_And_ExecuteBundle_Raw(t *testing.T) {
 	Reset()
 
-	h1 := sha256.Sum256([]byte("key1"))
-	h2 := sha256.Sum256([]byte("key2"))
-
-	ptr, length := EncodeRaw([][sha256.Size]byte{h1, h2})
-	if ptr == 0 || length != 64 {
-		t.Fatalf("unexpected EncodeRaw result: ptr=%d, length=%d", ptr, length)
-	}
-
-	expected := append(h1[:], h2[:]...)
-	actual := outputBuf[:length]
-	if !bytes.Equal(actual, expected) {
-		t.Fatalf("raw bytes mismatch:\ngot  %x\nwant %x", actual, expected)
-	}
-}
-
-func TestEncodeStructured(t *testing.T) {
-	Reset()
-
-	h1 := sha256.Sum256([]byte("key1"))
-	val1 := []byte("val1")
-	h2 := sha256.Sum256([]byte("key2"))
-	val2 := []byte("val2_longer_string")
-
-	entries := []Entry{
-		{KeyHash: h1, Value: val1},
-		{KeyHash: h2, Value: val2},
-	}
-
-	ptr, length := EncodeStructured(entries)
-	if ptr == 0 {
-		t.Fatal("expected valid ptr from EncodeStructured")
-	}
-
-	data := outputBuf[:length]
-	if len(data) < 4 {
-		t.Fatalf("data too short: %d", len(data))
-	}
-	count := binary.BigEndian.Uint32(data[0:4])
-	if count != 2 {
-		t.Fatalf("expected count 2, got %d", count)
-	}
-
-	offset := 4
-	// Entry 1
-	var gotH1 [32]byte
-	copy(gotH1[:], data[offset:offset+32])
-	if gotH1 != h1 {
-		t.Fatalf("entry 1 hash mismatch")
-	}
-	offset += 32
-	vlen1 := binary.BigEndian.Uint16(data[offset : offset+2])
-	if int(vlen1) != len(val1) {
-		t.Fatalf("entry 1 value len mismatch")
-	}
-	offset += 2
-	if !bytes.Equal(data[offset:offset+int(vlen1)], val1) {
-		t.Fatalf("entry 1 value mismatch")
-	}
-	offset += int(vlen1)
-
-	// Entry 2
-	var gotH2 [32]byte
-	copy(gotH2[:], data[offset:offset+32])
-	if gotH2 != h2 {
-		t.Fatalf("entry 2 hash mismatch")
-	}
-	offset += 32
-	vlen2 := binary.BigEndian.Uint16(data[offset : offset+2])
-	if int(vlen2) != len(val2) {
-		t.Fatalf("entry 2 value len mismatch")
-	}
-	offset += 2
-	if !bytes.Equal(data[offset:offset+int(vlen2)], val2) {
-		t.Fatalf("entry 2 value mismatch")
-	}
-	offset += int(vlen2)
-
-	if offset != int(length) {
-		t.Fatalf("offset %d != length %d", offset, length)
-	}
-}
-
-func TestRegisterAndExecuteMap(t *testing.T) {
-	Reset()
-
-	h := sha256.Sum256([]byte("sdk_test"))
-	Register(func(leaf []byte) []Entry {
-		return []Entry{{KeyHash: h, Value: leaf}}
+	RegisterRaw(func(leaf []byte) [][]byte {
+		if string(leaf) == "skip" {
+			return nil
+		}
+		return [][]byte{
+			[]byte("key_" + string(leaf)),
+			[]byte("extra_" + string(leaf)),
+		}
 	})
 
-	ptr, length := ExecuteMap([]byte("hello"))
-	if ptr == 0 || length == 0 {
-		t.Fatalf("ExecuteMap failed: ptr=%d len=%d", ptr, length)
+	leaves := [][]byte{
+		[]byte("leaf0"),
+		[]byte("leaf1"),
+		[]byte("skip"),
+		[]byte("leaf3"),
 	}
 
-	packed := mapLeaf(0, 0)
-	if packed == 0 {
-		t.Fatalf("mapLeaf failed, got packed 0")
+	packedInput := PackBundleInput(leaves)
+	if len(packedInput) == 0 {
+		t.Fatal("PackBundleInput returned empty buffer")
+	}
+
+	ptr := Allocate(uint32(len(packedInput)))
+	if ptr == 0 {
+		t.Fatal("Allocate failed")
+	}
+	copy(GetInputSlice(ptr, uint32(len(packedInput))), packedInput)
+
+	outPtr, outLen := ExecuteBundle(ptr, uint32(len(packedInput)))
+	if outPtr == 0 || outLen == 0 {
+		t.Fatalf("ExecuteBundle failed: outPtr=%d outLen=%d", outPtr, outLen)
+	}
+
+	outBuf := outputBuf[:outLen]
+	leafCount := binary.LittleEndian.Uint32(outBuf[0:4])
+	if leafCount != 4 {
+		t.Fatalf("leafCount = %d, want 4", leafCount)
+	}
+
+	k0 := binary.LittleEndian.Uint32(outBuf[4:8])
+	k1 := binary.LittleEndian.Uint32(outBuf[8:12])
+	k2 := binary.LittleEndian.Uint32(outBuf[12:16])
+	k3 := binary.LittleEndian.Uint32(outBuf[16:20])
+
+	if k0 != 2 || k1 != 2 || k2 != 0 || k3 != 2 {
+		t.Fatalf("key counts mismatch: [%d, %d, %d, %d], want [2, 2, 0, 2]", k0, k1, k2, k3)
+	}
+
+	// Verify mapBundle wasm export
+	ret := mapBundle(ptr, uint32(len(packedInput)))
+	if ret == 0 {
+		t.Fatal("mapBundle returned 0")
 	}
 
 	reset()
 	if allocOffset != 0 {
 		t.Fatalf("reset failed, allocOffset is %d", allocOffset)
+	}
+}
+
+func TestExecuteBundle_Strings(t *testing.T) {
+	Reset()
+
+	RegisterStrings(func(leaf []byte) []string {
+		return []string{"domain_" + string(leaf)}
+	})
+
+	leaves := [][]byte{[]byte("example.com")}
+	packedInput := PackBundleInput(leaves)
+
+	ptr := Allocate(uint32(len(packedInput)))
+	copy(GetInputSlice(ptr, uint32(len(packedInput))), packedInput)
+
+	outPtr, outLen := ExecuteBundle(ptr, uint32(len(packedInput)))
+	if outPtr == 0 || outLen == 0 {
+		t.Fatalf("ExecuteBundle failed: outPtr=%d outLen=%d", outPtr, outLen)
+	}
+
+	outBuf := outputBuf[:outLen]
+	leafCount := binary.LittleEndian.Uint32(outBuf[0:4])
+	if leafCount != 1 {
+		t.Fatalf("leafCount = %d, want 1", leafCount)
+	}
+	kCount := binary.LittleEndian.Uint32(outBuf[4:8])
+	if kCount != 1 {
+		t.Fatalf("kCount = %d, want 1", kCount)
+	}
+
+	keyLen := binary.LittleEndian.Uint32(outBuf[8:12])
+	keyBytes := string(outBuf[12 : 12+keyLen])
+	if keyBytes != "domain_example.com" {
+		t.Fatalf("key = %q, want %q", keyBytes, "domain_example.com")
 	}
 }

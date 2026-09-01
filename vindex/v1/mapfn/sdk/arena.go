@@ -15,14 +15,13 @@
 package sdk
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"unsafe"
 )
 
 const (
-	// MaxBufferSize is the 1MB static arena buffer size.
-	MaxBufferSize = 1024 * 1024
+	// MaxBufferSize is the static arena buffer size (4MB to accommodate 256-leaf bundles).
+	MaxBufferSize = 4 * 1024 * 1024
 )
 
 var (
@@ -55,8 +54,10 @@ func GetInputSlice(ptr, length uint32) []byte {
 		offset := ptr - base
 		return inputBuf[offset : offset+length]
 	}
-	// Fallback when accessed outside static arena
-	return unsafe.Slice((*byte)(unsafe.Pointer(uintptr(ptr))), length)
+	if ptr < MaxBufferSize && ptr+length <= MaxBufferSize {
+		return inputBuf[ptr : ptr+length]
+	}
+	return nil
 }
 
 // Reset clears the bump allocator offset for the next execution.
@@ -64,50 +65,117 @@ func Reset() {
 	allocOffset = 0
 }
 
-// EncodeRaw encodes raw 32-byte hashes into the output arena and returns (ptr, len).
-func EncodeRaw(hashes [][sha256.Size]byte) (uint32, uint32) {
-	totalLen := uint32(len(hashes) * sha256.Size)
-	if totalLen == 0 {
-		return 0, 0
+// PackBundleInput serializes a slice of up to 256 leaves into the standard input buffer layout.
+// Framing: [leaf_count (4B uint32 LE)][offsets ([N+1]uint32 LE)][contiguous payload bytes]
+func PackBundleInput(leaves [][]byte) []byte {
+	n := len(leaves)
+	if n == 0 || n > 256 {
+		return nil
 	}
-	if totalLen > MaxBufferSize {
-		return 0, 0
+
+	headerLen := 4 + (n+1)*4
+	var payloadLen int
+	for _, l := range leaves {
+		payloadLen += len(l)
 	}
-	for i, h := range hashes {
-		copy(outputBuf[i*sha256.Size:(i+1)*sha256.Size], h[:])
+
+	buf := make([]byte, headerLen+payloadLen)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(n))
+
+	var currentOffset uint32
+	binary.LittleEndian.PutUint32(buf[4:8], 0)
+	payloadDst := buf[headerLen:]
+	var writePos int
+
+	for i, l := range leaves {
+		copy(payloadDst[writePos:], l)
+		writePos += len(l)
+		currentOffset += uint32(len(l))
+		binary.LittleEndian.PutUint32(buf[4+(i+1)*4:4+(i+2)*4], currentOffset)
 	}
-	ptr := uint32(uintptr(unsafe.Pointer(&outputBuf[0])))
-	return ptr, totalLen
+
+	return buf
 }
 
-// EncodeStructured encodes structured entries into the output arena and returns (ptr, len).
-// Format: [Count(4B)][Entry: KeyHash(32B) + ValLen(2B) + Val]...
-func EncodeStructured(entries []Entry) (uint32, uint32) {
-	if len(entries) == 0 {
+// ExecuteBundle processes a framed bundle of leaves in inputBuf and writes framed preimages to outputBuf.
+func ExecuteBundle(inPtr, inLen uint32) (uint32, uint32) {
+	if inLen < 8 {
 		return 0, 0
 	}
-	totalLen := 4
-	for _, e := range entries {
-		if len(e.Value) > 0xFFFF {
+
+	inSlice := GetInputSlice(inPtr, inLen)
+	if len(inSlice) < 8 {
+		return 0, 0
+	}
+
+	leafCount := binary.LittleEndian.Uint32(inSlice[0:4])
+	if leafCount == 0 || leafCount > 256 {
+		return 0, 0
+	}
+
+	headerLen := 4 + (leafCount+1)*4
+	if uint32(len(inSlice)) < headerLen {
+		return 0, 0
+	}
+
+	offsetTable := inSlice[4:headerLen]
+	payload := inSlice[headerLen:]
+
+	outBase := uint32(uintptr(unsafe.Pointer(&outputBuf[0])))
+	binary.LittleEndian.PutUint32(outputBuf[0:4], leafCount)
+
+	keyCountsOffset := 4
+	outOffset := 4 + int(leafCount)*4
+
+	for i := uint32(0); i < leafCount; i++ {
+		start := binary.LittleEndian.Uint32(offsetTable[i*4 : (i+1)*4])
+		end := binary.LittleEndian.Uint32(offsetTable[(i+1)*4 : (i+2)*4])
+
+		if end < start || end > uint32(len(payload)) {
 			return 0, 0
 		}
-		totalLen += sha256.Size + 2 + len(e.Value)
-	}
-	if totalLen > MaxBufferSize {
-		return 0, 0
-	}
-	binary.BigEndian.PutUint32(outputBuf[0:4], uint32(len(entries)))
-	offset := 4
-	for _, e := range entries {
-		copy(outputBuf[offset:offset+sha256.Size], e.KeyHash[:])
-		offset += sha256.Size
-		binary.BigEndian.PutUint16(outputBuf[offset:offset+2], uint16(len(e.Value)))
-		offset += 2
-		if len(e.Value) > 0 {
-			copy(outputBuf[offset:offset+len(e.Value)], e.Value)
-			offset += len(e.Value)
+		leafBytes := payload[start:end]
+
+		if registeredRawMapFunc != nil {
+			keys := registeredRawMapFunc(leafBytes)
+			binary.LittleEndian.PutUint32(outputBuf[keyCountsOffset+int(i)*4:], uint32(len(keys)))
+			for _, k := range keys {
+				kLen := len(k)
+				if outOffset+4+kLen > MaxBufferSize {
+					return 0, 0
+				}
+				binary.LittleEndian.PutUint32(outputBuf[outOffset:outOffset+4], uint32(kLen))
+				copy(outputBuf[outOffset+4:outOffset+4+kLen], k)
+				outOffset += 4 + kLen
+			}
+		} else if registeredStringMapFunc != nil {
+			keys := registeredStringMapFunc(leafBytes)
+			binary.LittleEndian.PutUint32(outputBuf[keyCountsOffset+int(i)*4:], uint32(len(keys)))
+			for _, k := range keys {
+				kLen := len(k)
+				if outOffset+4+kLen > MaxBufferSize {
+					return 0, 0
+				}
+				binary.LittleEndian.PutUint32(outputBuf[outOffset:outOffset+4], uint32(kLen))
+				copy(outputBuf[outOffset+4:outOffset+4+kLen], []byte(k))
+				outOffset += 4 + kLen
+			}
+		} else if registeredMapFunc != nil {
+			entries := registeredMapFunc(leafBytes)
+			binary.LittleEndian.PutUint32(outputBuf[keyCountsOffset+int(i)*4:], uint32(len(entries)))
+			for _, e := range entries {
+				kLen := len(e.Key)
+				if outOffset+4+kLen > MaxBufferSize {
+					return 0, 0
+				}
+				binary.LittleEndian.PutUint32(outputBuf[outOffset:outOffset+4], uint32(kLen))
+				copy(outputBuf[outOffset+4:outOffset+4+kLen], e.Key)
+				outOffset += 4 + kLen
+			}
+		} else {
+			binary.LittleEndian.PutUint32(outputBuf[keyCountsOffset+int(i)*4:], 0)
 		}
 	}
-	ptr := uint32(uintptr(unsafe.Pointer(&outputBuf[0])))
-	return ptr, uint32(totalLen)
+
+	return outBase, uint32(outOffset)
 }

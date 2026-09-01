@@ -61,7 +61,9 @@ func runInspectCmd(ctx context.Context, args []string) error {
 	imports := compiled.ImportedFunctions()
 
 	hasAlloc := exports["allocate"] != nil || exports["malloc"] != nil
-	hasMap := exports["map_leaf"] != nil
+	hasMapBundle := exports["map_bundle"] != nil
+	hasMapLeaf := exports["map_leaf"] != nil
+	hasMap := hasMapBundle || hasMapLeaf
 	hasReset := exports["reset"] != nil
 
 	fmt.Printf("=== VIndex WASM MapFn Inspection: %s ===\n", *wasmPath)
@@ -76,10 +78,12 @@ func runInspectCmd(ctx context.Context, args []string) error {
 		fmt.Println("  [✗] allocate or malloc: MISSING")
 	}
 
-	if hasMap {
-		fmt.Println("  [✓] map_leaf (i32, i32) -> i64")
+	if hasMapBundle {
+		fmt.Println("  [✓] map_bundle (i32, i32) -> i64 (batch tile ABI)")
+	} else if hasMapLeaf {
+		fmt.Println("  [✓] map_leaf (i32, i32) -> i64 (legacy single-leaf ABI)")
 	} else {
-		fmt.Println("  [✗] map_leaf: MISSING")
+		fmt.Println("  [✗] map_bundle or map_leaf: MISSING")
 	}
 
 	fmt.Println("\nOptional ABI Exports:")

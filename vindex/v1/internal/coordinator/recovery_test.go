@@ -250,6 +250,7 @@ func TestRecovery_Phase1InstantServing(t *testing.T) {
 	restoredState := newPub.GetServingState()
 	if restoredState == nil {
 		t.Fatal("restored serving state is nil")
+		return
 	}
 	if restoredState.InputLogSize != 50 {
 		t.Fatalf("restored InputLogSize = %d, want 50", restoredState.InputLogSize)
@@ -323,6 +324,7 @@ func TestRecovery_Phase2ReplayCatchup(t *testing.T) {
 	restoredState := newPub.GetServingState()
 	if restoredState == nil {
 		t.Fatal("restored serving state is nil after Phase 2")
+		return
 	}
 	if restoredState.InputLogSize != 100 {
 		t.Fatalf("restored InputLogSize = %d, want 100", restoredState.InputLogSize)
@@ -348,6 +350,7 @@ func TestCoordinator_SyncOnce(t *testing.T) {
 	state := pub.GetServingState()
 	if state == nil {
 		t.Fatal("expected non-nil serving state after SyncOnce")
+		return
 	}
 	if state.InputLogSize != 200 {
 		t.Fatalf("InputLogSize = %d, want 200", state.InputLogSize)
@@ -553,6 +556,7 @@ func TestRecovery_LaggingMPT_FallbackToPhase2(t *testing.T) {
 	restoredState := newPub.GetServingState()
 	if restoredState == nil {
 		t.Fatal("restored serving state is nil")
+		return
 	}
 	if restoredState.InputLogSize != 100 {
 		t.Fatalf("restored InputLogSize = %d, want 100", restoredState.InputLogSize)
@@ -813,6 +817,7 @@ func TestRecover_Phase3Catchup_MPTAndOutputLogAdvanced(t *testing.T) {
 	servingState := newPub.GetServingState()
 	if servingState == nil {
 		t.Fatal("expected non-nil serving state after SyncOnce")
+		return
 	}
 	if servingState.InputLogSize != 150 {
 		t.Fatalf("servingState.InputLogSize = %d, want 150", servingState.InputLogSize)
@@ -953,6 +958,7 @@ func TestRecover_Phase2PartialTileFetch(t *testing.T) {
 	state := pub.GetServingState()
 	if state == nil {
 		t.Fatal("serving state is nil after Phase 2 recovery")
+		return
 	}
 	if state.InputLogSize != 50 {
 		t.Fatalf("state.InputLogSize = %d, want 50", state.InputLogSize)
@@ -980,6 +986,7 @@ func TestSyncOnce_GenesisMode_DirectMPTMutation(t *testing.T) {
 	state := pub.GetServingState()
 	if state == nil {
 		t.Fatal("expected non-nil serving state after SyncOnce")
+		return
 	}
 	if state.InputLogSize != 200 {
 		t.Fatalf("state.InputLogSize = %d, want 200", state.InputLogSize)

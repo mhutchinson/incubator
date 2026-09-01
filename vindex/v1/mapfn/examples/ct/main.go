@@ -19,7 +19,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -35,7 +34,7 @@ import (
 func main() {}
 
 func init() {
-	sdk.RegisterRaw(MapCTLeaf)
+	sdk.RegisterStrings(MapCTLeaf)
 }
 
 var (
@@ -68,7 +67,7 @@ type extension struct {
 }
 
 // MapCTLeaf extracts all domain names (CN + SANs) and hierarchical sub-roots from a CT log leaf.
-func MapCTLeaf(data []byte) [][sha256.Size]byte {
+func MapCTLeaf(data []byte) []string {
 	names := extractRawDomainNames(data)
 	if len(names) == 0 {
 		return nil
@@ -123,12 +122,7 @@ func MapCTLeaf(data []byte) [][sha256.Size]byte {
 		sortedNames = append(sortedNames, name)
 	}
 	slices.Sort(sortedNames)
-
-	results := make([][sha256.Size]byte, 0, len(sortedNames))
-	for _, name := range sortedNames {
-		results = append(results, sha256.Sum256([]byte(name)))
-	}
-	return results
+	return sortedNames
 }
 
 func normalizeDomain(name string) string {

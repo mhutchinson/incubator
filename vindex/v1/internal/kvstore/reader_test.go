@@ -48,6 +48,7 @@ func TestLookup_KeyNotFound(t *testing.T) {
 	}
 	if res == nil {
 		t.Fatalf("Lookup returned nil result")
+		return
 	}
 	if len(res.MatchedIndices) != 0 {
 		t.Fatalf("expected 0 matched indices, got %v", res.MatchedIndices)
