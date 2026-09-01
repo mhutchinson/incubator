@@ -28,11 +28,20 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
 )
 
+type activeChunkEntry struct {
+	chunkNum uint64
+	record   *ChunkRecord
+}
+
+const maxGenChunkCacheSize = 32768
+
 // KVIndexer indexes mapped batches into Pebble inverted chunks ('c') and maintains Merkle compact ranges.
 type KVIndexer struct {
 	db               *DB
 	chunkSize        uint64
 	lastModifiedSubs map[[sha256.Size]byte][sha256.Size]byte
+	currentCache     map[[sha256.Size]byte]activeChunkEntry
+	previousCache    map[[sha256.Size]byte]activeChunkEntry
 }
 
 // NewKVIndexer creates a new KVIndexer with the given DB and chunk size.
@@ -42,9 +51,16 @@ func NewKVIndexer(db *DB, chunkSize uint64) *KVIndexer {
 		chunkSize = ChunkSize
 	}
 	return &KVIndexer{
-		db:        db,
-		chunkSize: chunkSize,
+		db:           db,
+		chunkSize:    chunkSize,
+		currentCache: make(map[[sha256.Size]byte]activeChunkEntry, 1024),
 	}
+}
+
+// ClearCache evicts all cached active chunk descriptors.
+func (idx *KVIndexer) ClearCache() {
+	idx.currentCache = make(map[[sha256.Size]byte]activeChunkEntry, 1024)
+	idx.previousCache = nil
 }
 
 // ChunkSize returns the configured chunk capacity.
@@ -108,6 +124,7 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 	defer func() { _ = pBatch.Close() }()
 
 	modifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+	newCachedEntries := make(map[[sha256.Size]byte]activeChunkEntry, len(keys))
 
 	newKVSize := batch.EndLeafIdx
 	if newKVSize == 0 && batch.Count > 0 {
@@ -151,7 +168,29 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 		var rec *ChunkRecord
 		var currentRange *CompactRange
 
-		if iter.SeekPrefixGE(prefix) && bytes.HasPrefix(iter.Key(), prefix) {
+		if cached, ok := idx.currentCache[keyHash]; ok {
+			currChunkNum = cached.chunkNum
+			rec = &ChunkRecord{
+				CoveredSize:     cached.record.CoveredSize,
+				CompactHashes:   cached.record.CompactHashes,
+				RelativeIndices: append([]uint16(nil), cached.record.RelativeIndices...),
+			}
+			currentRange = &CompactRange{
+				CoveredSize: rec.CoveredSize,
+				Hashes:      rec.CompactHashes,
+			}
+		} else if cached, ok := idx.previousCache[keyHash]; ok {
+			currChunkNum = cached.chunkNum
+			rec = &ChunkRecord{
+				CoveredSize:     cached.record.CoveredSize,
+				CompactHashes:   cached.record.CompactHashes,
+				RelativeIndices: append([]uint16(nil), cached.record.RelativeIndices...),
+			}
+			currentRange = &CompactRange{
+				CoveredSize: rec.CoveredSize,
+				Hashes:      rec.CompactHashes,
+			}
+		} else if iter.SeekPrefixGE(prefix) && bytes.HasPrefix(iter.Key(), prefix) {
 			_, cNum, err := DecodeChunkKey(iter.Key())
 			if err != nil {
 				return nil, fmt.Errorf("failed to decode chunk key: %w", err)
@@ -163,7 +202,7 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 			}
 			currentRange = &CompactRange{
 				CoveredSize: rec.CoveredSize,
-				Hashes:      slices.Clone(rec.CompactHashes),
+				Hashes:      rec.CompactHashes,
 			}
 		} else {
 			currChunkNum = 0
@@ -179,11 +218,15 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 			targetChunkNum := leafIdx / idx.chunkSize
 			if targetChunkNum > currChunkNum {
 				// Rollover: finalize current chunk into compact range
+				cr := &CompactRange{
+					CoveredSize: currentRange.CoveredSize,
+					Hashes:      slices.Clone(currentRange.Hashes),
+				}
 				for _, rel := range rec.RelativeIndices {
 					absIdx := currChunkNum*idx.chunkSize + uint64(rel)
 					var b [8]byte
 					binary.BigEndian.PutUint64(b[:], absIdx)
-					currentRange.Append(LeafHash(b[:]))
+					cr.Append(LeafHash(b[:]))
 				}
 				// Write sealed historical chunk
 				sealedVal := MarshalChunkValue(rec)
@@ -193,10 +236,11 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 				// Allocate new active chunk
 				currChunkNum = targetChunkNum
 				rec = &ChunkRecord{
-					CoveredSize:     currentRange.CoveredSize,
-					CompactHashes:   slices.Clone(currentRange.Hashes),
+					CoveredSize:     cr.CoveredSize,
+					CompactHashes:   cr.Hashes,
 					RelativeIndices: nil,
 				}
+				currentRange = cr
 			}
 			rec.RelativeIndices = append(rec.RelativeIndices, uint16(leafIdx%idx.chunkSize))
 		}
@@ -209,8 +253,8 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 
 		// Compute modified sub-root
 		crClone := &CompactRange{
-			CoveredSize: currentRange.CoveredSize,
-			Hashes:      slices.Clone(currentRange.Hashes),
+			CoveredSize: rec.CoveredSize,
+			Hashes:      slices.Clone(rec.CompactHashes),
 		}
 		for _, rel := range rec.RelativeIndices {
 			absIdx := currChunkNum*idx.chunkSize + uint64(rel)
@@ -219,6 +263,11 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 			crClone.Append(LeafHash(b[:]))
 		}
 		modifiedSubRoots[keyHash] = crClone.Root()
+
+		newCachedEntries[keyHash] = activeChunkEntry{
+			chunkNum: currChunkNum,
+			record:   rec,
+		}
 	}
 
 	if newKVSize > persistedKVSize {
@@ -242,6 +291,14 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 			return nil, fmt.Errorf("failed to commit indexing batch: %w", err)
 		}
 		metrics.PebbleApplyDurationSeconds.Observe(time.Since(applyStart).Seconds())
+
+		if len(idx.currentCache)+len(newCachedEntries) > maxGenChunkCacheSize {
+			idx.previousCache = idx.currentCache
+			idx.currentCache = make(map[[sha256.Size]byte]activeChunkEntry, maxGenChunkCacheSize)
+		}
+		for k, v := range newCachedEntries {
+			idx.currentCache[k] = v
+		}
 	} else if len(rawTargetCP) > 0 && targetSize > 0 && newKVSize == targetSize {
 		if err := idx.db.SetMetadata(KeyMetaKVCheckpoint, rawTargetCP); err != nil {
 			return nil, fmt.Errorf("failed to set metadata kv_checkpoint: %w", err)

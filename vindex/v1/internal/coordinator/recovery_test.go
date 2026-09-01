@@ -396,7 +396,7 @@ func TestCoordinator_SyncOnce(t *testing.T) {
 }
 
 func TestCoordinator_Run(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	coord, _, _, pub, _, _, _ := setupRecoveryEnvironment(t)

@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -486,5 +487,197 @@ func TestKVIndexer_IntermediateVsFinalBatch_SyncBehavior(t *testing.T) {
 	kvCP2, _ := db.GetMetadata(KeyMetaKVCheckpoint)
 	if !bytes.Equal(kvCP2, targetCP.Raw) {
 		t.Fatalf("Final batch must write KeyMetaKVCheckpoint, got: %q", string(kvCP2))
+	}
+}
+
+func TestKVIndexer_ActiveChunkCache(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	chunkSize := uint64(100)
+	idx := NewKVIndexer(db, chunkSize)
+
+	key := sha256.Sum256([]byte("hot_key_for_cache_test"))
+
+	// Batch 1: leaves [0, 50), adds indices 10, 20
+	batch1 := &ingest.MappedBatch{
+		BundleIdx:    0,
+		StartLeafIdx: 0,
+		EndLeafIdx:   50,
+		Count:        50,
+		KeyMap: map[[32]byte][]uint64{
+			key: {10, 20},
+		},
+	}
+	_, err := idx.IndexBatch(ctx, batch1, nil)
+	if err != nil {
+		t.Fatalf("batch1 failed: %v", err)
+	}
+
+	// Verify cache entry populated
+	cached, ok := idx.currentCache[key]
+	if !ok {
+		t.Fatal("expected cache entry after batch1")
+	}
+	if cached.chunkNum != 0 {
+		t.Fatalf("cached chunkNum = %d, want 0", cached.chunkNum)
+	}
+	if len(cached.record.RelativeIndices) != 2 {
+		t.Fatalf("cached RelativeIndices len = %d, want 2", len(cached.record.RelativeIndices))
+	}
+
+	// Batch 2: leaves [50, 100), adds indices 60, 70 (must hit cache in chunk 0)
+	batch2 := &ingest.MappedBatch{
+		BundleIdx:    0,
+		StartLeafIdx: 50,
+		EndLeafIdx:   100,
+		Count:        50,
+		KeyMap: map[[32]byte][]uint64{
+			key: {60, 70},
+		},
+	}
+	res2, err := idx.IndexBatch(ctx, batch2, nil)
+	if err != nil {
+		t.Fatalf("batch2 failed: %v", err)
+	}
+
+	expectedSubRoot2 := computeExpectedSubRoot([]uint64{10, 20, 60, 70})
+	if res2.ModifiedSubRoots[key] != expectedSubRoot2 {
+		t.Fatalf("subRoot mismatch: got %x, want %x", res2.ModifiedSubRoots[key], expectedSubRoot2)
+	}
+
+	// Batch 3: leaves [100, 200), adds index 120 (triggers rollover from chunk 0 to chunk 1)
+	batch3 := &ingest.MappedBatch{
+		BundleIdx:    0,
+		StartLeafIdx: 100,
+		EndLeafIdx:   200,
+		Count:        100,
+		KeyMap: map[[32]byte][]uint64{
+			key: {120},
+		},
+	}
+	res3, err := idx.IndexBatch(ctx, batch3, nil)
+	if err != nil {
+		t.Fatalf("batch3 failed: %v", err)
+	}
+
+	expectedSubRoot3 := computeExpectedSubRoot([]uint64{10, 20, 60, 70, 120})
+	if res3.ModifiedSubRoots[key] != expectedSubRoot3 {
+		t.Fatalf("subRoot mismatch after rollover: got %x, want %x", res3.ModifiedSubRoots[key], expectedSubRoot3)
+	}
+
+	cached3, ok := idx.currentCache[key]
+	if !ok || cached3.chunkNum != 1 {
+		t.Fatalf("expected cached chunkNum = 1 after rollover, got %v", cached3)
+	}
+
+	// Clear cache and verify GetSubRoot reconstructs correctly from Pebble
+	idx.ClearCache()
+	subRootFromPebble, err := idx.GetSubRoot(key, 200)
+	if err != nil {
+		t.Fatalf("GetSubRoot failed: %v", err)
+	}
+	if subRootFromPebble != expectedSubRoot3 {
+		t.Fatalf("GetSubRoot from Pebble mismatch: got %x, want %x", subRootFromPebble, expectedSubRoot3)
+	}
+}
+
+func TestKVIndexer_TwoGenerationalCacheRotation(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, nil)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	idx := NewKVIndexer(db, 64)
+	ctx := context.Background()
+
+	// Insert hot key
+	hotKey := sha256.Sum256([]byte("hot_key"))
+	batch1 := &ingest.MappedBatch{
+		StartLeafIdx: 0,
+		EndLeafIdx:   10,
+		Count:        10,
+		KeyMap: map[[32]byte][]uint64{
+			hotKey: {1, 2},
+		},
+	}
+	if _, err := idx.IndexBatch(ctx, batch1, nil); err != nil {
+		t.Fatalf("IndexBatch failed: %v", err)
+	}
+	if _, ok := idx.currentCache[hotKey]; !ok {
+		t.Fatal("hotKey not in currentCache")
+	}
+
+	// Populate maxGenChunkCacheSize keys to force cache generation swap
+	for i := 0; i < maxGenChunkCacheSize+5; i++ {
+		var k [32]byte
+		binary.BigEndian.PutUint64(k[:], uint64(i+100))
+		idx.currentCache[k] = activeChunkEntry{chunkNum: 0, record: &ChunkRecord{}}
+	}
+
+	// Trigger next batch to cause rotation
+	batch2 := &ingest.MappedBatch{
+		StartLeafIdx: 10,
+		EndLeafIdx:   20,
+		Count:        10,
+		KeyMap: map[[32]byte][]uint64{
+			hotKey: {15, 16},
+		},
+	}
+	res2, err := idx.IndexBatch(ctx, batch2, nil)
+	if err != nil {
+		t.Fatalf("IndexBatch after rotation failed: %v", err)
+	}
+
+	expectedSubRoot := computeExpectedSubRoot([]uint64{1, 2, 15, 16})
+	if res2.ModifiedSubRoots[hotKey] != expectedSubRoot {
+		t.Fatalf("subRoot mismatch after promotion: got %x, want %x", res2.ModifiedSubRoots[hotKey], expectedSubRoot)
+	}
+
+	// hotKey must now be promoted into currentCache
+	if _, ok := idx.currentCache[hotKey]; !ok {
+		t.Fatal("hotKey was not promoted to currentCache after access")
+	}
+}
+
+func BenchmarkKVIndexer_IndexBatch_Zipfian(b *testing.B) {
+	ctx := context.Background()
+	dir := b.TempDir()
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	idx := NewKVIndexer(db, 65536)
+
+	// Pre-generate 100 hot keys (representing Zipfian top keys)
+	hotKeys := make([][sha256.Size]byte, 100)
+	for i := range hotKeys {
+		hotKeys[i] = sha256.Sum256([]byte(fmt.Sprintf("hot_key_%d", i)))
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var leafOffset uint64
+	for i := 0; i < b.N; i++ {
+		batchKeyMap := make(map[[32]byte][]uint64, 50)
+		for j := 0; j < 256; j++ {
+			k := hotKeys[(i*256+j)%len(hotKeys)]
+			batchKeyMap[k] = append(batchKeyMap[k], leafOffset+uint64(j))
+		}
+		batch := &ingest.MappedBatch{
+			BundleIdx:    uint64(i),
+			StartLeafIdx: leafOffset,
+			EndLeafIdx:   leafOffset + 256,
+			Count:        256,
+			KeyMap:       batchKeyMap,
+		}
+		if _, err := idx.IndexBatch(ctx, batch, nil); err != nil {
+			b.Fatalf("IndexBatch failed: %v", err)
+		}
+		leafOffset += 256
 	}
 }
