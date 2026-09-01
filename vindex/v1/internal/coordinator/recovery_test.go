@@ -968,24 +968,24 @@ func TestRecover_Phase2PartialTileFetch(t *testing.T) {
 	}
 }
 
-func TestSyncOnce_GenesisMode_DirectMPTMutation(t *testing.T) {
+func TestCoordinator_Backfill_DirectMPTMutation(t *testing.T) {
 	ctx := context.Background()
 	coord, _, mptMgr, pub, _, outLog, fetcher := setupRecoveryEnvironment(t)
 	coord.SetCommitBatchSize(20) // Flush every 20 leaves to test multiple batch direct Set calls
 
-	// ServingState is nil at start (Genesis mode)
+	// ServingState is nil at start
 	if pub.GetServingState() != nil {
-		t.Fatal("expected nil serving state at genesis")
+		t.Fatal("expected nil serving state before backfill")
 	}
 
-	// Run SyncOnce: should apply direct SetBatch on each batch and Snap at the end
-	if err := coord.SyncOnce(ctx); err != nil {
-		t.Fatalf("SyncOnce failed in genesis mode: %v", err)
+	// Run Backfill with nil targetCP (fetches checkpoint automatically)
+	if err := coord.Backfill(ctx, nil); err != nil {
+		t.Fatalf("Backfill failed in genesis mode: %v", err)
 	}
 
 	state := pub.GetServingState()
 	if state == nil {
-		t.Fatal("expected non-nil serving state after SyncOnce")
+		t.Fatal("expected non-nil serving state after Backfill")
 		return
 	}
 	if state.InputLogSize != 200 {
@@ -1007,6 +1007,136 @@ func TestSyncOnce_GenesisMode_DirectMPTMutation(t *testing.T) {
 		if err != nil || !exists || len(proof) == 0 {
 			t.Fatalf("Prove failed for leaf %d: exists=%v, err=%v", i, exists, err)
 		}
+	}
+}
+
+func TestCoordinator_Backfill_ExplicitTargetCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	coord, db, mptMgr, pub, indexer, outLog, fetcher := setupRecoveryEnvironment(t)
+	coord.SetCommitBatchSize(25)
+
+	targetHash := kvstore.BatchRoot(fetcher.leaves[:100])
+	targetCP := &log.Checkpoint{
+		Origin: "example.com/inputlog",
+		Size:   100,
+		Hash:   targetHash[:],
+	}
+
+	// Run Backfill up to 100 leaves
+	if err := coord.Backfill(ctx, targetCP); err != nil {
+		t.Fatalf("Backfill up to 100 leaves failed: %v", err)
+	}
+
+	state := pub.GetServingState()
+	if state == nil || state.InputLogSize != 100 {
+		t.Fatalf("state.InputLogSize = %v, want 100", state)
+	}
+	if mptMgr.PersistedSize() != 100 {
+		t.Fatalf("mpt persisted size = %d, want 100", mptMgr.PersistedSize())
+	}
+
+	kvSize, err := db.GetUint64(kvstore.KeyMetaKVSize)
+	if err != nil || kvSize != 100 {
+		t.Fatalf("kvSize = %d, want 100", kvSize)
+	}
+
+	// Compute expected MPT root for 100 leaves
+	allKeySubRoots := make(map[[32]byte][32]byte)
+	for i := 0; i < 100; i++ {
+		kh := sha256.Sum256(fetcher.leaves[i])
+		sr, err := indexer.GetSubRoot(kh, 100)
+		if err != nil {
+			t.Fatalf("GetSubRoot failed for leaf %d: %v", i, err)
+		}
+		allKeySubRoots[kh] = sr
+	}
+	expectedRoot, err := mptMgr.Predict(allKeySubRoots)
+	if err != nil {
+		t.Fatalf("Predict expected root failed: %v", err)
+	}
+	if state.MapRoot != expectedRoot {
+		t.Fatalf("state.MapRoot = %x, want %x", state.MapRoot, expectedRoot)
+	}
+
+	// Now continue with normal SyncOnce for remaining leaves (100..200)
+	if err := coord.SyncOnce(ctx); err != nil {
+		t.Fatalf("SyncOnce failed after backfill: %v", err)
+	}
+
+	state2 := pub.GetServingState()
+	if state2 == nil || state2.InputLogSize != 200 {
+		t.Fatalf("state2.InputLogSize = %v, want 200", state2)
+	}
+	outSize, err := outLog.Size(ctx)
+	if err != nil || outSize != 2 {
+		t.Fatalf("outLog.Size = %d, want 2", outSize)
+	}
+}
+
+func TestCoordinator_Backfill_PeriodicSnapAndSync_AndResume(t *testing.T) {
+	ctx := context.Background()
+	coord, db, mptMgr, pub, _, outLog, fetcher := setupRecoveryEnvironment(t)
+	coord.SetCommitBatchSize(10)
+	coord.SetBackfillSnapInterval(30)
+	coord.SetBackfillSyncInterval(10 * time.Millisecond)
+
+	targetHash100 := kvstore.BatchRoot(fetcher.leaves[:100])
+	targetCP100 := &log.Checkpoint{
+		Origin: "example.com/inputlog",
+		Size:   100,
+		Hash:   targetHash100[:],
+	}
+
+	// 1. Run first partial Backfill up to 100 leaves
+	if err := coord.Backfill(ctx, targetCP100); err != nil {
+		t.Fatalf("Backfill up to 100 leaves failed: %v", err)
+	}
+
+	if mptMgr.PersistedSize() != 100 {
+		t.Fatalf("mpt persisted size = %d, want 100", mptMgr.PersistedSize())
+	}
+	kvSize, err := db.GetUint64(kvstore.KeyMetaKVSize)
+	if err != nil || kvSize != 100 {
+		t.Fatalf("kvSize = %d, want 100", kvSize)
+	}
+
+	// 2. Now run Backfill up to 200 leaves to test seamless continuation
+	targetHash200 := kvstore.BatchRoot(fetcher.leaves[:200])
+	targetCP200 := &log.Checkpoint{
+		Origin: "example.com/inputlog",
+		Size:   200,
+		Hash:   targetHash200[:],
+	}
+
+	if err := coord.Backfill(ctx, targetCP200); err != nil {
+		t.Fatalf("Backfill continuation to 200 leaves failed: %v", err)
+	}
+
+	if mptMgr.PersistedSize() != 200 {
+		t.Fatalf("mpt persisted size = %d, want 200", mptMgr.PersistedSize())
+	}
+	kvSize2, err := db.GetUint64(kvstore.KeyMetaKVSize)
+	if err != nil || kvSize2 != 200 {
+		t.Fatalf("kvSize2 = %d, want 200", kvSize2)
+	}
+
+	state := pub.GetServingState()
+	if state == nil || state.InputLogSize != 200 {
+		t.Fatalf("state.InputLogSize = %v, want 200", state)
+	}
+
+	// Verify proofs for all 200 leaves
+	for i := 0; i < 200; i++ {
+		kh := sha256.Sum256(fetcher.leaves[i])
+		proof, _, exists, err := mptMgr.Prove(kh)
+		if err != nil || !exists || len(proof) == 0 {
+			t.Fatalf("Prove failed for leaf %d: exists=%v, err=%v", i, exists, err)
+		}
+	}
+
+	outSize, err := outLog.Size(ctx)
+	if err != nil || outSize != 2 {
+		t.Fatalf("outLog.Size = %d, want 2", outSize)
 	}
 }
 

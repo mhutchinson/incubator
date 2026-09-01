@@ -296,6 +296,11 @@ func (m *Manager) Persist() error {
 	return m.tree.Sync()
 }
 
+// Sync flushes changes to disk under writeMu (alias for Persist).
+func (m *Manager) Sync() error {
+	return m.Persist()
+}
+
 // Close closes the underlying MPT files.
 func (m *Manager) Close() error {
 	m.writeMu.Lock()

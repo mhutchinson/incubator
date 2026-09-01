@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/coordinator"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
@@ -56,11 +57,13 @@ type Config struct {
 	InputLogURL        string
 	InputLogOrigin     string
 	InputLogVerifier   note.Verifier
-	OutputLogDir       string
-	OutputLogOrigin    string
-	OutputLogSignerKey string
-	WitnessURLs        []string
-	WitnessPubKeys     []string
+	OutputLogDir         string
+	OutputLogOrigin      string
+	OutputLogSignerKey   string
+	WitnessURLs          []string
+	WitnessPubKeys       []string
+	BackfillSnapInterval uint64
+	BackfillSyncInterval time.Duration
 }
 
 // DefaultConfig returns standard default configuration values.
@@ -259,6 +262,128 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 		server:   srv,
 		reaper:   reaper,
 	}, nil
+}
+
+// Backfill executes standalone bulk catch-up ingestion up to targetCP and persists baseline state commitments without starting an HTTP server.
+func Backfill(ctx context.Context, cfg Config, mapper LeafMapper, targetCP *log.Checkpoint) (err error) {
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = kvstore.ChunkSize
+	}
+	if cfg.BundleSize == 0 {
+		cfg.BundleSize = ingest.DefaultBundleSize
+	}
+	if cfg.Workers <= 0 {
+		cfg.Workers = runtime.GOMAXPROCS(0) - 1
+		if cfg.Workers < 1 {
+			cfg.Workers = 1
+		}
+	}
+	if mapper == nil {
+		mapper = IdentityMapper()
+	}
+
+	// 1. Open Pebble KV store
+	db, err := kvstore.Open(cfg.DBPath, nil)
+	if err != nil {
+		return fmt.Errorf("failed to open KV store at %q: %w", cfg.DBPath, err)
+	}
+	db.SetChunkSize(cfg.ChunkSize)
+	defer func() {
+		if cErr := db.Close(); cErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to close KV store: %w", cErr))
+		}
+	}()
+
+	// 2. Open Merkle Patricia Trie Manager
+	mptMgr, err := tree.NewManager(cfg.MPTDir)
+	if err != nil {
+		return fmt.Errorf("failed to open MPT at %q: %w", cfg.MPTDir, err)
+	}
+	defer func() {
+		if cErr := mptMgr.Close(); cErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to close MPT: %w", cErr))
+		}
+	}()
+
+	// 3. Initialize Managed Tile Cache
+	cache, err := ingest.NewManagedTileCache(cfg.TileCacheDir, cfg.BundleSize)
+	if err != nil {
+		return fmt.Errorf("failed to initialize tile cache at %q: %w", cfg.TileCacheDir, err)
+	}
+
+	// 4. Initialize KV Indexer
+	indexer := kvstore.NewKVIndexer(db, cfg.ChunkSize)
+
+	// 5. Initialize Output Log
+	var outLog coordinator.OutputLogReader
+	if cfg.OutputLogDir != "" && cfg.OutputLogSignerKey != "" {
+		signer, err := note.NewSigner(cfg.OutputLogSignerKey)
+		if err != nil {
+			return fmt.Errorf("failed to parse output log signer key: %w", err)
+		}
+		origin := cfg.OutputLogOrigin
+		if origin == "" {
+			origin = signer.Name()
+		}
+		posixLog, err := tree.NewPOSIXOutputLog(ctx, cfg.OutputLogDir, signer, tree.WithOrigin(origin))
+		if err != nil {
+			return fmt.Errorf("failed to open POSIX output log at %q: %w", cfg.OutputLogDir, err)
+		}
+		defer func() {
+			if cErr := posixLog.Close(); cErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to close output log: %w", cErr))
+			}
+		}()
+		outLog = posixLog
+	} else {
+		origin := cfg.OutputLogOrigin
+		if origin == "" {
+			origin = "vindex.memory.outputlog"
+		}
+		outLog = newMemoryOutputLog(origin)
+	}
+
+	// 6. Initialize Output Publisher
+	pub := tree.NewOutputPublisher(db, mptMgr, outLog, nil)
+
+	// 7. Initialize Input Log Tile Fetcher if configured
+	var fetcher ingest.TileFetcher
+	if cfg.InputLogURL != "" {
+		u, err := url.Parse(cfg.InputLogURL)
+		if err != nil {
+			return fmt.Errorf("invalid input log URL %q: %w", cfg.InputLogURL, err)
+		}
+		tFetcher, err := ingest.NewTiledFetcher(u, cfg.InputLogVerifier, cfg.InputLogOrigin, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create tile fetcher for %q: %w", cfg.InputLogURL, err)
+		}
+		fetcher = tFetcher
+	}
+
+	// 8. Initialize Coordinator
+	coord := coordinator.NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, cache, mapper)
+	if cfg.BackfillSnapInterval > 0 {
+		coord.SetBackfillSnapInterval(cfg.BackfillSnapInterval)
+	}
+	if cfg.BackfillSyncInterval > 0 {
+		coord.SetBackfillSyncInterval(cfg.BackfillSyncInterval)
+	}
+
+	// 9. Perform recovery check if needed
+	if err := coord.Recover(ctx); err != nil {
+		return fmt.Errorf("recovery check failed during backfill: %w", err)
+	}
+
+	// 10. Execute Backfill
+	if err := coord.Backfill(ctx, targetCP); err != nil {
+		return fmt.Errorf("coordinator backfill failed: %w", err)
+	}
+
+	if err := mapper.Close(ctx); err != nil {
+		return fmt.Errorf("failed to close mapper: %w", err)
+	}
+
+	return nil
 }
 
 // Start executes startup crash recovery and starts background synchronization and tile reaping loops.
