@@ -21,9 +21,9 @@ A **Verifiable Index (VIndex)** provides efficient, trustless, and cryptographic
 ### 1.3 Non-Requirements & Out of Scope
 
 - **Strictly Single-Machine Deployment**: VIndex explicitly avoids distributed consensus (e.g. Raft, Paxos), clustering, horizontal sharding, or internal replication protocols. High availability and redundancy are achieved externally: third-party monitors and mirrors run independent, standalone VIndex single-node instances indexing the same shared Input Log.
-- **No Complex / Multi-Key Querying**: The service provides point lookups on exact 32-byte key hashes only (`KeyHash = SHA256(Key)`). Cross-key range scans, boolean filtering (AND/OR), substring searches, full-text search, and regular expression lookups are out of scope.
+- **Point Lookups by 32-Byte Key Hashes**: The production v1 service provides point lookups on exact 32-byte key hashes (`KeyHash = SHA256(CanonicalSubject)`). General cross-key range scans, boolean filtering (AND/OR), substring searches, full-text search, and arbitrary regular expressions are out of scope. (Note: Retaining raw preimages on the host enables future prefix-trie / subtree indexing without guest ABI changes; see Section 9.5).
 - **No Log Mutation or Tombstones**: Index state is strictly append-only. The system does not support deletion, key un-mapping, tombstones, or retrospective data modification.
-- **No In-Tree Semantic Validation**: VIndex indexes raw bytes extracted deterministically by the WebAssembly `MapFn`. It does not perform semantic validation of indexed payloads (e.g. validating X.509 certificate chains, checking OCSP/CRL revocation, or verifying digital signatures).
+- **No In-Tree Semantic Validation**: VIndex indexes canonical Claim Subject preimages extracted deterministically by the WebAssembly `MapFn`. It does not perform semantic validation of indexed payloads (e.g. validating X.509 certificate chains, checking OCSP/CRL revocation, or verifying digital signatures).
 
 ---
 
@@ -39,7 +39,12 @@ A **Verifiable Index (VIndex)** provides efficient, trustless, and cryptographic
 │  [Ingestion Plane]                                                          │
 │  • TileFetcher & Local Cache (torchwood.PermanentCache / Managed Cache)     │
 │  • Parallel Wazero WASM Sandboxes (GOMAXPROCS-1 workers)                    │
-│  • In-Memory Priority Resequencer (Monotonic leaf ordering)                 │
+│    - Bundled Tile Mapping: map_bundle (1 <= N <= 256 leaves/call, 2-3 FFI)  │
+│    - Extracts Canonical Preimages (e.g. domain strings, module paths)       │
+│  • Host-Side Hardware Cryptography (crypto/sha256 + SHA-NI / ARMv8 Crypto)  │
+│    - KeyHash = SHA256(canonical_subject)                                   │
+│    - Lexicographical sort (bytes.Compare) & deduplication (slices.Compact)  │
+│  • In-Memory Priority Resequencer (Monotonic leaf ordering min-heap)        │
 │         │                                                                   │
 │         ▼ chan *MappedBatch (ordered)                                       │
 │  [Data & Commitment Plane] (Serialized Batch Commit Loop)                   │
@@ -66,8 +71,8 @@ The VIndex architecture is partitioned into modular subsystems located in [`vind
 
 | Subsystem | Location | Storage Prefix / Tech | Core Responsibilities |
 | :--- | :--- | :--- | :--- |
-| **Ingestion Pipeline** | [`internal/ingest/`](../internal/ingest/README.md) | `filippo.io/torchwood` + Wazero WASM | Checkpoint validation, tile/leaf Merkle authentication, native entry bundle fetching, sandboxed WASM `MapFn` execution, priority resequencer, and `TileReaper` cache management. |
-| **WASM MapFn SDK & Runtime** | [`mapfn/`](../mapfn/README.md) | Wazero (`wasip1`) + Guest SDKs | Sandboxed WebAssembly guest ABI, memory management protocol, multi-language SDKs (Go, TinyGo, Rust), and offline `vindex-map` verification CLI. |
+| **Ingestion Pipeline** | [`internal/ingest/`](../internal/ingest/README.md) | `filippo.io/torchwood` + Wazero WASM | Checkpoint validation, tile/leaf Merkle authentication, native entry bundle fetching, sandboxed WASM `map_bundle` execution, host-side hardware SHA-256 hashing, priority resequencer, and `TileReaper` cache management. |
+| **WASM MapFn SDK & Runtime** | [`mapfn/`](../mapfn/README.md) | Wazero (`wasip1`) + Guest SDKs | Sandboxed WebAssembly guest ABI, `map_bundle` tile/slice protocol (1 <= N <= 256 leaves), canonical preimage extraction, multi-language SDKs (Go, TinyGo, Rust), host hardware SHA-NI hashing, and offline `vindex-map` verification CLI. |
 | **KV Storage** | [`internal/kvstore/`](../internal/kvstore/README.md) | Pebble prefixes `'c'` & `'m'` | Inverted chunk numbering (`^chunkNum`), 33-byte prefix Bloom filters, delimitless value encoding, and O(1) sub-root read recovery. |
 | **Authenticated State** | [`internal/tree/`](../internal/tree/README.md) | `torchwood/mpt` + Tessera | In-memory MPT in `mmap`, lock-free root prediction, Tessera Output Log state commitments, and witness cosignature aggregation. |
 | **Coordinator & Recovery** | [`internal/coordinator/`](../internal/coordinator/README.md) | Pebble prefix `'m'` + `tlog.CheckTree` | Checkpoint progression & Merkle consistency proofs, moving-goalpost prevention (`m_target_checkpoint`), watermark tracking, serialized batch coordination (`store.WriteBatch` -> `publisher.PublishBatch`), and Zero-WAL startup recovery (< 500ms time-to-first-serve). |
@@ -242,7 +247,7 @@ Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is **st
 
 - **Ingestion & Mapping**:
   - `vindex_ingestion_lag` (Gauge): Distance between Input Log head and `m_kv_size`.
-  - `vindex_map_duration_seconds` (Histogram): Duration of WASM `MapFn` executions.
+  - `vindex_map_bundle_duration_seconds` (Histogram): Duration of WASM `map_bundle` tile executions.
   - `vindex_map_errors_total` (Counter): Count of mapping failures by policy (`HALT`).
 - **Commitment & Witnessing**:
   - `vindex_indexing_lag` (Gauge): Distance between `m_kv_size` and `Output_Size`.
@@ -272,7 +277,7 @@ Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is **st
 
 #### 1. Genesis Catch-Up Mode
 
-High-throughput fast-forward bulk ingestion from leaf 0 to a target checkpoint. In this mode, `vindexd` maximizes parallelism across Wazero WASM sandboxes, bypasses per-batch witness roundtrips, and streams entries directly into Pebble DB and the in-memory MPT before activating serving endpoints.
+High-throughput fast-forward bulk ingestion from leaf 0 to a target checkpoint. In this mode, `vindexd` maximizes parallelism across Wazero WASM sandboxes, executes bundled tile mapping (`map_bundle`), bypasses per-batch witness roundtrips, and streams entries directly into Pebble DB and the in-memory MPT before activating serving endpoints.
 
 #### 2. Single-Host Disaster Recovery
 
@@ -282,34 +287,94 @@ High-throughput fast-forward bulk ingestion from leaf 0 to a target checkpoint. 
 
 ---
 
-## 8. Architectural Decisions & Alternatives Considered
+## 8. Major Design Evolutions via Closed-Loop Spec -> Implement -> Measure -> Update Cycles
 
-### 8.1 Authenticated Data Structure & Single-Host Coupling
+The Plan of Record (PoR) for VIndex v1 was hardened through empirical, closed-loop engineering iterations where initial architectural assumptions were implemented, measured under production-scale workloads, and systematically evolved.
+
+### 8.1 Evolution 1: MapFn Bundling & Host-Side Preimage Hashing
+
+```text
+Baseline Design (Per-Leaf Mapping + In-Guest Crypto):
+  Tile (256 leaves) ──► 768 FFI Transitions (allocate, map_leaf, reset per leaf) ──► ~23% CPU in FFI
+                    ──► In-Guest Software SHA-256 in WASM Bytecode                ──► ~55% CPU in Crypto
+
+PoR Design (Bundled Tile Mapping + Host Hardware SIMD Crypto):
+  Tile (256 leaves) ──► 1 allocate + 1 map_bundle + 1 reset (2-3 FFI calls)       ──► < 1% CPU in FFI
+                    ──► Guest emits Raw Canonical Preimages
+                    ──► Host computes Hardware SHA-256 (SHA-NI / ARMv8 Crypto)   ──► Hardware Speed (0% WASM crypto)
+                    ──► Preserves Preimages for future Prefix-Trie indexing
+```
+
+- **Problem & Profiling Telemetry**:
+  In the initial v1 specification, the WebAssembly interface mapped entries on a per-leaf basis (`map_leaf(ptr, len) -> (out_ptr, out_len)`), with guest bytecode computing SHA-256 hashes internally. Comprehensive CPU profiling during 54M-leaf SumDB and 10M-leaf CT ingestion runs revealed two severe bottlenecks:
+  1. **FFI Boundary Overhead (~23% CPU)**: For every 256-leaf tile, the host executed 3 FFI calls per leaf (`allocate`, `map_leaf`, `reset`), totaling 768 FFI boundary crossings per tile. FFI parameter marshaling, memory boundary assertions, and context switches consumed ~23% of total CPU time.
+  2. **In-Guest Software SHA-256 (~55% CPU)**: Compiling software cryptographic hashing routines into WebAssembly bytecode prevented the guest from accessing host CPU vector/SIMD cryptographic instructions. Software SHA-256 inside WASM consumed ~55% of all CPU cycles during mapping.
+- **Plan of Record (PoR) Architecture**:
+  1. **Bundled Tile Execution (`map_bundle`)**: Instead of 768 FFI calls per tile, the host writes bundled leaves (`1 <= N <= 256`) into guest memory in a single structured buffer and invokes `map_bundle` once. FFI transitions dropped from 768 to 2–3 per tile, reducing FFI overhead from ~23% to < 1% of CPU time, with full support for partial tiles on unaligned checkpoint boundaries or log heads.
+  2. **Host-Side Hardware SHA-256**: Guest plugins extract and emit raw canonical Claim Subject preimages (e.g. lowercase Punycode domain strings, escaped Go module paths). The Go host runtime hashes preimages using standard `crypto/sha256`, which leverages hardware-accelerated SIMD instructions (Intel/AMD SHA-NI extensions or ARMv8 Crypto instructions). This eliminated the ~55% software crypto bottleneck.
+  3. **Preservation of Preimages for Future Subtree / Prefix Indexing**: By returning raw preimages rather than opaque hashes, the host runtime retains the exact domain strings and module paths. This provides forward compatibility for future prefix-trie search capabilities (Section 9.5) without altering guest WASM plugin ABIs.
+
+### 8.2 Evolution 2: Removal of the Write-Ahead Log (WAL)
+
+```text
+Baseline Design (Pebble 'w' Prefix WAL + Async WalReaper):
+  Ingest ──► WriteBatch('w' WAL) ──► Disk Sync ──► Output Log ──► WalReaper Compaction ──► Inverted Chunks ('c')
+  Result: Double-write disk amplification, high LSM compaction churn, P99 latency spikes (847–1,214 ms).
+
+PoR Design (Zero-WAL Direct Commit + TileReaper):
+  Ingest ──► Direct WriteBatch('c' Chunks) with pebble.Sync ──► Output Log & MPT Ratchet
+  Result: +24.7% throughput (240k leaves/s), 2.4 ms warm recovery, ~93–99% P99 latency reduction.
+```
+
+- **Problem & Profiling Telemetry**:
+  The prototype staged index records under a transient `'w'` prefix in Pebble DB before an asynchronous background worker (`WalReaper`) converted them into inverted chunks (`'c'`) and deleted the `'w'` keys. Telemetry revealed severe performance pathologies:
+  1. **Double-Write Amplification & LSM Churn**: Every mapping was written to disk twice and then deleted, saturating NVMe write bandwidth and triggering massive Pebble LSM compaction cascades.
+  2. **Severe Tail Read Latency Spikes**: LSM compaction stalls in Pebble caused P99 lookup latencies to spike to **1,214 ms** (1-to-1 mapping) and **847.8 ms** (CT fanout).
+  3. **Slow Startup Recovery**: Crash recovery required scanning and replaying unindexed WAL entries from Pebble.
+- **Plan of Record (PoR) Architecture**:
+  1. **Direct Inverted Chunk Commits**: Mapped batches are committed directly into Pebble inverted chunk records (`'c' + KeyHash + ^chunkNum`) with a synchronous durability barrier (`pebble.Sync`).
+  2. **Immutable Tile Cache as Log of Record**: Verified raw entry tiles stored by `torchwood.PermanentCache` serve as the immutable log of record. If an unclean crash occurs, Stage 1 startup recovery deterministically replays missing tiles in < 500ms using O(1) `store.GetSubRoot` point queries with **zero storage mutations**.
+  3. **Empirical Results**:
+     - Throughput increased by **+24.7%** (from 192k to 240,467 leaves/sec on full Go SumDB).
+     - Warm recovery time-to-first-serve dropped to **2.4 ms**.
+     - P99 read tail latencies dropped by **~93–99%** (to 11.3 ms for 1-to-1 and 62.2 ms for CT fanout).
+     - Pebble database footprint in CT tests dropped by **99%** (from 1.2 GB down to 9.91 MB).
+
+---
+
+## 9. Architectural Decisions & Alternatives Considered
+
+### 9.1 Authenticated Data Structure & Single-Host Coupling
 - *Selected*: In-memory Binary Merkle Patricia Trie (`torchwood/mpt` backed by `mmap`). Delivers ~52 bytes/node density, sub-5ms commit locks, and lock-free root prediction (`mpt.Predict`). Keeping the MPT in memory backed by local NVMe requires high-spec single-host hardware optimized for bulk log catch-up.
 - *Rejected*: Sparse Merkle Trees (SMT) were rejected due to severe memory and disk I/O overhead across 256-level trie depths. Verkle Trees were rejected due to prohibitive CPU update costs during high-throughput bulk ingestion.
 
-### 8.2 Storage Engine & Encapsulation Principle
+### 9.2 Storage Engine & Encapsulation Principle
 - *Selected*: Embedded Pebble LSM key-value store encapsulated behind an abstract `IndexStore` interface. Provides zero network hops, single-host NVMe optimization, 33-byte prefix Bloom filters, and fast inverted chunk seeks (`^chunkNum`).
 - *Architectural Isolation Principle*: **Pebble is strictly contained within the `kvstore` subsystem**. All Pebble concepts (SSTables, memtables, iterators, batches, bitwise key inversion, and binary chunk formats) are completely hidden behind the `IndexStore` domain interface. No external subsystem (`coordinator`, `server`, `ingest`, `tree`) imports Pebble or accesses low-level iterators. This guarantees that the underlying storage implementation can be seamlessly swapped (e.g. for SQLite, DuckDB, RocksDB, or a cloud-managed KV) without affecting any other part of the system.
 - *Rejected*: Distributed KV stores (e.g. Cloud Bigtable, Spanner, Cassandra) were ruled out as the default engine because the MPT already requires single-host deployment; remote RPC hops introduce network latency and degrade bulk catch-up throughput.
 
-### 8.3 Commit & Durability Pipeline
+### 9.3 Commit & Durability Pipeline
 - *Selected*: Zero-WAL architecture with a synchronous storage persistence barrier. Uses the immutable Input Log tile cache as the log of record, completely eliminating write amplification and WAL tail repair during crash recovery. Mandates strict, synchronous disk persistence of the KV store (`store.WriteBatch` with `pebble.Sync`) before Output Log publication and witness network RPCs begin.
 - *Rejected / Retired*: A WAL-in-Pebble design (staging index records under a transient 'w' prefix with an asynchronous WAL reaper) was initially implemented and evaluated. Removing the WAL in favor of direct chunk indexing proved measurably superior in empirical benchmarks: it increased full Go SumDB ingestion throughput by +24.7% (from ~192k to ~240k leaves/sec), reduced end-to-end build duration by ~20%, and eliminated double-write disk amplification and LSM compaction churn.
 
-### 8.4 Pagination Model & Traversal Direction
+### 9.4 Pagination Model & Traversal Direction
 - *Selected - Backward Paging (`before=X&limit=M`)*:
   - **Merkle Log Prefix Property**: Merkle tree compact ranges natively commit to a contiguous prefix of history (`0 .. K-1`). Returning the latest tail entries alongside a single `prefix-compact-range-v1` allows O(log N) cryptographic verification of all prior history in a single response, without requiring complex arbitrary suffix/middle sub-tree proofs.
   - **Access Pattern & Recency Bias**: Transparency log auditing is heavily biased toward the most recent entries (new certificates, latest package releases, fresh signatures). Earlier entries are typically stale, superseded, or already observed by recurring index auditors. Backward paging delivers the freshest data on Page 1 immediately.
   - **Storage & Traversal Alignment**: Inverted chunk storage (`'c' + KeyHash + ^chunkNum`) naturally positions the active, newest chunk first, enabling O(1) seek and chronological reverse traversal.
 - *Rejected - Forward Paging (`start=X&limit=M`)*: Forward paging would require either returning unverified future state, maintaining complex arbitrary suffix sub-tree proofs, or forcing clients to traverse millions of historical entries to reach the latest state.
 
+### 9.5 Future Architectural Extensions: Prefix-Trie & Subtree Indexing
+
+While VIndex v1 standardizes on 32-byte point lookups (`KeyHash = SHA256(canonicalSubject)`), preserving canonical preimages across `map_bundle` executions creates a clean architectural foundation for future prefix search extensions:
+- **Subdomain & Path Discovery**: In CT and package repositories, querying all subdomains under `*.example.com` or all subpackages under `github.com/org/*` requires prefix-trie indexing.
+- **Unified Guest Contract**: Because guest WASM modules emit canonical string preimages rather than one-way hashes, future index versions can index raw radix paths or subtree roots without modifying plugin implementations or recompiling guest modules.
+
 ---
 
-## 9. Companion Documentation
+## 10. Companion Documentation
 
-- **[WASM MapFn Plugin SDK & Runtime](../mapfn/README.md)**: WebAssembly guest ABI, memory management protocol, Wazero sandboxing, multi-language SDKs, and offline verification harness.
+- **[WASM MapFn Plugin SDK & Runtime](../mapfn/README.md)**: WebAssembly guest ABI, 256-leaf `map_bundle` protocol, host SHA-NI crypto, multi-language SDKs, and offline verification harness.
 - **[Applications & Ecosystems](./APPLICATIONS.md)**: Ecosystem mapping guides (Certificate Transparency, Merkle Tree Certificates, Go SumDB, Sigstore, Sigsum).
-- **[Benchmarks & Performance](./BENCHMARKS.md)**: Empirical performance benchmarks (Zero-WAL vs WAL, 54M local / 61M live CDN SumDB ingestion, 10M CT fanout load tests).
+- **[Benchmarks & Performance](./BENCHMARKS.md)**: Empirical performance benchmarks (Zero-WAL vs WAL, 54M local / 61M live CDN SumDB ingestion, 10M CT fanout load tests, closed-loop telemetry).
 - **[Hammer Design](../hammer/README.md)**: Load testing, synthetic generation, and invariant verification framework.
-

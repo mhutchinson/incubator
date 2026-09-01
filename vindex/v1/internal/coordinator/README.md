@@ -6,7 +6,7 @@ The **Coordinator Subsystem** (`vindex/v1/internal/coordinator`) orchestrates li
 
 ### 1.1 Core Goals
 1. **Sub-500ms Time-to-First-Serve**: Open the HTTP Read Server for lookup queries almost instantaneously upon process launch, without waiting for background ingestion sync.
-2. **Zero-WAL Deterministic Replay**: Reconstruct and fast-forward un-synced in-memory MPT state to the latest Output Log entry (`S_OUT`) after crashes by streaming historical tiles from cache, evaluating `MapFn`, and reading Pebble KV chunks with O(1) sub-root reconstruction—with **zero mutations or writes to Pebble DB**.
+2. **Zero-WAL Deterministic Replay**: Reconstruct and fast-forward un-synced in-memory MPT state to the latest Output Log entry (`S_OUT`) after crashes by streaming historical tiles from cache, evaluating `MapBundle` (bundled execution with host SIMD SHA-256), and reading Pebble KV chunks with O(1) sub-root reconstruction—with **zero mutations or writes to Pebble DB**.
 3. **Monotonic Watermark Progression**: Enforce strict pipeline invariants preventing race conditions between ingestion, chunk commits, MPT updates, and serving state.
 4. **Moving-Goalpost Prevention**: Persist target Input Log checkpoints to `m_target_checkpoint` to prevent synchronization starvation on high-velocity logs.
 5. **Cryptographic Checkpoint Ratcheting**: Enforce mandatory origin signature verification, optional witness policy ([c2sp.org/tlog-policy](https://c2sp.org/tlog-policy)) quorums via `torchwood.VerifyCheckpoint`, and Merkle consistency proof verification (`golang.org/x/mod/sumdb/tlog.CheckTree`) on target checkpoint transitions (`CP_old` -> `CP_new`).
@@ -39,9 +39,9 @@ The Coordinator manages the daemon through three distinct, strictly sequenced li
        │      - Fast-Forward Tile Replay Catchup (exact == false || mptVersion < S_OUT):
        │          • Dirty/unclean crash or lagging MPT detected
        │          • Execute Replay(mptVersion, S_OUT):
-       │              - Stream historical leaves [mptVersion .. S_OUT) from tile cache
-       │              - Evaluate MapFn on historical leaves to identify modified keys
-       │              - For each key: Invoke store.GetSubRoot(keyHash, S_OUT) (targeted lookup on 'c')
+       │              - Stream historical tiles [mptVersion .. S_OUT) from local tile cache
+       │              - Evaluate MapBundle on historical tiles; compute host hardware SHA-256
+       │              - For each modified key: Invoke store.GetSubRoot(keyHash, S_OUT) (targeted lookup on 'c')
        │              - Reconstruct MiniLog Merkle sub-roots at S_OUT (zero storage writes)
        │              - Apply mutations to in-memory MPT via mpt.Set()
        │          • Finalize root: mpt.Snap(int64(S_OUT))
@@ -52,7 +52,7 @@ The Coordinator manages the daemon through three distinct, strictly sequenced li
        ▼
 [Stage 2: Live Steady-State Ingestion]
        ├── 1. Checkpoint Verification: Poll upstream checkpoint, verify origin signature & witness policy (torchwood.VerifyCheckpoint), verify Merkle consistency proof (tlog.CheckTree), and persist m_target_checkpoint
-       ├── 2. IngestionPipeline: Monotonic forward ingestion from S_OUT to live Target_CP
+       ├── 2. IngestionPipeline: Monotonic forward ingestion from S_OUT to live Target_CP using MapBundle
        ├── 3. Serialized Batch Execution Loop (per batch S_k):
        │      a. store.WriteBatch(entries, S_k): Blocking disk persistence (pebble.Sync) -> advances m_kv_size
        │      b. publisher.PublishBatch(...): Root prediction -> Output Log append -> witness cosignatures -> in-memory MPT ratchet -> advances Output_Size
@@ -76,7 +76,7 @@ On startup, the Coordinator inspects the on-disk MPT header (`mptMgr.Version()`)
 mptVersion        │   INSTANT WARM START        │   FAST-FORWARD TILE REPLAY  │
    == S_OUT       │   (< 5ms)                   │   (< 500ms)                 │
                   │   • Clean shutdown verified │   • Dirty header on disk    │
-(MPT Matches      │   • Assert Root consistency │   • Replay missing leaves   │
+(MPT Matches      │   • Assert Root consistency │   • Replay missing tiles    │
  Output Log)      │   • Set serving_state       │     from last clean version │
                   │   • Open Read Server NOW    │   • mptMgr.Sync() + Open    │
                   │                             │                             │
@@ -85,7 +85,7 @@ mptVersion        │   INSTANT WARM START        │   FAST-FORWARD TILE REPLAY
 mptVersion        │   FAST-FORWARD TILE REPLAY  │   FAST-FORWARD TILE REPLAY  │
    < S_OUT        │   (< 500ms)                 │   (< 500ms)                 │
                   │   • Clean MPT on disk, but  │   • Dirty/lagging MPT       │
-(MPT Lags Behind  │     lagging behind Output   │   • Replay missing leaves   │
+(MPT Lags Behind  │     lagging behind Output   │   • Replay missing tiles    │
  Output Log)      │   • Replay [mptVer..S_OUT)  │     [mptVer..S_OUT) from    │
                   │   • Zero Pebble DB writes   │     local tile cache        │
                   │   • mptMgr.Sync() + Open    │   • Zero Pebble DB writes   │
@@ -96,7 +96,7 @@ mptVersion        │   FAST-FORWARD TILE REPLAY  │   FAST-FORWARD TILE REPLAY
 | Recovery Mode | Header Condition | In-Memory Work | Storage Mutations | Time to First Serve |
 | :--- | :--- | :--- | :--- | :--- |
 | **Instant Warm Start** | `exact == true && mptVersion == S_OUT` | Assert `MPT.Root() == OutputLog[N-1].MapRoot` | None | **< 5ms** |
-| **Fast-Forward Tile Replay** | `exact == false || mptVersion < S_OUT` | Stream leaves `[mptVersion .. S_OUT)`, evaluate `MapFn`, call `store.GetSubRoot`, apply `mpt.Set` + `mpt.Snap` | None (zero writes to Pebble) | **< 500ms** |
+| **Fast-Forward Tile Replay** | `exact == false || mptVersion < S_OUT` | Stream tiles `[mptVersion .. S_OUT)`, evaluate `MapBundle` + host hardware SHA-256, call `store.GetSubRoot`, apply `mpt.Set` + `mpt.Snap` | None (zero writes to Pebble) | **< 500ms** |
 
 ---
 
@@ -226,8 +226,8 @@ During daemon startup, `RecoveryCoordinator.RecoverState` runs before opening th
    - Sets `mptDurableSize = S_OUT` and initializes active `ServingState = OutputLog[N-1]`.
    - Opens HTTP Read Server for lookup queries immediately (**< 5ms**).
 3. **Fast-Forward Tile Replay Catchup (`exact == false || mptVersion < S_OUT`)**:
-   - Streams missing historical leaves `[mptVersion .. S_OUT)` from local tile cache.
-   - Evaluates `MapFn` over replayed leaves to identify modified key hashes.
+   - Streams missing historical tiles `[mptVersion .. S_OUT)` from local tile cache.
+   - Evaluates `MapBundle` over replayed tiles and computes host SIMD SHA-256 to identify modified key hashes.
    - For each modified key: invokes `store.GetSubRoot(keyHash, S_OUT)` on `'c'` chunks.
    - Reconstructs MiniLog Merkle sub-roots at `S_OUT` with **zero storage writes or disk mutations**.
    - Applies mutations to in-memory MPT via `mpt.Set()`.

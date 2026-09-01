@@ -412,10 +412,10 @@ TIER 2: CONTINUATION PAGE VERIFICATION (before == X, inductive step)
 
 ## 8. Alternatives Considered
 
-For comprehensive discussion of architectural trade-offs across storage engines, commit pipelines, and trie structures, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-architectural-decisions--alternatives-considered).
+For comprehensive discussion of architectural trade-offs across storage engines, commit pipelines, and trie structures, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#9-architectural-decisions--alternatives-considered).
 
 - **Paging Model & Traversal Direction**:
-  - **Selected - Backward Paging (`before=X&limit=M`)**: Merkle tree compact ranges natively commit to a contiguous prefix of history (`0 .. K-1`). Returning the latest tail entries alongside a single `prefix-compact-range-v1` allows O(log N) cryptographic verification of all prior history in a single response. Traversal naturally aligns with inverted chunk storage (`'c' + KeyHash + ^chunkNum`). For detailed rationale, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#8-architectural-decisions--alternatives-considered).
+  - **Selected - Backward Paging (`before=X&limit=M`)**: Merkle tree compact ranges natively commit to a contiguous prefix of history (`0 .. K-1`). Returning the latest tail entries alongside a single `prefix-compact-range-v1` allows O(log N) cryptographic verification of all prior history in a single response. Traversal naturally aligns with inverted chunk storage (`'c' + KeyHash + ^chunkNum`). For detailed rationale, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md#9-architectural-decisions--alternatives-considered).
   - **Rejected - Forward Paging (`start=X&limit=M`)**: Requires either returning unverified future state, maintaining complex arbitrary suffix sub-tree proofs, or forcing clients to traverse millions of historical entries to reach the latest state.
 - **Wire Protocol & Framing**:
   - **Selected - C2SP Multi-Section text/plain Framing**: Standardized in transparency ecosystem (signed-note, tlog-checkpoint), human-readable, curl-friendly, zero Base64 JSON overhead, simple line-scanner parsing.

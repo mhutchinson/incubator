@@ -2,13 +2,15 @@
 
 ## 1. Context & Objectives
 
-The **Ingestion Pipeline** (`vindex/v1/internal/ingest`) is responsible for streaming leaves from an append-only Input Log, executing deterministic [`MapFn`](../../mapfn/README.md) mapping across parallel WebAssembly sandboxes, enforcing strictly chronological leaf ordering via an in-memory resequencer, and delivering ordered mapped batches to the database commit plane without write-ahead log (WAL) overhead.
+The **Ingestion Pipeline** (`vindex/v1/internal/ingest`) is responsible for streaming leaves from an append-only Input Log, executing deterministic [`map_bundle`](../../mapfn/README.md) mapping across parallel WebAssembly sandboxes, computing host hardware-accelerated SHA-256 key hashes, enforcing strictly chronological leaf ordering via an in-memory resequencer, and delivering ordered mapped batches to the database commit plane without write-ahead log (WAL) overhead.
 
 ### 1.1 Key Guarantees
 
 1. **High Throughput Streaming**: Native 256-leaf entry bundle fetching (`TileFetcher.FetchTiles`) eliminates per-leaf function call and network overhead.
 2. **Cryptographic Input Log Authentication**: Verifies checkpoint origin signatures, optional witness policy ([c2sp.org/tlog-policy](https://c2sp.org/tlog-policy)), Merkle consistency proofs, and authenticates tree tiles and leaf record hashes (`tlog.RecordHash`) against the target checkpoint root via `torchwood`.
-3. **Deterministic Hermetic Mapping**: Sandboxed WASM execution via Wazero with a strict `HALT` policy on memory violations or guest traps.
+3. **Bundled Hermetic Mapping & Hardware Cryptography**:
+   - Bundled tile mapping (`map_bundle`) executes 256 leaves per FFI boundary crossing, slashing FFI transitions from 768 to 2–3 per tile (< 1% CPU).
+   - Guest modules emit raw canonical preimages, allowing the Go host to compute SHA-256 using hardware SIMD acceleration (**Intel SHA-NI** or **ARMv8 Crypto** extensions), eliminating the ~55% software crypto bottleneck.
 4. **Monotonic Leaf Ordering**: Out-of-order map worker completions are sorted into strictly ascending order by an in-memory priority queue min-heap before downstream delivery.
 5. **Zero-WAL Architecture**: Local tile cache acts as the immutable log of record; intermediate database WAL writes are completely eliminated.
 6. **Decoupled Storage**: The ingestion package contains **zero Pebble dependencies, keys, or transactions**.
@@ -16,7 +18,7 @@ The **Ingestion Pipeline** (`vindex/v1/internal/ingest`) is responsible for stre
 ### 1.2 Non-Requirements & Out of Scope
 
 - **No Network / Host I/O in MapFn**: WebAssembly sandboxes have zero WASI syscall access (no network, no filesystem I/O, no system clock, no RNG). Execution is pure, hermetic function of leaf bytes.
-- **No Cross-Leaf State Retention**: `MapFn` is strictly stateless across invocations. No mutable state persists inside guest modules between leaves.
+- **No Cross-Leaf State Retention**: `MapFn` is strictly stateless across invocations. No mutable state persists inside guest modules between tiles.
 - **No Direct Storage Mutation**: Ingestion has zero dependencies on Pebble DB, MPT, or Output Log schemas; it strictly outputs monotonically ordered `MappedBatch` channels.
 
 ---
@@ -39,10 +41,11 @@ The Ingestion Pipeline is structured as a 3-stage asynchronous pipeline with Go 
                                │ chan *LeafBundle (depth: 64-256)
                                ▼ (Stage 2: CPU Bound, max(1, GOMAXPROCS-1) workers)
 ┌─────────────────────────────────────────────────────────────┐
-│ MapWorkerPool                                               │
-│ • Wazero WASM Sandbox / Go MapFn execution                  │
-│ • Parse leaf -> extract search keys -> SHA-256 hash         │
-│ • Sort & deduplicate key hashes per leaf                    │
+│ MapWorkerPool (~4 MB linear memory / worker instance)       │
+│ • Bundled Wazero WASM map_bundle execution (256 leaves/call)│
+│ • Guest emits canonical Claim Subject preimages             │
+│ • Host computes KeyHash = crypto/sha256 (SHA-NI / ARM Crypto│
+│ • Sort (bytes.Compare) & deduplicate key hashes per leaf    │
 │ • Construct MappedBatch (unordered completion)              │
 └──────────────────────────────┬──────────────────────────────┘
                                │ chan *MappedBatch (unordered)
@@ -80,9 +83,9 @@ import (
 )
 
 var (
-	ErrWasmHalt        = errors.New("wasm execution halted due to trap or resource violation")
-	ErrInvalidMemory   = errors.New("wasm returned pointer outside linear memory bounds")
-	ErrUnalignedOutput = errors.New("wasm output byte length is not a multiple of 32 bytes")
+	ErrWasmHalt      = errors.New("wasm execution halted due to trap or resource violation")
+	ErrInvalidMemory = errors.New("wasm returned pointer outside linear memory bounds")
+	ErrInvalidFraming = errors.New("wasm output framing or bounds corrupted")
 )
 
 // Checkpoint represents an Input Log checkpoint validated via torchwood.VerifyCheckpoint.
@@ -94,7 +97,7 @@ type Checkpoint struct {
 	Extension []byte
 }
 
-// LeafBundle encapsulates 256 contiguous leaves unpacked from a single Tessera entry bundle.
+// LeafBundle encapsulates up to 256 contiguous leaves (1 <= N <= 256) unpacked from a Tessera entry bundle.
 type LeafBundle struct {
 	BundleIdx    uint64
 	StartLeafIdx uint64
@@ -123,9 +126,9 @@ type TileCache interface {
 	PruneBefore(watermark uint64) error
 }
 
-// SandboxPool manages a pool of sandboxed WebAssembly execution modules.
+// SandboxPool manages a pool of sandboxed WebAssembly execution modules executing bundled tiles.
 type SandboxPool interface {
-	MapLeaf(ctx context.Context, leaf []byte) ([][sha256.Size]byte, error)
+	MapBundle(ctx context.Context, leaves [][]byte) ([][][sha256.Size]byte, error)
 	Close(ctx context.Context) error
 }
 
@@ -162,17 +165,21 @@ func (p *Pipeline) Close() error
   - Acts as the immutable log of record powering Zero-WAL startup recovery without network egress.
 - **Format Adapters**:
   - Configures log format path conventions via `torchwood.WithTilePath` and entry boundary slicing via `torchwood.WithCutEntry` for standard formats (`tlog-tiles`, `static-ct`, and `sumdb`).
-- **Batching Transformation**: Authenticated raw leaves are unpacked into `LeafBundle` slices of exactly 256 contiguous leaves, stamped with `BundleIdx = StartLeafIdx / 256`.
+- **Batching Transformation**: Authenticated raw leaves are unpacked into `LeafBundle` slices of up to 256 contiguous leaves (`1 <= N <= 256`), stamped with `BundleIdx = StartLeafIdx / 256`.
 
 ### 4.2 Stage 2: MapWorkerPool & WASM Sandbox
-- **Workload Profile**: CPU bound (WebAssembly execution, parsing, cryptographic hashing).
+- **Workload Profile**: CPU bound (WebAssembly execution, parsing, host hardware cryptographic hashing).
 - **Host CPU Partitioning**: Strictly sized to `max(1, GOMAXPROCS - 1)` workers. 1 dedicated CPU core is reserved for Pebble chunk writes (`KVIndexer`), MPT root publishing (`OutputPublisher`), and live read queries.
-- **WASM Guest ABI & Runtime Delegation**: Low-level WebAssembly guest ABI exports (`map_leaf`, `allocate`, `deallocate`), linear memory layouts, memory safety bounds, and SDK bindings are fully detailed in [**WASM MapFn Plugin SDK & Host Runtime**](../../mapfn/README.md).
-- **Host Execution & Deduplication Mechanics**:
-  - Host allocates a guest memory buffer via `allocate(size)`, writes raw leaf bytes, and invokes `map_leaf(ptr, len)`.
-  - Host verifies return values: asserts output length is a multiple of 32 bytes (`out_len % 32 == 0`) and memory range `[out_ptr .. out_ptr+out_len)` falls strictly within guest memory boundaries.
-  - Host extracts 32-byte SHA-256 key hashes, sorts them lexicographically via `bytes.Compare`, and deduplicates using `slices.Compact` to guarantee strictly unique keys per leaf before constructing `MappedBatch`.
-- **Deterministic Error Policy (`HALT`)**: Any guest panic, linear memory violation, or execution timeout (e.g. 100ms per-leaf deadline) triggers an immediate daemon `HALT` to prevent unverified witness state divergence.
+- **Memory Footprint & Sizing**: Each worker allocates ~4 MB of linear memory for input/output arenas (64 WASM memory pages), allowing 24 parallel workers on a multi-core server to consume under 100 MB of total RAM.
+- **Bundled Execution Mechanics (`MapBundle`)**:
+  - Host serializes all N leaves (`1 <= N <= 256`) into the structured offset array format and writes to guest memory via `allocate(len)`.
+  - Host invokes `map_bundle(ptr, len)` once per bundle/tile. FFI boundary overhead is reduced from ~23% CPU to < 1% CPU.
+  - Guest SDK harness iterates across the N leaves (`0 .. N-1`), invokes the developer's pure single-leaf mapping logic, and serializes canonical Claim Subject preimages into the framed output buffer.
+- **Host Hardware Hashing, Sorting & Deduplication**:
+  - Host unpacks canonical preimages and computes `KeyHash = sha256.Sum256(preimage)` using Go's SIMD hardware acceleration (**x86 SHA-NI** or **ARMv8 Crypto**), eliminating the ~55% software crypto bottleneck.
+  - Host sorts hashes lexicographically via `bytes.Compare` and deduplicates using `slices.Compact` to guarantee strictly unique keys per leaf.
+  - Host constructs `MappedBatch` mapping `KeyHash -> []LeafIndex` across all N leaves.
+- **Deterministic Error Policy (`HALT`)**: Any guest panic, linear memory violation, framing corruption, or execution timeout (e.g. 100ms per-bundle deadline) triggers an immediate daemon `HALT` to prevent unverified witness state divergence.
 
 ### 4.3 Stage 3: Resequencer & Output Channel
 - **Mechanism**: In-memory priority min-heap indexed by `BundleIdx`.
@@ -263,9 +270,9 @@ SafeWatermark = mptDurableSize
 - **Tile & Leaf Merkle Authentication**: `torchwood.Client` strictly authenticates downloaded tree tiles against `tree.Hash`, computes leaf record hashes (`tlog.RecordHash`), and asserts equality against Level-0 tree tiles prior to mapping.
 
 ### 7.2 WebAssembly Guest Sandboxing
-- **Memory Cap**: Fixed linear memory limit (e.g., 16 MB maximum heap per WASM instance). Exceeding this triggers a trap and immediate daemon `HALT`.
-- **Execution Timeout**: Per-leaf execution deadline (e.g., 100ms CPU timeout) via context cancellation to prevent guest infinite loops.
-- **Memory Safety & Alignment**: Validation of return pointer/length within guest bounds; enforcement of `out_len % 32 == 0`.
+- **Memory Cap**: Fixed linear memory limit (e.g., 16 MB maximum heap per WASM instance; ~4 MB active arena). Exceeding this triggers a trap and immediate daemon `HALT`.
+- **Execution Timeout**: Per-bundle execution deadline (e.g., 100ms CPU timeout) via context cancellation to prevent guest infinite loops.
+- **Memory Safety & Alignment**: Validation of return pointer/length within guest bounds; enforcement of framing invariants.
 
 ---
 
@@ -280,7 +287,7 @@ SafeWatermark = mptDurableSize
 
 ### Unit & Fuzz Testing
 - **Resequencer Queue Tests**: Unit test suite for `Resequencer` min-heap priority queue verifying correct reordering under randomized arrival orders, out-of-order bursts, and backpressure.
-- **MapWorkerPool Fuzzing**: Fuzzing `MapWorkerPool` output validation against malformed WASM return pointers, unaligned byte slices, and out-of-bounds linear memory offsets.
+- **MapWorkerPool Fuzzing**: Fuzzing `MapWorkerPool` output validation against malformed WASM return pointers, invalid framing headers, corrupted length prefixes, and out-of-bounds linear memory offsets.
 - **TileFetcher Fuzzing**: Fuzzing `TileFetcher` against corrupted entry bundles and truncated checkpoints.
 
 ---
@@ -291,7 +298,7 @@ SafeWatermark = mptDurableSize
 - `vindex_ingest_tile_fetch_bytes_total` (Counter): Total raw bundle bytes fetched.
 - `vindex_ingest_resequencer_heap_size` (Gauge): Current buffered batches in the min-heap.
 - `vindex_ingest_resequencer_gap_wait_seconds` (Histogram): Time spent waiting for missing sequence numbers at head of heap.
-- `vindex_ingest_map_worker_duration_seconds` (Histogram): Per-leaf execution time within WASM runtime.
+- `vindex_ingest_map_bundle_duration_seconds` (Histogram): Per-bundle execution time within WASM runtime.
 - `vindex_ingest_wasm_memory_allocated_bytes` (Gauge): Memory consumed by Wazero instances.
 - `vindex_ingest_tile_reaper_deleted_tiles_total` (Counter): Cumulative tiles pruned.
 
@@ -303,8 +310,9 @@ SafeWatermark = mptDurableSize
   - **Option A (Selected) - `filippo.io/torchwood`**: End-to-end cryptographic tile and leaf Merkle tree authentication against target checkpoint root (`tree.Hash`), built-in `torchwood.PermanentCache` for Zero-WAL startup recovery, origin signature and witness policy validation (`torchwood.VerifyCheckpoint`), and modular format adapters (`WithTilePath`, `WithCutEntry`).
   - **Option B (Rejected) - Raw / Custom Tile Fetching**: Lacks standardized tile Merkle proof verification; custom cryptographic validation is error-prone and adds unneeded maintenance overhead.
 - **Mapping Execution Engine**:
-  - **Option A (Selected) - Wazero WebAssembly Sandboxes**: Hermetic, deterministic execution across heterogeneous host platforms, hardware memory boundary enforcement, zero cgo overhead, strict CPU/memory isolation.
-  - **Option B (Rejected) - Go Plugins (`plugin.Open`)**: Requires exact compiler/dependency matching, unsafe (unbounded memory access can corrupt host state or crash process), non-deterministic host behavior can break consensus.
+  - **Option A (Selected) - Wazero WebAssembly Sandboxes (`map_bundle`)**: Hermetic, deterministic execution across heterogeneous host platforms, hardware memory boundary enforcement, zero cgo overhead, strict CPU/memory isolation, and bundled tile execution reducing FFI overhead to < 1% CPU.
+  - **Option B (Rejected) - Per-Leaf WASM Invocation**: 768 FFI transitions per tile consumed ~23% of CPU time in boundary crossings.
+  - **Option C (Rejected) - Go Plugins (`plugin.Open`)**: Requires exact compiler/dependency matching, unsafe (unbounded memory access can corrupt host state or crash process), non-deterministic host behavior can break consensus.
 - **Ingestion Batch Granularity**:
   - **Option A (Selected) - Native 256-Leaf Entry Bundles**: Aligns with Tessera's physical storage layout, fetching full tiles in single I/O operations without unbundling overhead.
   - **Option B (Rejected) - Leaf-by-Leaf Streaming**: Massive HTTP request amplification and high CPU serialization overhead.
