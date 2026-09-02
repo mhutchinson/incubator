@@ -1,108 +1,13 @@
 # Sub-Design: Authenticated State (MPT & Output Log Commitments)
 
-## 1. Context & Objectives
-
-The **Authenticated State Subsystem** (`vindex/v1/internal/tree`) manages the cryptographic commitments binding search keys to mini-log Merkle roots, publishes state commitments to the Tessera Output Log, collects remote witness cosignatures, and updates the in-memory Merkle Patricia Trie (MPT) with a sub-5ms write lock critical section.
-
-### 1.1 Core Guarantees
-1. **Uninterrupted Read Serving**: Uses lock-free MPT root prediction (`mpt.Predict`) and Split-Locking (`writeMu` vs `treeMu`). Long disk fsync operations (5-20ms) during `Sync()` run under `writeMu` and never block `Prove()` lookup reads (`treeMu.RLock()`), maintaining 100% read availability during witness latency windows and disk flushes.
-2. **Sub-5ms Critical Section**: The `treeMu` write lock critical section is strictly limited to in-memory MPT node updates (`mpt.Set`), SHA-256 root snap (`mpt.Snap`), and atomic pointer ratcheting.
-3. **Equivocation Protection**: Binds `MapRoot` and the exact `InputLogCheckpoint` bytes into an append-only Tessera Output Log with witness cosignatures.
-4. **Zero GC Pressure via `mmap`**: The working trie is backed by OS `mmap(2)` via `torchwood/mpt`, bypassing Go runtime garbage collection.
-
-### 1.2 Non-Requirements & Out of Scope
-- **No Historical Time-Travel Queries**: The in-memory MPT serves proofs against the active ServingState. Historical root queries are verified via the append-only Output Log, not retained as active in-memory branches.
-- **No Multi-Tree Sharding**: A single MPTManager instance manages the global key-space on the host.
-- **No Direct Leaf Ingestion**: The tree package does not parse raw log leaves or execute MapFn; it strictly accepts pre-computed modifiedSubRoots map updates from the committer.
+This document defines the authenticated trie architecture, cryptographic invariants, verified performance optimizations, operational considerations, and retired design branches for the **Authenticated State Subsystem** (`vindex/v1/internal/tree`).
 
 ---
 
-## 2. Package API & Responsibilities
+## 1. Core Load-Bearing Invariants
 
-### Responsibilities
-- **MPT Working Tree Management**: Allocates and maintains the `torchwood/mpt` binary trie in `mmap`, managing dirty subtree hashing and background compaction.
-- **Split-Locking Concurrency**: Isolates background disk `Sync()` operations (`writeMu`) from in-memory lookups (`treeMu.RLock()`).
-- **Lock-Free Root Prediction**: Computes the future `MapRoot` across modified sub-roots prior to acquiring writer locks.
-- **Output Log State Commitments**: Serializes `StateCommitment` (`hex(MapRoot) + "\n" + ILCheckpoint.Raw`), appends to Tessera Output Log, and queries inclusion proofs.
-- **Witness Protocol Coordination**: Submits new Output Log checkpoints to remote witnesses and aggregates signed note cosignatures.
-- **Serving State Management**: Maintains the thread-safe active serving state pointer accessed by the Read Server.
-
-### Go Interfaces & Types
-
-```go
-package tree
-
-import (
-	"context"
-	"crypto/sha256"
-	"sync"
-	"sync/atomic"
-	"github.com/transparency-dev/formats/log"
-	torchmpt "filippo.io/torchwood/mpt"
-)
-
-// MPTManager wraps the torchwood/mpt in-memory trie with split-locking.
-type MPTManager struct {
-	writeMu sync.Mutex   // Serializes Commit and Sync operations
-	treeMu  sync.RWMutex // Protects trie access during Prove lookups and in-memory root swaps
-	tree    *torchmpt.Tree
-	mmapDir string
-}
-
-func OpenMPT(mmapDir string) (*MPTManager, error)
-func (m *MPTManager) Version() (version int64, exact bool)
-func (m *MPTManager) Predict(mutations map[[sha256.Size]byte][sha256.Size]byte) ([sha256.Size]byte, error)
-func (m *MPTManager) Commit(mutations map[[sha256.Size]byte][sha256.Size]byte, inputLogSize uint64) ([sha256.Size]byte, error)
-func (m *MPTManager) Sync() (durableSize uint64, err error) // Flushes patch frames, fsyncs disk, asserts exact == true, returns durable InputLogSize
-func (m *MPTManager) Prove(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error)
-func (m *MPTManager) Root() [sha256.Size]byte
-func (m *MPTManager) Close() error
-
-// OutputLogClient abstracts append and proof operations against the Tessera Output Log.
-type OutputLogClient interface {
-	Append(ctx context.Context, leafData []byte) (leafIdx uint64, rawCP []byte, err error)
-	InclusionProof(ctx context.Context, leafIdx, treeSize uint64) ([][sha256.Size]byte, error)
-}
-
-// WitnessClient abstracts submitting checkpoints to remote witnesses for cosigning.
-type WitnessClient interface {
-	Witness(ctx context.Context, checkpoint []byte) (witnessedCP []byte, err error)
-}
-
-// ServingState represents the immutable active state served to lookup clients.
-type ServingState struct {
-	OutputLogIndex uint64
-	OutputLogSize  uint64
-	OutputLogCP    *log.Checkpoint
-	RawCheckpoint  []byte // Raw signed note bytes preserving witness cosignatures
-	OutputLogProof [][sha256.Size]byte
-	InputLogCP     *log.Checkpoint
-	RawInputLogCP  []byte // Raw signed Input Log checkpoint note bytes
-	InputLogSize   uint64
-	MapRoot        [sha256.Size]byte
-}
-
-// OutputPublisher coordinates MPT prediction, Output Log publishing, and state ratcheting.
-type OutputPublisher struct {
-	mptMgr       *MPTManager
-	outputLog    OutputLogClient
-	witness      WitnessClient
-	servingState atomic.Pointer[ServingState]
-}
-
-func NewOutputPublisher(mptMgr *MPTManager, outputLog OutputLogClient, witness WitnessClient) *OutputPublisher
-func (p *OutputPublisher) PublishBatch(ctx context.Context, modifiedSubRoots map[[sha256.Size]byte][sha256.Size]byte, inputLogCP *log.Checkpoint, rawInputLogCP []byte) (*ServingState, error)
-func (p *OutputPublisher) GetServingState() *ServingState
-```
-
----
-
-## 3. Part 1 — The Commitment & Publishing Plane
-
-### 3.1 Output Log Commitment Schema
-
+### 1.1 Output Log State Commitment Schema
 Each leaf in the Tessera Output Log consists of a two-line plain-text `StateCommitment` payload:
-
 ```text
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 example.com/inputlog
@@ -111,139 +16,77 @@ example.com/inputlog
 
 — example.com/inputlog/witness BxHj...
 ```
-
-- **Line 1 (`MapRoot`)**: 64-character lowercase hex string representing the 32-byte MPT root hash.
+- **Line 1 (`MapRoot`)**: 64-character lowercase hex string representing the 32-byte Sparse Merkle Patricia Trie root hash.
 - **Remaining Lines (`InputLogCheckpoint`)**: Raw unparsed bytes of the signed Input Log checkpoint note committed at this snapshot, including all origin, size, root hash, and witness cosignature lines.
 
-### 3.2 Serialized Batch Commit Barrier & Split-Lock Sequencing
+### 1.2 Lock-Free Root Prediction (`mpt.Predict`)
+Before acquiring the writer lock or appending to the Output Log, `OutputPublisher` calls `mptMgr.Predict`:
+- Computes the future `MapRoot` across all modified mini-log sub-roots pure in-memory without holding the exclusive writer lock (`treeMu.Lock`).
+- Allows Output Log append and remote witness network RPCs to proceed while concurrent readers query `treeMu.RLock()` without blocking.
 
-To guarantee crash consistency without distributed transactions, the batch commit pipeline enforces a strict, synchronous commit barrier: Output Log append and witness network calls **MUST NOT begin** until `kvstore.WriteBatch` has successfully completed and durably persisted to disk (`pebble.Sync`).
-
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 1. Synchronous Storage Commit Barrier (kvstore.WriteBatch)                  │
-│ • Commit modified chunks + KeyMetaKVSize to Pebble DB with pebble.Sync      │
-│ • BLOCKING: Output Log publishing & witness RPCs MUST NOT start before this │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │ (Storage persistence verified durable)
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2. Lock-Free Publishing Phase (OutputPublisher - treeMu NOT held)           │
-│ • Calculate predicted MapRoot across modified sub-roots (mptMgr.Predict)    │
-│ • Construct StateCommitment payload: hex(MapRoot) + "\n" + rawBytes(IL_CP) │
-│ • Append leaf to Tessera Output Log (outputLog.Append)                      │
-│ • Submit Output Log checkpoint to remote witnesses & collect cosignatures   │
-│ • Query RFC 6962 inclusion proof for the Output Log leaf                    │
-│   (Read Server continues serving Prove() lookups completely unblocked)      │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3. In-Memory Critical Section (< 5ms under treeMu.Lock() & writeMu.Lock())  │
-│ • Apply sub-root mutations to in-memory MPT (mpt.Set)                       │
-│ • Recompute root hash & record Input Log size version (mpt.Snap(S_k))       │
-│ • Assert actualRoot == predictedMapRoot (FATAL HALT on mismatch)            │
-│ • Ratchet atomic servingState pointer to new Output Log commitment         │
-│ • Release treeMu.Unlock() & writeMu.Unlock()                                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                       │ (Background / Periodic)
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 4. Background Disk Sync (5-20ms under writeMu.Lock(), treeMu NOT held)      │
-│ • Flush patch frames & fsync MPT file descriptor                            │
-│ • Assert Version() exact == true                                            │
-│ • Advance MPTDurableSize watermark (SafeWatermark = mptDurableSize)         │
-│   (Concurrent Prove() lookups hold treeMu.RLock() completely unblocked)     │
-└─────────────────────────────────────────────────────────────────────────────┘
+### 1.3 Fatal Panic on Root Prediction Divergence
+In `publisher.PublishBatch`, once the commitment is appended to the Output Log, writer lock `treeMu` is acquired and mutations are committed (`CommitWithVersionLocked`). The actual computed root is asserted against `predictedMapRoot`:
+```go
+if actualRoot != predictedMapRoot {
+    p.mptMgr.Unlock()
+    panic(fmt.Sprintf("FATAL: MPT root prediction mismatch after output log append: actual root %x != predicted root %x", actualRoot, predictedMapRoot))
+}
 ```
+- **Invariant**: If `actualRoot != predictedMapRoot`, the node must terminate immediately with a fatal panic. Continuing execution would commit an equivocal root to the Output Log.
 
-- **Parallelism Note**: While in-memory root prediction (`mptMgr.Predict()`) could technically run in parallel with the storage sync, Output Log network I/O (append and witness cosignatures) must strictly wait for storage persistence (`store.WriteBatch`). Serializing the entire step per batch (`store.WriteBatch` -> `publisher.PublishBatch`) avoids unnecessary concurrency complexity, state coordination overhead, and race risks.
+### 1.4 Split-Locking Read Isolation
+The subsystem uses split-locking to isolate background disk persistence from in-memory lookups:
+- `writeMu` (`sync.Mutex`): Held during `CommitWithVersionLocked` and `Sync()`. Serializes write operations and background disk flushes.
+- `treeMu` (`sync.RWMutex`): Held in read mode (`RLock()`) during `Prove()` lookups, and briefly in write mode (`Lock()`) during in-memory node updates and root pointer swaps (< 5ms).
+- **Invariant**: `Sync()` (5–20ms disk fsync) executes under `writeMu` and **NEVER holds `treeMu`**. Concurrent `Prove()` lookups run completely unblocked during disk flushes.
 
-### 3.3 Crash Invariants, Failure Modes & Witness Recovery Policy
+### 1.5 Semantic MPT Versioning Bound to Input Log Size
+The trie supports versioned snapshots via `mpt.Snap(int64(inputLogSize))`:
+- Snapshot versions are strictly bound to the Input Log tree size committed in the Output Log leaf.
+- Binds cryptographic proofs directly to witnessed Input Log checkpoints with zero out-of-band metadata.
 
-- **Crash Invariant Guarantee (`m_kv_size >= Output_Size`)**:
-  Because storage persistence strictly precedes Output Log publication, the invariant `m_kv_size >= Output_Size` is preserved across all crash, kill, and power loss scenarios. Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted KV store chunks. If a crash occurs between storage sync and Output Log publication, `m_kv_size > S_OUT`; startup recovery simply ignores uncommitted storage chunks beyond `S_OUT` via point-in-time `store.GetSubRoot(keyHash, S_OUT)` queries.
-- **Prediction Mismatch (HALT)**: If `actualRoot != predictedMapRoot` during `Commit()`, the system logs a fatal error and triggers a deterministic `HALT` (since the Output Log has already committed to the predicted root).
-- **Witness Quorum Timeout**: Configurable retry with exponential backoff before failing the batch commit.
+### 1.6 Atomic Serving State Ratchet
+`OutputPublisher` ratchets the reader-visible state via an `atomic.Pointer[ServingState]`:
+- Readers observe new commitments atomically after write lock verification.
+- Guarantees readers never observe partial, intermediate, or uncommitted trie mutations.
 
 ---
 
-## 4. Part 2 — In-Memory Authenticated Trie Engine (`torchwood/mpt`)
+## 2. Verified Performance Optimizations
 
-The MPT stores cryptographic sub-roots mapping `KeyHash -> MiniLogRoot` using [`torchwood/mpt`](https://github.com/FiloSottile/torchwood/blob/main/mpt/DESIGN.md), a binary Merkle Patricia Trie.
+### 2.1 Binary Sparse MPT in `mmap` via `torchwood/mpt`
+The working trie is backed by OS `mmap(2)` via `filippo.io/torchwood/mpt`:
+- Node pointers (`left`, `right`, `leaf`) use 48-bit (6-byte) relocatable offsets, achieving ~52 bytes/node density.
+- Operates outside the Go runtime heap, completely eliminating Go garbage collection (GC) scan and pause overheads.
 
-### 4.1 MPT Working Tree Architecture
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│ MPT In-Memory Working Tree (mmap)                           │
-│                                                             │
-│  Trie Nodes (52 Bytes):                                     │
-│  [ bitDirty (2B) | left (6B) | right (6B) | leaf (6B) | ihash (32B) ]
-│                                                             │
-│  Leaf Values:                                               │
-│  [ 32-byte MiniLogRoot ] -> Append-only leaf file           │
-└─────────────────────────────────────────────────────────────┘
-```
-
-1. **In-Memory Working Tree via `mmap`**:
-   - Node pointers (`left`, `right`, `leaf`) use 48-bit (6-byte) relocatable byte offsets.
-   - Bypasses Go GC overhead entirely.
-2. **Lazy Hash Recomputation & Compaction**:
-   - Updates flag nodes as `dirty`. `Snap()` recomputes SHA-256 hashes only along dirty subtrees.
-   - Non-blocking concurrent compaction writes memory snapshots to a `next` file in the background.
-
-### 4.2 Split-Locking Architecture & Microbenchmark Justification
-
-To prevent background disk persistence from introducing tail-latency spikes to reader lookups:
-- `writeMu` (`sync.Mutex`): Held during `Commit()` and `Sync()`. Serializes write operations and background disk flushes.
-- `treeMu` (`sync.RWMutex`): Held in read mode (`RLock()`) during `Prove()` queries, and briefly in write mode (`Lock()`) during in-memory node updates and root pointer swaps in `Commit()` (< 5ms).
-- **Zero Read Lock Contention during `Sync()`**: When `Sync()` flushes patch frames and executes `fsync` (5-20ms), it holds `writeMu` but **never** holds `treeMu`. Consequently, concurrent `Prove()` queries execute completely unblocked.
-
-#### Empirical Performance Justification (Split-Locking Benchmark)
-
-Microbenchmarks on a 24-core host measuring concurrent `Prove()` lookups under heavy background disk syncs (`tree.Sync()`) demonstrate the necessity of the split-locking architecture:
+### 2.2 Split-Locking Microbenchmark Justification
+Microbenchmarks on a 24-core host measuring concurrent `Prove()` lookups under heavy background disk syncs (`tree.Sync()`) prove the value of split-locking:
 
 | Lock Architecture | Baseline Read Latency (`Prove` No Sync) | Read Latency under Disk Sync (`tree.Sync()`) | Lookup Throughput | Reader Availability during `fsync` |
 | :--- | :--- | :--- | :--- | :--- |
 | **Coarse Global Lock** | 1,473 ns/op | **18,887 ns/op** (12.8x degradation) | ~53,000 reads/s | **0% (100% blocked during msync/fsync)** |
 | **Split-Locking (`writeMu` + `treeMu`)** | **1,473 ns/op** | **1,473 ns/op** (in-memory snapshot) | **~678,000 reads/s** | **100% (uninterrupted read serving)** |
 
-- **Zero Reader Contention**: Because `Sync()` executes under `writeMu` without acquiring `treeMu.Lock()`, disk I/O pauses (5–20ms) never block HTTP lookup handlers calling `mptMgr.RLock()` / `ProveLocked()`.
-- **Sub-5ms Critical Section**: The exclusive write lock (`treeMu.Lock()`) is held exclusively for in-memory node updates (`mpt.Set`) and snapshot pointer ratcheting (`mpt.Snap`), completing in microseconds.
+- Reader throughput is 12.8x higher under split-locking, maintaining 100% availability during 5–20ms disk fsync operations.
 
-### 4.3 MPT Version Semantics & Input Log Tree Size Binding
+### 2.3 Sub-5ms MPT Write Critical Section
+The exclusive write lock (`treeMu.Lock()`) is held strictly for in-memory node updates (`mpt.Set`), snapshot ratcheting (`mpt.Snap`), and atomic pointer swapping, completing in microseconds (< 5ms).
 
-The `torchwood/mpt` trie supports versioned snapshots via `mpt.Snap(version int64)`. In VIndex, `Snapshot.Version` is explicitly set to the **Input Log Tree Size** (`InputLogSize`):
+### 2.4 Lazy Hash Recomputation
+Updates flag trie nodes as `dirty`. `Snap()` recomputes SHA-256 hashes only along dirty subtrees, avoiding full-tree traversal.
 
-```go
-snap, err := m.tree.Snap(int64(inputLogSize))
-```
+---
 
-This semantic versioning contract provides three key guarantees:
-- **Direct Alignment with Input Log Checkpoints**: Binds the cryptographic MPT snapshot directly to the exact Input Log tree size committed in the Output Log leaf (`StateCommitment.ILCheckpoint`).
-- **Deterministic Crash Recovery**: Enables `RecoveryCoordinator` on startup to inspect `mptMgr.Version()` (`mptVersion, exact`) against `OutputLog[N-1].InputLogSize` (`S_OUT`) and compute the exact missing tile replay slice `[mptVersion .. S_OUT)` if `exact == false || mptVersion < S_OUT`.
-- **Client Verification Simplicity**: Clients parse `ilcp` from the Output Log leaf and construct `mpt.Snapshot{ Version: int64(ilcp.Size), Hash: MapRoot }` to verify inclusion/non-inclusion proofs with zero out-of-band metadata.
+## 3. Miscellaneous / Optional Considerations
 
-### 4.4 MPT Durability Mechanics, 'exact' State & Adaptive Sync Triggers
+### 3.1 Adaptive / Hybrid Sync Triggers
+To bound recovery replay time and disk scratch space, the tree subsystem executes `Sync()` based on:
+1. **Periodic Interval**: Flushes unsynced patch frames every 15 seconds.
+2. **Leaf Count Threshold**: Triggers `Sync()` when 30,000 leaves have been committed.
+3. **Ingestion Idle Window**: Executes `Sync()` when ingestion reaches the target checkpoint and transitions to idle polling.
+4. **Graceful Shutdown**: `Close()` invokes a blocking `Sync()` to consolidate on-disk state.
 
-- **The `exact` Flag & Crash Durability**:
-  - In `torchwood/mpt`, the on-disk file header stores an `exact` boolean flag alongside `version`.
-  - On the first `Set()` mutation following a clean sync, `torchwood/mpt` marks `exact = false` and immediately `fsync`s this updated header to disk before appending any new leaf bytes.
-  - While subsequent mutations and in-memory snapshots (`Snap()`) progress in RAM, the on-disk header continuously reflects `exact == false`.
-  - Only when `Sync()` is called does `torchwood/mpt` flush patch frames, record the new `version`, set `exact = true`, and `fsync` the file descriptor.
-  - **Why Regular Syncing Matters**: If a crash, kill signal, or power failure occurs after any `Set()` without an intervening `Sync()`, the tree on disk will report `exact == false` upon reopening. In that state, the on-disk trie cannot be assumed clean or complete at its recorded `version`, requiring the recovery layer to replay all leaves starting from the last durably synced `version` up to the latest committed Output Log tree size S_OUT.
-- **Adaptive / Hybrid Sync Triggers**:
-  1. **Periodic Interval**: Flushes unsynced patch frames every 15 seconds.
-  2. **Leaf Count Threshold**: Triggers a `Sync()` when 30,000 leaves have been committed since the last sync.
-  3. **Ingestion Idle Window**: Executes `Sync()` when the ingestion pipeline reaches the target checkpoint and transitions to idle polling.
-  4. **Graceful Shutdown**: `Close()` invokes a blocking `Sync()` to ensure all patch frames are flushed and fsync'd.
-- **Bounded Replay Slices & Safe Watermark Pruning**:
-  - The Adaptive Sync Triggers bound the unsynced leaf delta to < 30k leaves (or < 15s).
-  - Even during dirty crash recovery when `exact == false`, the tile replay slice `[mptVersion .. S_OUT)` is capped to < 30k leaves, guaranteeing recovery in < 150ms.
-  - When `mptMgr.Sync()` successfully fsyncs the MPT to disk (establishing `exact == true`), `mptDurableSize` advances to the synced version. The `TileReaper` safely consumes this watermark (`SafeWatermark = mptDurableSize`) to prune older cached tiles. Because `mptDurableSize` is strictly bounded by `m_kv_size` (`Target_CP >= Cached_Tiles >= m_kv_size >= Output_Size >= mptDurableSize`), `min(m_kv_size, mptDurableSize) == mptDurableSize`. Leaves below `mptDurableSize` are already committed to Pebble and durably fsync'd in MPT disk files, so crash recovery never requires raw tiles below `mptDurableSize`.
-
-### 4.5 MPT Memory Scale & Provisioning
+### 3.2 MPT Memory Provisioning Matrix
 
 | Scale (Unique Keys) | Inner Nodes in `mmap` | Top Levels (Hot in RAM) | Bottom Levels (Paged) |
 | :--- | :--- | :--- | :--- |
@@ -251,42 +94,37 @@ This semantic versioning contract provides three key guarantees:
 | **100 Million** | ~10.4 GB | ~100 MB | ~10.3 GB |
 | **1 Billion** | ~104 GB | ~100 MB | ~103.9 GB |
 
-> [!IMPORTANT]
-> Because key hashes are uniformly distributed, batch updates touch scattered nodes without locality. Production hosts must provision sufficient RAM to keep the active MPT `mmap` resident in physical memory, preventing random NVMe major page faults.
+Production hosts must provision sufficient RAM to keep the active MPT resident, preventing random NVMe major page faults.
+
+### 3.3 Compaction Scratch Overhead
+Background MPT compaction writes a new contiguous memory image to disk; hosts must reserve at least 2x the MPT disk size in scratch storage capacity.
 
 ---
 
-## 5. Testing & Qualification Strategy
+## 4. Retired Ideas & Alternatives Considered
 
-- **Integration & Synchronization Testing**: Tests for `MPTManager` (Predict vs Commit root consistency across randomized mutations, split-locking concurrency, `Sync()` durability verification), state commitment serialization, and serving state atomic pointer ratcheting. (Core MPT data structure correctness is delegated to upstream `torchwood/mpt` test suites).
-- **Witness Mocking & Fault Injection**: End-to-end integration tests using mock Output Log and simulated slow, flaky, or partitioned remote witness networks.
+### 4.1 Backfill Mode & `PublishDirect` Retirement
+- **What Was Proposed & Investigated**:
+  A dedicated publishing method, `PublishDirect(ctx, mapRoot, inputLogCP, rawInputLogCP)`, was implemented in `publisher.go` exclusively to serve Backfill Mode. In Backfill Mode, the coordinator updated MPT nodes directly via `mptMgr.SetBatch` and called `PublishDirect` once upon reaching the target checkpoint, bypassing lock-free root prediction (`mpt.Predict`) and intermediate Output Log publishing.
+- **Why It Was Investigated**:
+  Hypothesized that running `mpt.Predict` and publishing commitments per batch across tens of millions of leaves would cause excessive memory bloat and witness roundtrip latency during genesis sync.
+- **Empirical Findings (from BENCHMARK_RESULTS.md)**:
+  1. **Normal Mode Outperformed Backfill by 85.1% on SumDB**: Normal Mode achieved **90,797.2 leaves/sec** vs. Backfill's **49,063.6 leaves/sec**. `mpt.Predict` is an efficient in-memory trie path computation that introduced negligible overhead.
+  2. **100% Read Starvation**: Backfill Mode shut down read serving (0% availability) during bulk ingestion, whereas Normal Mode served queries with P50 < 2ms.
+  3. **Identical Memory Footprint**: Backfill Mode yielded no meaningful RSS savings (saving only 20–30 MB out of 220 MB).
+  4. **Prediction Bypass Risk**: `PublishDirect` bypassed root prediction consistency checks, creating an unverified code path.
+- **Why Permanently Set Aside & Pruned**:
+  `PublishDirect` was pruned from `publisher.go` in Milestone M3 along with its unit test `TestPublisher_PublishDirect`. The publisher is permanently unified around `PublishBatch` with prediction assertions.
 
----
+### 4.2 Coarse Global Locking across Network RPCs & Disk Sync
+- Holding a single global lock during remote witness RPCs or disk fsync stalled read queries for 100ms–seconds per batch.
+- Replaced by split-locking (`writeMu` vs `treeMu`) and lock-free root prediction.
 
-## 6. Compaction Sizing & Subsystem Metrics
+### 4.3 Full Tree Copy-on-Write
+- Duplicating memory-mapped trees for multi-version concurrency created prohibitive memory overhead and Linux dirty page writeback storms.
+- Replaced by single in-memory working tree with split-locking and atomic pointer ratcheting.
 
-### 6.1 Compaction Sizing & Scratch Overhead
-- **Compaction Scratch Overhead**: Background MPT compaction writes a new contiguous memory image to disk; host must reserve at least 2x the MPT disk size in scratch capacity.
-
-### 6.2 Subsystem Telemetry & Metrics
-- `vindex_tree_mpt_nodes_count` (Gauge): Current count of trie nodes.
-- `vindex_tree_mmap_bytes` (Gauge): Total memory mapped by the working trie.
-- `vindex_tree_predict_duration_seconds` (Histogram): Time spent calculating predicted root.
-- `vindex_tree_commit_duration_seconds` (Histogram): Critical section duration under `treeMu` write lock (< 5ms).
-- `vindex_tree_prove_duration_seconds` (Histogram): Duration of MPT inclusion/non-inclusion proof generation under `treeMu.RLock()`.
-- `vindex_tree_sync_duration_seconds` (Histogram): Time spent in `Sync()` disk fsync (5-20ms).
-- `vindex_tree_sync_total` (Counter): Total count of successful MPT disk syncs.
-- `vindex_tree_compaction_duration_seconds` (Histogram): Duration of background disk compaction.
-- `vindex_tree_witness_latency_seconds` (Histogram): Time spent awaiting witness cosignatures.
-- `vindex_tree_witness_errors_total` (Counter): Count of witness RPC timeouts / failures.
-
----
-
-## 7. Design Rationale & Alternatives Considered
-
-- **Concurrency & Lock Sequencing**:
-  - **Option A (Selected) - Split-Locking with Lock-Free Prediction & Synchronous Storage Barrier**: `writeMu` serializes `Commit` and `Sync` operations while `treeMu` (RWMutex) guards trie operations. `Sync()` fsync (5-20ms) executes without holding `treeMu`, ensuring zero read latency spikes on `Prove()`. Output Log append and witness network I/O are gated behind a synchronous storage barrier (`store.WriteBatch` with `pebble.Sync`). Root prediction allows slow network I/O (Output Log append + witness cosignatures) to run completely lock-free without holding `treeMu`.
-  - **Option B (Rejected) - Coarse Global Lock across Network & Disk Sync**: Holding a single global lock during remote witness RPCs or disk fsync stalls read queries for 100ms–seconds per batch.
-  - **Option C (Rejected) - Full Tree Copy-on-Write**: Duplicating memory-mapped trees for MVCC creates prohibitive memory overhead and Linux dirty page writeback storms.
-  - *(Note: For the overarching selection of Binary MPT vs SMT/Verkle, see [ARCHITECTURE.md](../../docs/ARCHITECTURE.md).)*
-
+### 4.4 Sparse Merkle Trees (SMT) & Verkle Trees
+- Sparse Merkle Trees: Prohibitive memory and disk I/O across 256-level trie depths.
+- Verkle Trees: Prohibitive CPU costs for polynomial commitment computation during high-throughput ingestion.
+- Replaced by binary Sparse Merkle Patricia Trie in `mmap` (`torchwood/mpt`).

@@ -8,37 +8,6 @@ The **VIndex Hammer (`vindex-hammer`)** is a dedicated integration testbed, load
 1. **Upstream Input Log**: Hosts a local POSIX `tlog-tiles` Input Log with an automated sequencer and drip-feed proxy.
 2. **Downstream Verifier**: Emits continuous concurrent query workloads against `vindexd`'s HTTP Read API and cryptographically validates all returned proofs against the witnessed Output Log checkpoints.
 
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            vindex-hammer Process                            │
-│                                                                             │
-│  ┌───────────────────────┐   ┌────────────────────────┐   ┌──────────────┐  │
-│  │ Synthetic Leaf        │   │ Tessera POSIX Log      │   │ Drip-Feed    │  │
-│  │ Generator             ├──>│ Sequencer & Signer     ├──>│ HTTP Server  │  │
-│  │ (Zipfian/Uniform/Non) │   │ (Appender + TileFiles) │   │ (:8085)      │  │
-│  └───────────────────────┘   └────────────────────────┘   └──────┬───────┘  │
-│                                                                  │          │
-│  ┌───────────────────────────────────────────────────────────┐   │          │
-│  │ Verifying Concurrent Readers (1..1000 QPS)                │<──┤          │
-│  │ • Monotonic Index Growth  • Mini-Log Compact Range Roots  │   │          │
-│  │ • MPT Proofs              • Checkpoint Signatures         │   │          │
-│  └───────────────────────────────────────────────────────────┘   │          │
-│                                │                                 │          │
-│  ┌─────────────────────────────┴─────────────────────────────┐   │          │
-│  │ Metrics Analyzer & Terminal Dashboard                     │   │          │
-│  │ • Write/Read QPS  • Ingestion Lag  • Latency  • Invariants│   │          │
-│  └───────────────────────────────────────────────────────────┘   │          │
-└──────────────────────────────────────┬───────────────────────────┘          │
-                                       │ HTTP                                 │
-                                       ▼                                      │
-                     ┌───────────────────────────────────┐                    │
-                     │          vindexd Daemon           │                    │
-                     │  • IngestMapper  • KVIndexer      │                    │
-                     │  • OutputPublisher & MPT          │                    │
-                     │  • Read Server (/vindex/lookup)   │                    │
-                     └───────────────────────────────────┘                    │
-```
-
 ---
 
 ## 2. Core Components

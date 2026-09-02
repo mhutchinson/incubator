@@ -15,7 +15,7 @@ Operating as a "Map Sandwich" between an Input Log and a witnessed Output Log, V
   │                       vindexd Daemon                        │
   │  ┌───────────────────────┐       ┌───────────────────────┐  │
   │  │  In-Memory Binary MPT │       │   Pebble DB KV Store  │  │
-  │  │   (KeyHash -> SubRoot)│       │ (Inverted Chunks 'c') │  │
+  │  │  (KeyHash -> SubRoot) │       │ (Inverted Chunks 'c') │  │
   │  └───────────────────────┘       └───────────────────────┘  │
   └──────────────────────────────┬──────────────────────────────┘
                                  │ State Commitments (hex(MapRoot) + ILCheckpoint)

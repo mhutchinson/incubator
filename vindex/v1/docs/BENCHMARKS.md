@@ -1,14 +1,40 @@
-# VIndex V1 Benchmarks & Performance Analysis
+# VIndex v1 Benchmarks & Performance Analysis
 
-This document details empirical benchmarks and performance analysis for the **Production Zero-WAL Direct Commit Pipeline** and **Bundled WASM MapFn Architecture** in VIndex v1, followed by comparative analysis against the retired baseline WAL and per-leaf mapping architectures.
+This document details empirical benchmarks and performance analysis for the **Production Zero-WAL Direct Commit Pipeline** and **Bundled WASM MapFn Architecture** in VIndex v1, followed by comparative analysis against the retired baseline WAL, per-leaf mapping, and Backfill Mode architectures.
 
 ---
 
-## 1. Headline Metrics & Key Highlights
+## 1. Core Load-Bearing Invariants
 
-The production Zero-WAL architecture streams mapped leaf entries directly into Pebble inverted chunk records (`'c'`) with synchronous durability barriers (`pebble.Sync`), backed by bundled tile WebAssembly execution (`map_bundle`), host SIMD hardware SHA-256 computation, and dynamic `TileReaper` pruning over verified input tiles.
+### 1.1 Closed-Loop Dual-Process Benchmark Topology
+All benchmarks are conducted under an isolated, opaque-box dual-process architecture on dedicated multi-core hardware:
+- **Harness Process (`vindex-hammer`)**: Tessera POSIX Input Log sequencer and Checkpoint Drip Proxy listening at `http://127.0.0.1:8085`.
+- **System Under Test (`vindexd`)**: Verifiable Index Daemon (Ingestion, KV Indexer, Output Log Publisher, and HTTP Read Server) listening at `http://127.0.0.1:8088`.
+- **Loopback HTTP Communication**: Communication across processes is restricted to loopback HTTP (`:8085` -> `:8088`), ensuring realistic network boundary simulation without testbed short-circuiting.
 
-### Production Key Performance Indicators (KPIs)
+### 1.2 Continuous Cryptographic Invariant Verification
+Read benchmark clients do not merely measure request/response times; every client query executes strict, full cryptographic verification:
+- Verifying the Output Log checkpoint note origin and witness signatures.
+- Verifying RFC 6962 inclusion proofs for Output Log leaf commitments.
+- Verifying Sparse Merkle Patricia Trie inclusion and non-inclusion proofs against `MapRoot`.
+- Reconstructing RFC 6962 Compact Range mini-log roots from returned indices and asserting equality with `MiniLogRoot`.
+- **Zero-Tolerance Invariant Invariant**: Benchmark runs are declared invalid if any of the following occur:
+  * Non-zero monotonicity violations (indices must strictly ascend).
+  * Cryptographic proof verification failures.
+  * Bounds violations (`idx >= InputLogSize`).
+  * Mini-log root mismatches.
+Across all reported production benchmark runs, exactly **0 invariant violations** occurred.
+
+### 1.3 Synchronous Storage Persistence Barrier
+Benchmarks enforce production durability guarantees:
+- `store.WriteBatch` executes `pebble.Sync` on terminal batch commits, blocking until all SSTable chunk records and `m_kv_size` are durably fsync'd.
+- Output Log append and witness network calls strictly wait for storage persistence to complete before publishing commitments.
+
+---
+
+## 2. Verified Performance Optimizations
+
+### 2.1 Headline Performance Indicators (PoR vs. Baseline)
 
 | Performance Dimension | Production Result (PoR) | Comparison vs. Baseline Architecture | Impact & Significance |
 | :--- | :--- | :--- | :--- |
@@ -21,256 +47,124 @@ The production Zero-WAL architecture streams mapped leaf entries directly into P
 | **Warm Recovery (Time-to-First-Serve)** | **2.4 ms** | **Instant warm recovery** | Zero WAL replay or index rebuild on restart |
 | **Pebble Storage Footprint (CT Fanout)** | **9.91 MB** | **99% space savings** | Eliminates temporary WAL bloat (down from 1.2 GB) |
 
----
+### 2.2 Production Concurrency Pipeline
+The Zero-WAL pipeline utilizes a pipelined concurrency model balancing CPU-bound mapping against I/O-bound persistence:
 
-## 2. Test Environment & Hardware Configuration
+1. **Stage 1 (I/O-Bound Fetch)**: `TileFetcher` retrieves tiles from `ManagedTileCache` and unpacks them into contiguous `LeafBundle` slices (256 leaves per bundle).
+2. **Stage 2 (CPU-Bound Mapping)**: `Mapper Worker Pool` defaults to `max(1, GOMAXPROCS - 1)` workers (e.g., 23 parallel workers on a 24-core host). Each worker invokes bundled WASM `map_bundle` (256 leaves/call, < 1% FFI CPU) and computes `KeyHash = crypto/sha256` via host SIMD hardware acceleration (SHA-NI / ARMv8 Crypto), emitting unordered `MappedBatch` records.
+3. **Stage 3 (Monotonic Resequencing)**: Completed batches buffer in a priority queue min-heap indexed by `BundleIdx = StartLeafIdx / 256`, reordering batches into a gapless, strictly ascending sequence.
+4. **Stage 4 (Database Commit Plane)**: `Pebble KV Committer & MPT Publisher` streams batches directly into inverted chunks (`'c'`) with `pebble.Sync` persistence and commits authenticated MPT roots to the Tessera Output Log. Channel backpressure pauses tile dispatch if downstream storage commits experience disk I/O pauses.
 
-All benchmarks were conducted under a standardized local dual-process topology on dedicated multi-core NVMe hardware:
-
-- **Host Operating System**: Linux
-- **Processor Architecture**: 24-core host (`runtime.GOMAXPROCS(0) = 24`) with hardware SHA-NI / ARMv8 Crypto support
-- **Storage Subsystem**: Local high-performance NVMe SSD
-- **Dual-Process Topology**:
-  - `vindex-hammer`: Tessera POSIX Input Log sequencer and Checkpoint Drip Proxy listening at `http://127.0.0.1:8085`.
-  - `vindexd`: Verifiable Index Daemon (Ingestion, KV Indexer, Output Log Publisher, and HTTP Serving API) listening at `http://127.0.0.1:8088`.
-- **Communication Channel**: Local loopback HTTP (`:8085` -> `:8088`).
-
----
-
-## 3. Production Concurrency Architecture
-
-The Zero-WAL pipeline utilizes a pipelined concurrency model to balance CPU-bound mapping against I/O-bound database persistence and cryptographic tree hashing.
-
-### Concurrency Pipeline Diagram
-
-```text
-[Input Log / ManagedTileCache]
-              │
-              ▼ (Stage 1: I/O Bound Fetch)
-┌─────────────────────────────────────────────────────────────┐
-│ TileFetcher & Cache Pool                                    │
-│ • Unpacks tiles into contiguous LeafBundles (256 leaves)    │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ chan *LeafBundle
-                               ▼ (Stage 2: CPU Bound Mapping)
-┌─────────────────────────────────────────────────────────────┐
-│ Mapper Worker Pool (runtime.GOMAXPROCS(0) - 1)              │
-│ • 23 parallel workers on 24-core host (~4 MB RAM / worker)  │
-│ • Bundled WASM map_bundle (256 leaves/call, < 1% FFI CPU)   │
-│ • Host computes KeyHash = crypto/sha256 (SHA-NI / ARM SIMD) │
-│ • Emits unordered MappedBatches                             │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ chan *MappedBatch (unordered)
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Resequencer Priority Queue                                  │
-│ • Min-heap / ring buffer indexed by BundleIdx               │
-│ • Monotonically reorders batches into gapless sequence      │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ chan *MappedBatch (ordered)
-                               ▼ (Stage 3: Database Commit Plane)
-┌─────────────────────────────────────────────────────────────┐
-│ Pebble KV Committer & MPT Publisher                         │
-│ • Direct streaming into inverted chunks ('c')               │
-│ • MPT root computation & Tessera Output Log commitment      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Worker Allocation & Reordering Mechanics
-
-- **Mapper Worker Pool**: Defaults to `runtime.GOMAXPROCS(0) - 1` (23 parallel workers on a 24-core host). This dedicates the remaining CPU capacity to Pebble chunk writes, MPT tree updates, and live query serving without saturating host CPU cores.
-- **Monotonic Resequencing via Priority Queue**: Because variable-length leaves cause parallel map workers to complete bundles out of order, the `Resequencer` buffers completed `MappedBatch` instances in a priority queue min-heap keyed by `BundleIdx`. Batches are released to the Pebble KV committer plane in strictly ascending chronological order before being committed to Pebble.
-- **Backpressure Control**: Buffered Go channels connecting pipeline stages enforce backpressure automatically, preventing unbound memory growth when downstream Pebble chunk writes or MPT publishing experience disk I/O pauses.
-
----
-
-## 4. Production Zero-WAL Benchmark Results
-
-### 4.1 Full Go SumDB Ingestion & Verification
-
-This benchmark measures full end-to-end ingestion, indexing, publication, and cryptographic verification of the entire public Go Module Sum Database (`sum.golang.org`) across local file mirror and live remote CDN sources.
-
-#### Summary Metrics (Live Remote Ingest)
-
-- **Total Input Leaves**: 60,965,405 leaves (100% of live Go SumDB)
-- **Total Ingestion Duration**: **8m 54s (534s)**
-- **Average Ingestion Throughput**: **~114,167 leaves/sec** (peaking at ~170,000 leaves/sec)
-- **CPU Utilization**: ~220–230% across parallel tile fetch and map worker pool
-- **Storage Footprint on Disk**:
-  - Inverted Chunk DB (Pebble): **345 MB**
-  - Sparse Merkle Trie (MPT): **75 MB**
-  - Output Log: **8 KB**
-  - Pruned Tile Cache: **28 KB** (managed by `TileReaper`)
-  - **Total Storage on Disk**: **~420 MB**
-- **Client Verification**: Verified across local git checkouts and cryptographic non-inclusion proofs.
-
-#### Pipeline Breakdown & Comparison
+### 2.3 Full Go SumDB Ingestion & Verification
+Evaluated across the full public Go Module Sum Database (`sum.golang.org`) on local file mirror and live remote CDN:
 
 | Ingestion Source | Total Leaves | Elapsed Time | Effective Rate | Storage Footprint | Verification Success |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Local File Mirror (Zero-WAL)** | 54,364,768 | 3m 46.08s | 240,467 leaves/s | ~380 MB | 100% |
-| **Live Remote CDN (`sum.golang.org`)** | **60,965,405** | **8m 54s (534s)** | **114,167 leaves/s** | **420 MB** | **100%** |
+| **Local File Mirror (Zero-WAL)** | 54,364,768 | 3m 46.08s | **240,467 leaves/s** | ~380 MB | 100% (0 errors) |
+| **Live Remote CDN (`sum.golang.org`)** | 60,965,405 | 8m 54s (534s) | **114,167 leaves/s** | ~420 MB | 100% (0 errors) |
 
-#### Cryptographic Verification
+### 2.4 Synthetic 10M-Entry Load Tests
 
-- **Verification Results**: **100% cryptographic verification**, 0 proof errors.
-- **Proofs Validated**: Checkpoint note signatures, Output Log tile inclusion proofs, Binary MPT inclusion proofs, and RFC 6962 Compact Range mini-tree root recalculation.
+#### 1-to-1 Identity Mapping Baseline
+Evaluated across four concurrent verifying read QPS tiers (0, 1, 10, 100 QPS) generated by `vindex-hammer`:
 
----
+| Read Load Profile | Duration | Write Throughput | Final Serving Size | Actual Read QPS | P50 Latency | P90 Latency | P99 Latency | Invariant Violations |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **0 QPS** (Write-Only) | 80.9s | ~123,600 leaves/s | 10,000,000 | 0.0 QPS | N/A | N/A | N/A | 0 |
+| **1 QPS** | 82.4s | ~121,350 leaves/s | 10,000,000 | 1.0 QPS | 1.4 ms | 16.2 ms | 598.1 ms | 0 |
+| **10 QPS** | 88.7s | ~112,740 leaves/s | 10,000,000 | 10.0 QPS | 1.6 ms | 45.8 ms | 812.4 ms | 0 |
+| **100 QPS** | 132.2s | ~111,200 leaves/s | 10,000,000 | 99.8 QPS | 1.8 ms | 194.3 ms | 1,214.0 ms | 0 |
 
-## 5. 10 Million Entry Synthetic Load Tests
+#### CT-Style 1-to-N Multi-Domain Fanout Load Test
+Simulates Certificate Transparency workloads where each leaf covers 1 to 50 domain names (mean: ~25 SANs per cert), creating ~250M indexed keys:
 
-### 5.1 1-to-1 Identity Mapping Baseline
-
-A 10,000,000 leaf synthetic dataset with 1-to-1 key-to-leaf identity mapping was evaluated across four concurrent verifying read QPS tiers (0 QPS, 1 QPS, 10 QPS, 100 QPS) generated by `vindex-hammer`.
-
-| Read Load Profile | Duration | Write Throughput | Final Serving Size | Actual Read QPS | Read Success Rate | P50 Latency | P90 Latency | P99 Latency | Max Latency | Invariant Violations |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **0 QPS** (Write-Only) | 80.9s | ~123,600 leaves/s | 10,000,000 | 0.0 QPS | N/A | N/A | N/A | N/A | N/A | 0 |
-| **1 QPS** | 82.4s | ~121,350 leaves/s | 10,000,000 | 1.0 QPS | 100.0% | 1.4 ms | 16.2 ms | 598.1 ms | 1.2 s | 0 |
-| **10 QPS** | 88.7s | ~112,740 leaves/s | 10,000,000 | 10.0 QPS | 100.0% | 1.6 ms | 45.8 ms | 812.4 ms | 3.8 s | 0 |
-| **100 QPS** | 132.2s | ~111,200 leaves/s | 10,000,000 | 99.8 QPS | 100.0% | 1.8 ms | 194.3 ms | 1,214.0 ms | 11.3 s | 0 |
-
----
-
-### 5.2 CT-Style 1-to-N Multi-Domain Fanout Load Test
-
-This test simulates Certificate Transparency (CT) workloads where each certificate leaf covers multiple Subject Alternative Names (SANs), producing a 1-to-N fanout from leaf entries to search keys.
-
-- **Input Leaves**: 10,000,000 leaves
-- **Fanout Distribution**: 1 to 50 domain names per leaf (mean: ~25 domains/leaf)
-- **Total Mapped Search Keys**: ~250,000,000 indexed key entries
-- **Concurrent Read Load**: 100 verifying read QPS
-
-| Metric | 1-to-1 Identity Baseline (100 QPS) | CT-Style 1-to-N Fanout (100 QPS) |
+| Metric | 1-to-1 Baseline (100 QPS) | CT-Style 1-to-N Fanout (100 QPS) |
 | :--- | :--- | :--- |
 | **Input Leaves** | 10,000,000 | 10,000,000 |
 | **Domain Fanout per Leaf** | 1 (Fixed) | 1 to 50 (Mean: ~25) |
 | **Indexed Key Entries** | 10,000,000 | ~250,000,000 |
 | **Input Leaf Throughput** | ~43,820 leaves/s | 12,022 leaves/s |
-| **Effective Key Indexing Rate** | ~43,820 keys/s | **~300,550 search keys/s** |
+| **Effective Key Indexing Rate**| ~43,820 keys/s | **~300,550 search keys/s** |
 | **Read Latency P50** | 1.800 ms | 1.615 ms |
-| **Read Latency P90** | 194.300 ms | 24.766 ms |
 | **Read Latency P99** | 1,214.000 ms | 847.847 ms |
 | **Invariant Violations** | 0 | **0** |
 
----
+### 2.5 Cumulative Speedup Matrix (61.7M Leaves Go SumDB)
 
-## 6. Closed-Loop MapFn Profiling & Hardware Cryptography Telemetry
-
-During development of the V1 mapping plane, detailed CPU profiling was conducted to measure the exact breakdown of CPU cycles across WASM guest execution, FFI boundary crossings, and cryptographic hashing.
-
-### 6.1 Telemetry Findings: Baseline vs. PoR
-
-```text
-Baseline (Per-Leaf map_leaf + WASM Software SHA-256):
-  ┌─────────────────────────┬─────────────────────────┬─────────────────────────┐
-  │  FFI Boundary: ~23%     │  WASM Software SHA-256: │  Business Logic /       │
-  │  (768 calls / tile)     │  ~55% of CPU cycles     │  Parsing: ~22%          │
-  └─────────────────────────┴─────────────────────────┴─────────────────────────┘
-
-Production PoR (Bundled map_bundle + Host Hardware SHA-NI):
-  ┌──────┬────────────────────────────────────────────┬─────────────────────────┐
-  │ FFI: │ Business Logic / Parsing: ~40%             │ Host Hardware SHA-256   │
-  │ < 1% │ (Runs at full guest speed in WASM)         │ (SIMD SHA-NI: < 5% CPU) │
-  └──────┴────────────────────────────────────────────┴─────────────────────────┘
-```
-
-### 6.2 Architectural Breakdown Table
-
-| Dimension | Baseline Per-Leaf Mapping | PoR Bundled Tile Mapping (`map_bundle`) | Delta / Improvement |
+| Metric | **1. Baseline WASM**<br>(Per-leaf FFI + In-Guest SHA) | **2. Final Production WASM**<br>(Bundled FFI + Host SIMD + Storage Opts) | **3. Pure Native Go**<br>(In-process direct mapping) |
 | :--- | :--- | :--- | :--- |
-| **FFI Calls per 256-Leaf Tile** | 768 calls (`allocate`, `map_leaf`, `reset` x 256) | **2–3 calls** (`allocate`, `map_bundle`, `reset`) | **99.6% fewer FFI calls** |
-| **FFI CPU Time Proportion** | ~23% of total CPU time | **< 1% of total CPU time** | ~23x reduction in FFI overhead |
-| **SHA-256 Execution Domain** | In-guest WebAssembly bytecode | **Go host runtime (`crypto/sha256`)** | Delegated to host SIMD |
-| **Hardware Acceleration** | None (pure software bitwise in WASM) | **x86 SHA-NI / ARMv8 Crypto** | Full hardware acceleration |
-| **Crypto CPU Time Proportion** | ~55% of total CPU time | **< 5% of total CPU time** | ~11x reduction in crypto overhead |
-
----
-
-## 7. Comparative Analysis: Zero-WAL vs. Retired Baseline WAL
-
-The initial V1 implementation utilized an intermediate Write-Ahead Log staged under a transient `'w'` prefix in Pebble DB, managed by a background `WalReaper`. Removing the WAL in favor of direct chunk indexing and managed tile caching yielded major architectural and performance improvements.
-
-### Comprehensive Performance Comparison Table
-
-| Workload Configuration | Metric | Retired Baseline WAL Architecture | Production Zero-WAL Direct Commit | Improvement / Delta |
-| :--- | :--- | :--- | :--- | :--- |
-| **Full Go SumDB** | **Total Wall-Clock Time** | 4m 42.00s | **3m 46.08s** | **55.92s faster (-19.8%)** |
-| | **Effective Throughput** | 192,783 leaves/s | **240,467 leaves/s** | **+24.7% throughput gain** |
-| | **Warm Recovery** | Cold WAL replay overhead | **2.4 ms** | **Instant warm recovery** |
-| **1-to-1 Mapping (100 Read QPS)** | **Read Latency P50** | 1.800 ms | **0.905 ms** | **~50% reduction** |
-| | **Read Latency P99** | 1,214.000 ms | **11.343 ms** | **~99% tail reduction** |
-| | **Pebble Compaction Churn** | Continuous WAL LSM compaction | **0%** | **100% transient WAL churn eliminated** |
-| **1-to-N CT Fanout (100 Read QPS)** | **Read Latency P99** | 847.847 ms | **62.218 ms** | **~93% reduction** |
-| | **Pebble DB Footprint** | 1.2 GB | **9.91 MB** | **99% space savings** |
-
-### Architectural Rationale for WAL Retirement
-
-1. **Throughput Gain & Elimination of Double Writes**: Ingesting the complete 54,364,768 leaf Go SumDB dataset completed in **3m 46.08s** under Zero-WAL compared to **4m 42.00s** for the baseline WAL pipeline—a **55.92s reduction (-19.8% duration)** and a **+24.7% throughput gain**.
-2. **Instant Warm Startup Recovery**: With Zero-WAL, daemon restarts on an existing database achieve a time-to-first-serve of **2.4 ms**. The system eliminates the costly startup phase of scanning and replaying unindexed WAL keys.
-3. **Tail Latency Eradication**: Direct chunk commits eliminate transient WAL churn entirely, reducing P99 tail latencies significantly for both 1-to-1 and CT fanout scenarios.
-4. **Sub-Millisecond Serving**: Median read latencies drop to sub-millisecond levels, providing excellent query responsiveness during active write ingestion.
-5. **Database Footprint & Space Savings**: Eliminating temporary WAL writes reduces total Pebble DB storage overhead from 1.2 GB down to **9.91 MB** (99% space savings) in CT fanout tests. The `ManagedTileCache` working set remains bounded to `< 1 MB` under continuous `TileReaper` pruning.
-6. **Cryptographic Invariant Guarantees**: Zero invariant violations occurred across all benchmark runs, validating that the direct commit model strictly preserves all Merkle tree and MPT cryptographic invariants.
-
----
-
-## 8. Full Go SumDB Ingestion Matrix: Baseline WASM vs. Final WASM vs. Pure Native Go
-
-This section presents the empirical end-to-end ingestion benchmarks across the complete 61,707,729 leaf Go Checksum Database (`sum.golang.org`) on a 24-core NVMe host (`runtime.GOMAXPROCS(0) = 24`), evaluating the evolution from the initial baseline WASM runtime to the final production architecture on `v1/impl`, compared against pure native Go execution.
-
-### 8.1 Performance Comparison Matrix (61.7M Leaves)
-
-| Metric | **1. Baseline WASM**<br>(Per-leaf FFI + In-Guest SHA) | **2. Final Production WASM (`v1/impl`)**<br>(Bundled FFI + Host SIMD + Storage Opts) | **3. Pure Native Go**<br>(In-process direct mapping) |
-| :--- | :--- | :--- | :--- |
-| **Total Ingestion Time (61.7M leaves)** | **23m 57s** (1,437.0s) | **12m 04.2s** (724.2s) | **5m 31.0s** (331.0s) |
+| **Total Ingestion Time** | **23m 57s** (1,437.0s) | **12m 04.2s** (724.2s) | **5m 31.0s** (331.0s) |
 | **Average Ingestion Throughput** | **42,455 leaves/sec** | **85,237 leaves/sec** | **186,594 leaves/sec** |
 | **Peak Throughput** | ~63,400 leaves/sec | **~86,500 leaves/sec** | **~204,800 leaves/sec** |
 | **Speedup vs. Baseline** | *1.0x (Baseline)* | **+100.8% (2.01x speedup)** | **+339.5% (4.40x speedup)** |
-| **Time Reduction vs. Baseline** | *0%* | **-49.6% (~2x faster)** | **-77.0% (~4.3x faster)** |
-| **FFI Calls per 256-Leaf Tile** | 768 calls (`alloc`+`map`+`reset` x 256) | **1 call** (`map_bundle`) | **0 calls** |
+| **FFI Calls per 256-Leaf Tile** | 768 calls | **1 call** (`map_bundle`) | **0 calls** |
 | **WASM / FFI CPU Load** | **78.9% CPU** | **73.5% CPU** | **0% CPU** |
-| **Storage & Commit CPU** | ~5.6% CPU | **~12.0% CPU** | **~38.5% CPU** |
-| **WASM Binary Size (`sumdb.wasm`)** | 2.5 MB | **1.9 MB** (-24% size) | N/A |
-| **In-Use Process Memory** | ~367 MB | **~664 MB** (64MB write buffers + pool) | **~310 MB** |
+| **WASM Binary Size** | 2.5 MB | **1.9 MB** (-24% size) | N/A |
+| **In-Use Process Memory** | ~367 MB | **~664 MB** | **~310 MB** |
+
+The 2.01x speedup stems from 6 verified techniques:
+1. **FFI Amortization (`map_bundle`)**: Cut FFI calls by 99.6%, reducing CPU overhead from ~23% to < 1%.
+2. **Host Hardware SIMD Cryptography**: Delegated preimage hashing to Go host (`crypto/sha256` with SHA-NI / ARMv8 Crypto), dropping crypto CPU load from ~55% to < 5%.
+3. **Zero-Allocation Byte Scanner**: Eliminated guest regex engine and heap allocations, shrinking binary size from 2.5 MB to 1.9 MB.
+4. **Two-Generational Active Chunk Cache**: Bounded cache in `KVIndexer` eliminated 90%+ of Pebble read I/O on active chunks.
+5. **Lexicographical Key Sorting**: Batch keys are sorted with `bytes.Compare` before MPT insertion, enforcing branch locality.
+6. **Tuned Pebble Compaction & MemTables**: Configured 64 MB write buffers with `MaxConcurrentCompactions = 4`, eliminating write stalls.
 
 ---
 
-### 8.2 Key Architectural Differences: Baseline vs. Final Implementation
+## 3. Miscellaneous / Optional Considerations
 
-The 2.01x speedup in the final WASM implementation is the cumulative result of six distinct architectural optimizations:
+### 3.1 WASM vs. Native Go Performance Ceiling
+Native Go in-process mapping executes at **186.6k leaves/sec (5m 31s)** vs. **85.2k leaves/sec (12m 04s)** for WASM. The 2.19x gap represents the irreducible baseline overhead of WebAssembly sandboxing (JIT bytecode interpretation, memory bounds checks). For high-security environments, this isolation cost is well within acceptable operational budgets.
 
-#### 1. FFI Boundary Amortization (`map_leaf` -> `map_bundle`)
-- **Baseline**: Traversed the WebAssembly foreign function interface 768 times per 256-leaf tile (calling `allocate`, `map_leaf`, and `reset` for each individual leaf). FFI boundary crossings consumed ~23% of total host CPU cycles.
-- **Final**: Packed an entire 256-leaf tile into a contiguous shared memory arena and executed a single `map_bundle` call per tile. Cut FFI boundary overhead by 99.6% (< 1% of host CPU).
+### 3.2 Hardware Scaling Projections
+Because MapFn guest workers run in an uncoordinated worker pool, mapping throughput scales near-linearly with CPU core counts:
+- **24 Cores (Current Workstation)**: **85,237 leaves/sec** (~12m 04s for 61.7M leaves)
+- **64 Cores (Production Server)**: Projected **~220,000 leaves/sec** (~4m 40s)
+- **128 Cores (Large Compute Node)**: Projected **~400,000+ leaves/sec** (~2m 30s)
 
-#### 2. Host SIMD Cryptographic Preimage Hashing
-- **Baseline**: Leaf preimages were hashed inside the WASM sandbox using software bitwise operations, consuming ~55% of guest CPU cycles.
-- **Final**: WASM MapFn returns raw key preimages (`[][]byte`). Hashing is delegated to the Go host (`crypto/sha256`), which executes native hardware SIMD instructions (x86 SHA-NI / ARMv8 Crypto), dropping crypto CPU load to < 5%.
-
-#### 3. Zero-Allocation Byte Scanner (Elimination of Guest Regex)
-- **Baseline**: Imported `golang.org/x/mod/module` in the guest WASM binary. Filtering pseudo-versions converted byte slices to strings and executed Go's standard regex engine, statically embedding `reflect`, `regexp`, and Unicode tables inside `sumdb.wasm` (2.5 MB).
-- **Final**: Replaced regex with a zero-allocation byte scanner (`isPseudoVersion([]byte)`). Eliminated guest heap allocations, reduced guest CPU time by 40%, and shrank `sumdb.wasm` to 1.9 MB.
-
-#### 4. Two-Generational In-Memory Active Chunk Cache
-- **Baseline / Initial Storage**: Every batch executed a disk point lookup (`iter.SeekPrefixGE`) in Pebble DB for every modified key to read the previous 64KB chunk descriptor, causing I/O stalls during bulk ingestion.
-- **Final**: Introduced a bounded 2-generational cache (`currentCache` and `previousCache` in `KVIndexer`). Retains hot module keys in memory across sequential batches, eliminating 90%+ of Pebble read block I/O without coarse full-cache invalidation freezes.
-
-#### 5. Lexicographical Key Sorting for Sparse Merkle Tree (MPT) Locality
-- **Baseline**: Inserted 32-byte key hashes into the Sparse Merkle Patricia Trie in arbitrary batch order, causing random node traversals and branch re-hashing thrashing.
-- **Final**: Sorts batch keys lexicographically with `slices.SortFunc` before MPT insertion. Grouping updates into identical subtrees enforces depth-first branch locality and minimizes tree node allocations.
-
-#### 6. Tuned Pebble MemTable & Compaction Concurrency
-- **Baseline**: Default 16 MB MemTable write buffers with single-threaded compaction.
-- **Final**: Configured 64 MB write buffers (`MemTableSize = 64 << 20`) with `MaxConcurrentCompactions = 4`, preventing write stalls during sustained high-throughput ingestion.
+### 3.3 NVMe Storage Sizing & Bandwidth
+On local NVMe SSDs (`ext4`), sustained write throughput exceeds 80 MB/s during peak compaction bursts. Ensuring disk IOPS headroom prevents memtable flush stalls.
 
 ---
 
-### 8.3 Performance Ceiling & Production Scaling
+## 4. Retired Ideas & Alternatives Considered
 
-- **WASM vs. Native Go Gap (2.19x)**: Native in-process Go executes at **186.6k leaves/sec (5m 31s)** vs. **85.2k leaves/sec (12m 04s)** for WASM. The remaining 2.19x delta is purely the baseline overhead of Wazero JIT bytecode interpretation compared to native machine code.
-- **Linear Horizontal Scaling**: Because MapFn guest workers run in an uncoordinated worker pool (`runtime.GOMAXPROCS(0) - 1`), WASM mapping throughput scales linearly with CPU core count:
-  - **24 Cores (Current)**: **85,237 leaves/sec** (~12m 04s)
-  - **64 Cores (Prod)**: Projected **~220,000 leaves/sec** (~4m 40s)
-  - **128 Cores (Prod)**: Projected **~400,000+ leaves/sec** (~2m 30s)
+### 4.1 Backfill Mode Empirical Evaluation & Verdict
+- **What Was Proposed & Investigated**:
+  A dedicated "Backfill Mode" (`vindex.Backfill`, `Coordinator.Backfill`, `--backfill`) was developed to accelerate initial bulk log ingestion from genesis. The design streamed leaf batches into Pebble and updated in-memory MPT nodes directly via `mptMgr.SetBatch`, completely bypassing per-batch lock-free root prediction (`mpt.Predict`), Output Log state commitments, and remote witness cosignatures. The mode used periodic snapshots (`backfillSnapInterval = 1,000,000`) and a post-sync publishing step (`PublishDirect`).
+- **Why It Was Investigated**:
+  Theoretical concern that during initial synchronization of tens of millions of leaves, per-batch root prediction and Output Log publishing would cause excessive memory bloat and witness network latency bottlenecks.
+- **Empirical Findings (8-Run Benchmark Matrix from BENCHMARK_RESULTS.md)**:
+  Controlled tests on 24-core NVMe hardware directly comparing Normal Serving Mode (`SyncOnce`) against Backfill Mode across four representative workloads revealed:
+
+| Workload Run | Mode | Ingestion Rate (leaves/s) | Peak RSS (MB) | Read QPS & Availability | P50 Latency | Violations |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Synthetic 1-to-1 (Normal)** | Normal | 43,420.4 | 80.6 MB | 80.3 QPS (100% Live) | 1.12 ms | 0 |
+| **Synthetic 1-to-1 (Backfill)** | Backfill | 57,239.7 | 85.3 MB | 0 QPS (Offline) | N/A | 0 |
+| **Synthetic CT 1-to-N (Normal)** | Normal | 4,215.9 | 249.7 MB | 93.6 QPS (100% Live) | 4.25 ms | 0 |
+| **Synthetic CT 1-to-N (Backfill)**| Backfill | 4,383.5 | 226.7 MB | 0 QPS (Offline) | N/A | 0 |
+| **Real Go SumDB (Normal)** | Normal | **90,797.2** | 208.0 MB | Live Ready | Sub-2ms | 0 |
+| **Real Go SumDB (Backfill)** | Backfill | **49,063.6** | 185.6 MB | 0 QPS (Offline) | N/A | 0 |
+| **Real MTC Shard3 (Normal)** | Normal | **32,705.9** | 93.9 MB | Live Ready | Sub-2ms | 0 |
+| **Real MTC Shard3 (Backfill)** | Backfill | **30,979.2** | 101.5 MB | 0 QPS (Offline) | N/A | 0 |
+
+  1. **Normal Mode Outperforms Backfill by 85.1% on Real SumDB**: Normal Mode achieved **90,797.2 leaves/sec** vs. Backfill's **49,063.6 leaves/sec**. Normal Mode batches updates to the storage engine efficiently, avoiding the per-batch in-memory MPT mutation overhead that throttles Backfill Mode.
+  2. **100% Read Starvation**: Backfill Mode shut down the HTTP read server, causing 0% query availability for the entire ingestion duration. Normal Mode delivered sub-2ms P50 latency with 100% availability under concurrent read queries while actively ingesting.
+  3. **Identical Memory Footprint**: Backfill Mode saved at most 20–30 MB out of a 220 MB working set; memory is dominated by Pebble LSM write buffers and MPT nodes.
+  4. **Production Demonstrators Never Used Backfill**: The headline throughput of 240,467 leaves/sec was achieved by `sumdbindex --oneshot`, which runs Normal Serving Mode (`SyncOnce`). Neither `sumdbindex` nor `mtcindex` ever implemented or called Backfill Mode.
+- **Why Permanently Set Aside & Pruned**:
+  Backfill Mode provided zero real-world performance benefit, introduced severe read starvation, duplicated the batch streaming loop, and created architectural dead weight across 6 source files and 3 test files. It was permanently pruned from the codebase in Milestone M3.
+
+### 4.2 Intermediate Write-Ahead Log in Pebble ('w' Prefix & WalReaper)
+- Staged records under `'w'` prefix in Pebble DB with an asynchronous `WalReaper`.
+- Caused double-write disk amplification, massive LSM compaction churn, and P99 read latency spikes (up to 1,214 ms).
+- Replaced by Zero-WAL direct inverted chunk indexing (+24.7% throughput, ~99% P99 tail reduction).
+
+### 4.3 Per-Leaf WebAssembly Invocations (`map_leaf`)
+- Invoking WASM `map_leaf` individually for every leaf generated 768 FFI calls per tile, consuming ~23% of host CPU time.
+- Replaced by `map_bundle` (2–3 FFI calls per tile, < 1% CPU).
+
+### 4.4 In-Guest Software Cryptographic Hashing
+- Executing SHA-256 inside WASM bytecode consumed ~55% of mapping CPU cycles.
+- Replaced by host-side hardware SIMD hashing (SHA-NI / ARMv8 Crypto), dropping crypto CPU time to < 5%.

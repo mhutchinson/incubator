@@ -30,7 +30,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,7 +37,6 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/hammer"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/coordinator"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
@@ -67,8 +65,6 @@ var (
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
 	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
-	backfill           = flag.Bool("backfill", false, "Run in standalone batch backfill mode to catch up to target checkpoint, publish root, and exit.")
-	backfillCheckpoint = flag.String("backfill_checkpoint", "", "Optional target checkpoint file path or note-signed text for backfill. If unset, fetches latest from input log.")
 )
 
 func main() {
@@ -211,42 +207,7 @@ func run(ctx context.Context) error {
 	}
 	klog.Info("Startup recovery completed successfully.")
 
-	// 7. Handle Standalone Backfill Mode
-	if *backfill {
-		var targetCP *log.Checkpoint
-		if *backfillCheckpoint != "" {
-			cpBytes, err := os.ReadFile(*backfillCheckpoint)
-			if err != nil {
-				// Treat value as raw text if not a file
-				cpBytes = []byte(*backfillCheckpoint)
-			}
-			if verifier != nil {
-				parsed, _, _, err := log.ParseCheckpoint(cpBytes, *inputLogOrigin, verifier)
-				if err != nil {
-					return fmt.Errorf("failed to verify backfill checkpoint signature: %w", err)
-				}
-				targetCP = parsed
-			} else {
-				parsed, err := parseCheckpointHeaderOnly(cpBytes)
-				if err != nil {
-					return fmt.Errorf("failed to parse backfill checkpoint: %w", err)
-				}
-				targetCP = parsed
-			}
-			klog.Infof("Target backfill checkpoint provided: origin=%q size=%d", targetCP.Origin, targetCP.Size)
-		}
-
-		startTime := time.Now()
-		klog.Info("Starting coordinator backfill execution...")
-		if err := coord.Backfill(ctx, targetCP); err != nil {
-			return fmt.Errorf("backfill failed: %w", err)
-		}
-		elapsed := time.Since(startTime)
-		klog.Infof("Backfill completed successfully in %v.", elapsed)
-		return nil
-	}
-
-	// 8. Start Read Server
+	// 7. Start Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
 	readSrv.SetEnableUI(*enableUI)
 	readMux := http.NewServeMux()
@@ -264,13 +225,13 @@ func run(ctx context.Context) error {
 	}()
 	defer func() { _ = httpServer.Close() }()
 
-	// 9. Start Background Tile Reaper
+	// 8. Start Background Tile Reaper
 	tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
 	go func() {
 		_ = tileReaper.Run(ctx, 60*time.Second)
 	}()
 
-	// 10. Start Ingestion & Commit Pipeline Loop
+	// 9. Start Ingestion & Commit Pipeline Loop
 	if fetcher != nil {
 		klog.Infof("Starting zero-WAL ingestion pipeline polling %q every %v", *inputLogURL, *pollInterval)
 		if err := coord.Run(ctx, *pollInterval); err != nil && !errors.Is(err, context.Canceled) {
@@ -282,27 +243,6 @@ func run(ctx context.Context) error {
 
 	klog.Info("Shutting down vindexd gracefully...")
 	return nil
-}
-
-func parseCheckpointHeaderOnly(rawCP []byte) (*log.Checkpoint, error) {
-	lines := strings.Split(string(bytes.TrimRight(rawCP, "\n")), "\n")
-	if len(lines) < 3 {
-		return nil, fmt.Errorf("checkpoint header has %d lines, want at least 3", len(lines))
-	}
-	origin := lines[0]
-	size, err := strconv.ParseUint(lines[1], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid size %q: %w", lines[1], err)
-	}
-	hashBytes, err := base64.StdEncoding.DecodeString(lines[2])
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 hash %q: %w", lines[2], err)
-	}
-	return &log.Checkpoint{
-		Origin: origin,
-		Size:   size,
-		Hash:   hashBytes,
-	}, nil
 }
 
 type defaultIdentityMapper struct{}

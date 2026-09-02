@@ -6,40 +6,6 @@ A Verifiable Index (VIndex) indexes arbitrary append-only transparency logs (suc
 
 The **WASM MapFn Plugin SDK & Host Runtime** (`vindex/v1/mapfn`) defines the sandboxed WebAssembly execution environment, the guest-host Application Binary Interface (ABI), memory management lifecycle, multi-language guest SDKs, host hardware cryptography pipeline, and offline verification tooling.
 
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            vindexd Ingestion Plane                          │
-│                                                                             │
-│  [LeafBundle (N leaves, 1 <= N <= 256)]                                     │
-│         │                                                                   │
-│         ▼                                                                   │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ SandboxPool (max(1, GOMAXPROCS-1) Wazero Instances, ~4 MB/worker)      │  │
-│  │                                                                       │  │
-│  │   Guest WASM Instance (Linear Memory <= 16 MB, Timeout <= 100ms)      │  │
-│  │   ┌───────────────────────────────────────────────────────────────┐   │  │
-│  │   │ 1. Host writes bundled N leaves ──► inputBuf [allocate(len)]  │   │  │
-│  │   │ 2. Host calls ────────────────────► map_bundle(ptr, len)      │   │  │
-│  │   │ 3. SDK harness loops N leaves & maps canonical preimages      │   │  │
-│  │   │ 4. Guest returns framed preimages ──► (out_ptr << 32)|out_len │   │  │
-│  │   │ 5. Host calls (optional) ─────────► reset()                   │   │  │
-│  │   └───────────────────────────────────────────────────────────────┘   │  │
-│  └──────────────────────────────────┬────────────────────────────────────┘  │
-│                                     │                                       │
-│                                     ▼ (Raw Canonical Preimages)             │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ Host Post-Processing & Cryptography Pipeline                          │  │
-│  │ • Compute KeyHash = crypto/sha256 (x86 SHA-NI / ARMv8 Crypto SIMD)    │  │
-│  │ • Lexicographical Sort (bytes.Compare)                                │  │
-│  │ • Deduplicate KeyHashes per leaf (slices.Compact)                     │  │
-│  │ • (Optional) Retain raw preimages for future Prefix-Trie indexing    │  │
-│  └──────────────────────────────────┬────────────────────────────────────┘  │
-│                                     │                                       │
-│                                     ▼                                       │
-│  [MappedBatch -> Resequencer -> KVIndexer]                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
 ### 1.1 Closed-Loop Telemetry & Architectural Evolution
 
 The Plan of Record (PoR) `map_bundle` ABI was established following empirical CPU profiling of per-leaf WASM invocations on production-scale datasets (54M-leaf SumDB and 10M-leaf CT):
@@ -82,14 +48,10 @@ Every compliant `MapFn` WASM module MUST export `map_bundle` and `allocate` (or 
 
 ### 2.2 Calling Convention & Return Value Encoding
 
-```text
-                 64-bit Return Value (uint64)
- ┌──────────────────────────────┬──────────────────────────────┐
- │     out_ptr (Upper 32 bits)  │     out_len (Lower 32 bits)  │
- ├──────────────────────────────┼──────────────────────────────┤
- │  Bits 63 .. 32               │  Bits 31 .. 0                │
- └──────────────────────────────┴──────────────────────────────┘
-```
+| Bits | Field | Type | Description |
+| :--- | :--- | :--- | :--- |
+| `63 .. 32` | `out_ptr` | Upper 32-bit `uint32` | Pointer to output buffer in guest linear memory |
+| `31 .. 0` | `out_len` | Lower 32-bit `uint32` | Length in bytes of output buffer in guest linear memory |
 
 1. **Input Delivery**:
    - Host packs N leaves (1 <= N <= 256) into the binary input layout.
@@ -107,13 +69,11 @@ Every compliant `MapFn` WASM module MUST export `map_bundle` and `allocate` (or 
 
 The host serializes N contiguous leaves (1 <= N <= 256) into a contiguous linear memory buffer using a prefix-sum offset array:
 
-```text
-+-------------------------+----------------------------------------------------+--------------------------------+
-|   leaf_count (uint32)   |               offsets ([N+1]uint32)                |     contiguous_leaf_bytes      |
-+-------------------------+----------------------------------------------------+--------------------------------+
-| 4 Bytes (1 <= N <= 256) | (N + 1) * 4 Bytes (offsets relative to payload)    | Variable (all leaf payloads)   |
-+-------------------------+----------------------------------------------------+--------------------------------+
-```
+| Field | Type / Size | Description |
+| :--- | :--- | :--- |
+| `leaf_count` | 4 Bytes (`uint32`) | Number of leaves in bundle (`1 <= N <= 256`). |
+| `offsets` | `(N + 1) * 4` Bytes (`[N+1]uint32`) | Offsets relative to payload start. |
+| `contiguous_leaf_bytes` | Variable length | Concatenated raw leaf payload bytes. |
 
 - `leaf_count`: 4 bytes little-endian integer (`uint32`), representing `N` leaves in the bundle (`1 <= N <= 256`). Full tiles have `N = 256`; partial tiles at unaligned checkpoint boundaries or the log head have `1 <= N < 256`.
 - `offsets`: `(N + 1)` little-endian `uint32` values (`(N + 1) * 4` bytes).
@@ -127,15 +87,11 @@ The host serializes N contiguous leaves (1 <= N <= 256) into a contiguous linear
 
 The guest SDK serializes extracted canonical preimages into guest memory using structured length-prefixed framing:
 
-```text
-+-------------------------+-----------------------------+---------------------------------------------------------+
-|   leaf_count (uint32)   |    key_counts ([N]uint32)   |             framed_key_preimages                        |
-+-------------------------+-----------------------------+---------------------------------------------------------+
-| 4 Bytes (1 <= N <= 256) | N * 4 Bytes                 | For each leaf i in 0..N-1:                              |
-|                         | (key_counts[i] = K_i)       |   For each key j in 0..K_i-1:                           |
-|                         |                             |     key_len (4B uint32) + key_bytes (key_len bytes)     |
-+-------------------------+-----------------------------+---------------------------------------------------------+
-```
+| Field | Type / Size | Description |
+| :--- | :--- | :--- |
+| `leaf_count` | 4 Bytes (`uint32`) | Number of leaves in bundle (must match input `leaf_count == N`). |
+| `key_counts` | `N * 4` Bytes (`[N]uint32`) | Number of canonical keys `K_i` emitted for each leaf `i` (`0 .. N-1`). |
+| `framed_key_preimages` | Variable length | Sequential length-prefixed preimages (`key_len: uint32` + `key_bytes`). |
 
 - `leaf_count`: 4 bytes little-endian `uint32` (asserted by host to match input `leaf_count == N`).
 - `key_counts`: Array of `N` little-endian `uint32` values (`N * 4` bytes). `key_counts[i]` specifies the number of canonical search keys `K_i` emitted for leaf `i`.

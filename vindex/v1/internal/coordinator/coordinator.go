@@ -32,28 +32,20 @@ import (
 const (
 	// DefaultCommitBatchSize is the default number of leaves aggregated before committing to the KV store (16 tiles).
 	DefaultCommitBatchSize uint64 = 4096 // 16 tiles (256 * 16)
-
-	// DefaultBackfillSnapInterval is the default number of indexed leaves between intermediate MPT snapshots during backfill.
-	DefaultBackfillSnapInterval uint64 = 1000000
-
-	// DefaultBackfillSyncInterval is the default time duration between intermediate MPT disk fsyncs during backfill.
-	DefaultBackfillSyncInterval time.Duration = 5 * time.Minute
 )
 
 // Coordinator manages the 3-phase startup and crash recovery workflow.
 type Coordinator struct {
-	db                   *kvstore.DB
-	mptMgr               *tree.Manager
-	outputLog            OutputLogReader
-	pub                  *tree.OutputPublisher
-	indexer              *kvstore.KVIndexer
-	fetcher              ingest.TileFetcher
-	cache                ingest.TileCache
-	mapper               ingest.LeafMapper
-	pipeline             *ingest.IngestionPipeline
-	commitBatchSize      uint64
-	backfillSnapInterval uint64
-	backfillSyncInterval time.Duration
+	db              *kvstore.DB
+	mptMgr          *tree.Manager
+	outputLog       OutputLogReader
+	pub             *tree.OutputPublisher
+	indexer         *kvstore.KVIndexer
+	fetcher         ingest.TileFetcher
+	cache           ingest.TileCache
+	mapper          ingest.LeafMapper
+	pipeline        *ingest.IngestionPipeline
+	commitBatchSize uint64
 }
 
 // NewCoordinator creates a new recovery Coordinator.
@@ -99,32 +91,6 @@ func (c *Coordinator) CommitBatchSize() uint64 {
 		return DefaultCommitBatchSize
 	}
 	return c.commitBatchSize
-}
-
-// SetBackfillSnapInterval sets the number of indexed leaves between intermediate MPT snapshots during backfill.
-func (c *Coordinator) SetBackfillSnapInterval(interval uint64) {
-	c.backfillSnapInterval = interval
-}
-
-// BackfillSnapInterval returns the configured intermediate snapshot interval for backfill.
-func (c *Coordinator) BackfillSnapInterval() uint64 {
-	if c.backfillSnapInterval == 0 {
-		return DefaultBackfillSnapInterval
-	}
-	return c.backfillSnapInterval
-}
-
-// SetBackfillSyncInterval sets the time duration between intermediate MPT disk fsyncs during backfill.
-func (c *Coordinator) SetBackfillSyncInterval(d time.Duration) {
-	c.backfillSyncInterval = d
-}
-
-// BackfillSyncInterval returns the configured intermediate fsync interval for backfill.
-func (c *Coordinator) BackfillSyncInterval() time.Duration {
-	if c.backfillSyncInterval <= 0 {
-		return DefaultBackfillSyncInterval
-	}
-	return c.backfillSyncInterval
 }
 
 // Recover runs the recovery sequence:
@@ -384,207 +350,6 @@ func (c *Coordinator) Phase3(ctx context.Context) error {
 		}
 	}
 
-	return nil
-}
-
-// Backfill executes Catch-Up Ingestion Mode from m_kv_size up to targetCP.Size,
-// directly updates the MPT working tree via SetBatch, snaps at targetCP.Size,
-// and publishes a single baseline state commitment to the Output Log.
-func (c *Coordinator) Backfill(ctx context.Context, targetCP *log.Checkpoint) error {
-	var rawTargetCP []byte
-	if targetCP == nil {
-		if c.fetcher == nil {
-			return errors.New("target checkpoint is required for backfill when fetcher is nil")
-		}
-		inCP, err := c.fetcher.Checkpoint(ctx)
-		if err != nil {
-			metrics.InputFetchErrorsTotal.Inc()
-			return fmt.Errorf("ingestion fetch checkpoint error: %w", err)
-		}
-		if inCP == nil {
-			return errors.New("nil checkpoint returned by fetcher")
-		}
-		targetCP = &log.Checkpoint{
-			Origin: inCP.Origin,
-			Size:   inCP.Size,
-			Hash:   inCP.Hash[:],
-		}
-		rawTargetCP = inCP.Raw
-	} else {
-		rawTargetCP = targetCP.Marshal()
-	}
-
-	metrics.InputTreeSize.Set(float64(targetCP.Size))
-
-	if err := c.db.SetMetadata(kvstore.KeyMetaTargetCheckpoint, rawTargetCP); err != nil {
-		return fmt.Errorf("failed to persist target checkpoint: %w", err)
-	}
-
-	if c.fetcher != nil {
-		if sizer, ok := c.fetcher.(interface{ SetTreeSize(uint64) }); ok {
-			sizer.SetTreeSize(targetCP.Size)
-		}
-	}
-
-	kvSize, err := c.db.GetUint64(kvstore.KeyMetaKVSize)
-	if err != nil {
-		return fmt.Errorf("failed to read m_kv_size: %w", err)
-	}
-
-	if kvSize > targetCP.Size {
-		return fmt.Errorf("%w: m_kv_size (%d) > target checkpoint size (%d)", ErrInvariantViolation, kvSize, targetCP.Size)
-	}
-
-	mptPersistedSize := c.mptMgr.PersistedSize()
-	if kvSize < mptPersistedSize {
-		return fmt.Errorf("%w: m_kv_size (%d) < MPT persisted size (%d)", ErrInvariantViolation, kvSize, mptPersistedSize)
-	}
-
-	if c.pipeline == nil {
-		if c.fetcher == nil || c.mapper == nil {
-			return errors.New("cannot initialize pipeline without fetcher and leaf mapper")
-		}
-		c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, 0)
-	}
-
-	startSize := mptPersistedSize
-	startTime := time.Now()
-	startProgressSize := startSize
-	lastLogSize := startSize
-	const logInterval = uint64(100000)
-
-	snapInterval := c.backfillSnapInterval
-	if snapInterval == 0 {
-		snapInterval = DefaultBackfillSnapInterval
-	}
-	syncInterval := c.backfillSyncInterval
-	if syncInterval <= 0 {
-		syncInterval = DefaultBackfillSyncInterval
-	}
-	lastSnapSize := startSize
-	lastSyncSize := startSize
-	lastSyncTime := startTime
-
-	batchSize := c.commitBatchSize
-	if batchSize == 0 {
-		batchSize = DefaultCommitBatchSize
-	}
-
-	var pendingBatch *ingest.MappedBatch
-
-	flush := func() error {
-		if pendingBatch == nil || pendingBatch.EndLeafIdx <= pendingBatch.StartLeafIdx {
-			return nil
-		}
-		var ingestCP *ingest.Checkpoint
-		if targetCP != nil {
-			var h [32]byte
-			copy(h[:], targetCP.Hash)
-			ingestCP = &ingest.Checkpoint{
-				Raw:    rawTargetCP,
-				Origin: targetCP.Origin,
-				Size:   targetCP.Size,
-				Hash:   h,
-			}
-		}
-		res, err := c.indexer.IndexBatch(ctx, pendingBatch, ingestCP)
-		if err != nil {
-			return fmt.Errorf("indexing error during backfill: %w", err)
-		}
-		metrics.KVCommittedSize.Set(float64(res.NewKVSize))
-		metrics.LeavesIndexedTotal.Add(float64(pendingBatch.Count))
-		if err := c.mptMgr.SetBatch(res.ModifiedSubRoots); err != nil {
-			return fmt.Errorf("mpt direct SetBatch failed: %w", err)
-		}
-		metrics.IndexingLag.Set(float64(targetCP.Size - res.NewKVSize))
-		if res.NewKVSize-lastLogSize >= logInterval || res.NewKVSize == targetCP.Size {
-			elapsed := time.Since(startTime).Seconds()
-			rate := 0.0
-			if elapsed > 0 {
-				rate = float64(res.NewKVSize-startProgressSize) / elapsed
-			}
-			klog.Infof("Backfill indexing progress: %d / %d leaves (%.1f leaves/sec)", res.NewKVSize, targetCP.Size, rate)
-			lastLogSize = res.NewKVSize
-		}
-
-		// Periodic intermediate MPT Snapshot and Disk Fsync
-		if res.NewKVSize-lastSnapSize >= snapInterval && res.NewKVSize < targetCP.Size {
-			if _, err := c.mptMgr.Snap(int64(res.NewKVSize)); err != nil {
-				return fmt.Errorf("intermediate mpt snap failed at size %d: %w", res.NewKVSize, err)
-			}
-			lastSnapSize = res.NewKVSize
-
-			if res.NewKVSize-lastSyncSize >= snapInterval || time.Since(lastSyncTime) >= syncInterval {
-				if err := c.mptMgr.Sync(); err != nil {
-					return fmt.Errorf("intermediate mpt sync failed at size %d: %w", res.NewKVSize, err)
-				}
-				lastSyncSize = res.NewKVSize
-				lastSyncTime = time.Now()
-				klog.Infof("Backfill checkpointed MPT to disk at %d leaves", res.NewKVSize)
-			}
-		}
-
-		pendingBatch = nil
-		return nil
-	}
-
-	if startSize < targetCP.Size {
-		batchChan, errChan := c.pipeline.StreamBatches(ctx, startSize, targetCP.Size)
-		for batch := range batchChan {
-			if batch.EndLeafIdx == 0 && batch.Count > 0 {
-				batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
-			}
-			if pendingBatch == nil {
-				pendingBatch = &ingest.MappedBatch{
-					BundleIdx:    batch.BundleIdx,
-					StartLeafIdx: batch.StartLeafIdx,
-					EndLeafIdx:   batch.EndLeafIdx,
-					Count:        batch.Count,
-					KeyMap:       make(map[[32]byte][]uint64),
-				}
-				for k, v := range batch.KeyMap {
-					pendingBatch.KeyMap[k] = append([]uint64(nil), v...)
-				}
-			} else {
-				pendingBatch.Merge(batch)
-			}
-
-			if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= batchSize {
-				if err := flush(); err != nil {
-					return err
-				}
-			}
-		}
-		if err := <-errChan; err != nil {
-			return fmt.Errorf("stream batches error during backfill: %w", err)
-		}
-
-		if err := flush(); err != nil {
-			return err
-		}
-	}
-
-	mapRoot, err := c.mptMgr.Snap(int64(targetCP.Size))
-	if err != nil {
-		return fmt.Errorf("mpt snap failed: %w", err)
-	}
-
-	logCP := &log.Checkpoint{
-		Origin: targetCP.Origin,
-		Size:   targetCP.Size,
-		Hash:   targetCP.Hash,
-	}
-	state, err := c.pub.PublishDirect(ctx, mapRoot, logCP, rawTargetCP)
-	if err != nil {
-		return fmt.Errorf("publish direct error: %w", err)
-	}
-
-	if err := c.mptMgr.Sync(); err != nil {
-		return fmt.Errorf("mpt sync failed: %w", err)
-	}
-
-	c.pub.SetServingState(state)
-	metrics.IndexingLag.Set(0)
 	return nil
 }
 

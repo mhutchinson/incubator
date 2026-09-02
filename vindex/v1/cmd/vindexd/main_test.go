@@ -18,9 +18,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
-	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,26 +27,7 @@ import (
 	"golang.org/x/mod/sumdb/note"
 )
 
-func TestParseCheckpointHeaderOnly(t *testing.T) {
-	hash := sha256.Sum256([]byte("root-hash"))
-	raw := fmt.Sprintf("test.origin.org\n12345\n%s\n", base64.StdEncoding.EncodeToString(hash[:]))
-
-	cp, err := parseCheckpointHeaderOnly([]byte(raw))
-	if err != nil {
-		t.Fatalf("parseCheckpointHeaderOnly failed: %v", err)
-	}
-	if cp.Origin != "test.origin.org" {
-		t.Errorf("Origin = %q, want %q", cp.Origin, "test.origin.org")
-	}
-	if cp.Size != 12345 {
-		t.Errorf("Size = %d, want 12345", cp.Size)
-	}
-	if string(cp.Hash) != string(hash[:]) {
-		t.Errorf("Hash mismatch")
-	}
-}
-
-func TestBackfillExecution(t *testing.T) {
+func TestVindexdRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -88,17 +66,14 @@ func TestBackfillExecution(t *testing.T) {
 
 	// Write 10 leaves
 	var targetLeafData []byte
-	var latestSignedCP []byte
 	for i := 0; i < 10; i++ {
 		leaf := generator.NextLeaf()
 		if i == 0 {
 			targetLeafData = leaf.LeafData
 		}
-		_, rawCP, err := sequencer.WriteLeaf(ctx, leaf.LeafData)
-		if err != nil {
+		if _, _, err := sequencer.WriteLeaf(ctx, leaf.LeafData); err != nil {
 			t.Fatalf("WriteLeaf %d failed: %v", i, err)
 		}
-		latestSignedCP = rawCP
 	}
 
 	// 2. Setup Drip Server
@@ -114,12 +89,6 @@ func TestBackfillExecution(t *testing.T) {
 	}
 	defer func() { _ = dripServer.Close(ctx) }()
 
-	// Write checkpoint file for testing --backfill_checkpoint
-	cpFile := filepath.Join(tmpDir, "target.checkpoint")
-	if err := os.WriteFile(cpFile, latestSignedCP, 0644); err != nil {
-		t.Fatalf("failed to write checkpoint file: %v", err)
-	}
-
 	// Configure flags for run()
 	*dbPath = dbPathVal
 	*mptDir = mptPathVal
@@ -131,12 +100,18 @@ func TestBackfillExecution(t *testing.T) {
 	*inputLogOrigin = sequencer.Origin()
 	*inputLogPubKey = sequencer.VerifierKey()
 	*mapper = "identity"
+	*listenAddr = "127.0.0.1:0"
 	*metricsAddr = ""
-	*backfill = true
-	*backfillCheckpoint = cpFile
+	*pollInterval = 50 * time.Millisecond
+
+	// Cancel context after vindexd has had time to ingest the 10 leaves
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		cancel()
+	}()
 
 	if err := run(ctx); err != nil {
-		t.Fatalf("run(ctx) with --backfill failed: %v", err)
+		t.Fatalf("run(ctx) failed: %v", err)
 	}
 
 	// Verify that DB metadata was populated and can be opened
@@ -154,13 +129,13 @@ func TestBackfillExecution(t *testing.T) {
 		t.Errorf("kvSize = %d, want 10", kvSize)
 	}
 
-	// Verify that key chunks exist in the backfilled storage
+	// Verify that key chunks exist in storage
 	_, rec, exists, err := db.ActiveChunk(sha256.Sum256(targetLeafData))
 	if err != nil {
 		t.Fatalf("ActiveChunk failed: %v", err)
 	}
 	if !exists || rec == nil {
-		t.Fatalf("expected key chunk to exist in backfilled index")
+		t.Fatalf("expected key chunk to exist in indexed storage")
 	}
 	if len(rec.RelativeIndices) == 0 {
 		t.Errorf("len(rec.RelativeIndices) = 0, want >= 1")

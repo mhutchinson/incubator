@@ -1,48 +1,33 @@
 # Verifiable Index (VIndex v1) Architecture
 
-## 1. Context & Objectives
-
-### 1.1 Problem Statement
-
-Append-only transparency logs (e.g. Certificate Transparency, Go SumDB, Sigstore) provide robust discoverability and cryptographic tamper-evidence. However, they lack the ability to *verifiably* query log entries by their content (such as a domain name, package path, or artifact hash).
-
-Users seeking specific records face an untenable trade-off:
-1. **Full-Log Download (Inefficient)**: Downloading and processing tens of gigabytes or terabytes of irrelevant data to find a handful of relevant entries.
-2. **Third-Party Indices (Unverifiable)**: Relying on centralized, unverifiable search engines that can omit records inadvertently or maliciously without detection.
-
-### 1.2 The Solution: The "Map Sandwich"
-
-A **Verifiable Index (VIndex)** provides efficient, trustless, and cryptographically verifiable querying over large append-only transparency logs. Informally called a "Map Sandwich", VIndex operates as a secondary overlay bounded between an **Input Log** (the source of truth being indexed) and an **Output Log** (committing to the index's cryptographic state):
-
-- **Efficiency**: O(1) point queries with O(log N) Merkle lookup and verification complexity, replacing O(N) full-log scans.
-- **Omission Resistance**: Every lookup response contains cryptographic inclusion or non-inclusion proofs (via an in-memory Merkle Patricia Trie and sub-log Merkle trees), mathematically guaranteeing completeness against witnessed checkpoints.
-- **Decoupled Architecture**: If the VIndex service fails or goes offline, the underlying Input Log's security model, sequencing, and availability remain completely unaffected.
-
-### 1.3 Non-Requirements & Out of Scope
-
-- **Strictly Single-Machine Deployment**: VIndex explicitly avoids distributed consensus (e.g. Raft, Paxos), clustering, horizontal sharding, or internal replication protocols. High availability and redundancy are achieved externally: third-party monitors and mirrors run independent, standalone VIndex single-node instances indexing the same shared Input Log.
-- **Point Lookups by 32-Byte Key Hashes**: The production v1 service provides point lookups on exact 32-byte key hashes (`KeyHash = SHA256(CanonicalSubject)`). General cross-key range scans, boolean filtering (AND/OR), substring searches, full-text search, and arbitrary regular expressions are out of scope. (Note: Retaining raw preimages on the host enables future prefix-trie / subtree indexing without guest ABI changes; see Section 9.5).
-- **No Log Mutation or Tombstones**: Index state is strictly append-only. The system does not support deletion, key un-mapping, tombstones, or retrospective data modification.
-- **No In-Tree Semantic Validation**: VIndex indexes canonical Claim Subject preimages extracted deterministically by the WebAssembly `MapFn`. It does not perform semantic validation of indexed payloads (e.g. validating X.509 certificate chains, checking OCSP/CRL revocation, or verifying digital signatures).
+This document defines the core architecture, non-negotiable invariants, verified performance optimizations, operational considerations, and retired design branches for **VIndex v1**.
 
 ---
 
-## 2. System Architecture & End-to-End Data Flow
+## 1. Core Load-Bearing Invariants
+
+### 1.1 Context, Problem Statement & The Map Sandwich
+Append-only transparency logs (e.g., Certificate Transparency, Go SumDB, Merkle Tree Certificates, Sigstore) provide tamper-evident discoverability. However, finding records by content (e.g., domain name, module path, public key hash) historically required full-log scans or trusting centralized, unverifiable third-party indexers that could silently omit records.
+
+A **Verifiable Index (VIndex)** operates as an authenticated search overlay bounded between an **Input Log** (the source of truth being indexed) and an **Output Log** (committing to the index's cryptographic state)—informally known as the **"Map Sandwich"**:
+- **O(1) Point Queries**: Constant-time key lookups with logarithmic Merkle inclusion proofs.
+- **Omission Resistance**: Every query response delivers cryptographic inclusion or non-inclusion proofs, mathematically guaranteeing completeness against witnessed checkpoints.
+- **Decoupled Security**: If VIndex halts or fails, the underlying Input Log's sequencing, consensus, and security model remain unaffected.
 
 ```text
   [Input Log] (Source of Truth, e.g. CT / MTC / SumDB)
        │
-       ▼ (1. Authenticated Entry Bundles: torchwood.Client [S/256 .. E/256))
+       ▼ (1. Authenticated Entry Bundles)
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              vindexd Daemon                                 │
 │                                                                             │
 │  [Ingestion Plane]                                                          │
-│  • TileFetcher & Local Cache (torchwood.PermanentCache / Managed Cache)     │
-│  • Parallel Wazero WASM Sandboxes (GOMAXPROCS-1 workers)                    │
+│  • TileFetcher & ManagedTileCache                                           │
+│  • Parallel Wazero WASM Sandboxes (max(1, GOMAXPROCS-1) workers)            │
 │    - Bundled Tile Mapping: map_bundle (1 <= N <= 256 leaves/call, 2-3 FFI)  │
 │    - Extracts Canonical Preimages (e.g. domain strings, module paths)       │
 │  • Host-Side Hardware Cryptography (crypto/sha256 + SHA-NI / ARMv8 Crypto)  │
-│    - KeyHash = SHA256(canonical_subject)                                   │
+│    - KeyHash = SHA256(canonical_subject)                                    │
 │    - Lexicographical sort (bytes.Compare) & deduplication (slices.Compact)  │
 │  • In-Memory Priority Resequencer (Monotonic leaf ordering min-heap)        │
 │         │                                                                   │
@@ -63,211 +48,147 @@ A **Verifiable Index (VIndex)** provides efficient, trustless, and cryptographic
   [Output Log] (Tessera POSIX / Cloud Tiles + Witness Cosignatures)
 ```
 
----
+### 1.2 Non-Negotiable System Scope & Invariants
+1. **Strictly Single-Machine Deployment**: VIndex operates strictly within a single process on a single host. It avoids internal clustering, distributed consensus (Raft/Paxos), or multi-node replication. High availability is achieved externally: independent monitors and mirrors run standalone VIndex instances against the shared Input Log.
+2. **Point Lookups by 32-Byte Key Hashes**: The production serving plane provides point queries exclusively over exact 32-byte key hashes (`KeyHash = SHA256(CanonicalSubject)`). General cross-key scans, substring matches, full-text queries, and arbitrary regex searches are out of scope.
+3. **Strictly Append-Only (Zero Tombstones)**: The index state progresses strictly forward. The system supports no deletions, key un-mappings, rollbacks, or tombstones.
+4. **Hermetic, Deterministic Mapping**: The WebAssembly `MapFn` operates in a restricted sandbox with zero host I/O, zero network access, and deterministic clocks. Any runtime trap, memory fault, or unhandled exception triggers an immediate `HALT` to prevent unverified state divergence across nodes.
 
-## 3. Subsystem Map & Responsibilities
-
-The VIndex architecture is partitioned into modular subsystems located in [`vindex/v1/internal/`](../internal/):
-
-| Subsystem | Location | Storage Prefix / Tech | Core Responsibilities |
-| :--- | :--- | :--- | :--- |
-| **Ingestion Pipeline** | [`internal/ingest/`](../internal/ingest/README.md) | `filippo.io/torchwood` + Wazero WASM | Checkpoint validation, tile/leaf Merkle authentication, native entry bundle fetching, sandboxed WASM `map_bundle` execution, host-side hardware SHA-256 hashing, priority resequencer, and `TileReaper` cache management. |
-| **WASM MapFn SDK & Runtime** | [`mapfn/`](../mapfn/README.md) | Wazero (`wasip1`) + Guest SDKs | Sandboxed WebAssembly guest ABI, `map_bundle` tile/slice protocol (1 <= N <= 256 leaves), canonical preimage extraction, multi-language SDKs (Go, TinyGo, Rust), host hardware SHA-NI hashing, and offline `vindex-map` verification CLI. |
-| **KV Storage** | [`internal/kvstore/`](../internal/kvstore/README.md) | Pebble prefixes `'c'` & `'m'` | Inverted chunk numbering (`^chunkNum`), 33-byte prefix Bloom filters, delimitless value encoding, and O(1) sub-root read recovery. |
-| **Authenticated State** | [`internal/tree/`](../internal/tree/README.md) | `torchwood/mpt` + Tessera | In-memory MPT in `mmap`, lock-free root prediction, Tessera Output Log state commitments, and witness cosignature aggregation. |
-| **Coordinator & Recovery** | [`internal/coordinator/`](../internal/coordinator/README.md) | Pebble prefix `'m'` + `tlog.CheckTree` | Checkpoint progression & Merkle consistency proofs, moving-goalpost prevention (`m_target_checkpoint`), watermark tracking, serialized batch coordination (`store.WriteBatch` -> `publisher.PublishBatch`), and Zero-WAL startup recovery (< 500ms time-to-first-serve). |
-| **Read Server & Protocol** | [`internal/server/`](../internal/server/README.md) | HTTP + C2SP `text/plain` | `GET /vindex/lookup` (`before=X&limit=M`), lock-free Pebble inverted scans, on-the-fly RFC 6962 prefix compact ranges, and multi-section plain-text response framing. |
-
----
-
-## 4. State Progression & Pipeline Invariants
-
-The vast majority of the design documents across this repository describe the default **Normal Serving Mode** (Mode 1), which enforces the active serving invariant:
-```text
-Ingestion Checkpoint >= Pebble Checkpoint >= Output Log Checkpoint >= Merkle Tree Checkpoint
-```
-(with `mpt.Predict` lock-free prediction, Output Log appending, and remote witness cosigning per batch).
-
-### 4.1 Watermark Glossary
+### 1.3 Watermark Glossary & Progression Inequality Chain
+VIndex coordinates state progression monotonically across four distinct pipeline planes:
 
 | Watermark Symbol | Pipeline Plane | Definition & Invariant Role |
 | :--- | :--- | :--- |
-| `Target_CP` (Target Checkpoint) | Upstream Input Log | Latest authenticated checkpoint size discovered, verified, and locked from the upstream Input Log. |
-| `Cached_Tiles` (Cached Tile Watermark) | Ingestion Plane / Local Cache | Highest contiguous leaf index downloaded, verified against the Merkle tree, and stored in `ManagedTileCache`. |
-| `m_kv_size` (Committed KV Size) | KV Storage Plane (`internal/kvstore`) | Highest contiguous leaf index whose mapped search key chunks have been durably synced to Pebble DB (`pebble.Sync`). |
-| `Output_Size` / `Serving_Size` / `mptDurableSize` | State Commitment Plane (`internal/tree`) | Output Log tree size committed with witness cosignatures; equals the active serving MPT size exposed to readers. |
+| `Target_CP` | Upstream Input Log | Latest authenticated checkpoint size discovered, verified, and frozen in Pebble (`m_target_checkpoint`). |
+| `Cached_Tiles` | Ingestion Plane / Local Cache | Highest contiguous leaf index downloaded, verified against the Merkle tree, and stored in `ManagedTileCache`. |
+| `m_kv_size` | Storage Plane (`internal/kvstore`) | Highest contiguous leaf index whose inverted chunk records have been durably synced to Pebble DB (`pebble.Sync`). |
+| `Output_Size` | Commitment Plane (`internal/tree`) | Input Log tree size committed with witness cosignatures in the Output Log (`StateCommitment`). |
+| `MPT_Durable_Size` | Tree Disk Plane (`internal/tree`) | Durably fsync'd MPT Input Log size on disk (`mptMgr.Sync()`). |
 
-### 4.2 Watermark Inequality Chain (Normal Serving Mode)
-
-State progresses monotonically across the four pipeline planes in Normal Serving Mode:
-
+In steady-state serving, these watermarks strictly satisfy the **Watermark Progression Inequality Chain**:
 ```text
-Input Log Target CP >= Cached Tile Watermark >= m_kv_size >= Output Log Size >= MPT_Durable_Size
+Target_CP >= Cached_Tiles >= m_kv_size >= Output_Size >= MPT_Durable_Size
 ```
-*(Note: `Output Log Size == Serving MPT`)*
+*(Note: Active Serving MPT Size == Output_Size)*.
 
-### 4.3 Invariants & Commit Barrier
+### 1.4 Synchronous Commit Barrier
+To guarantee crash consistency without distributed transactions or complex WAL rollback mechanics, the coordinator enforces a strict, synchronous commit barrier during batch processing:
+1. **Blocking Storage Persistence**: `store.WriteBatch(entries, S_k)` executes `pebble.Sync`, blocking until all inverted chunk mutations (`'c'`) and `m_kv_size` are durably persisted to disk.
+2. **Output Log Publication Gating**: Output Log append and remote witness network RPCs **MUST NOT begin** until `store.WriteBatch` has successfully returned.
+3. **Serialized Batch Loop**: Each batch progresses sequentially through:
+   `store.WriteBatch(entries, S_k)` (blocking disk sync) -> `publisher.PublishBatch(...)` (root prediction -> Output Log append -> witness cosigning -> in-memory MPT ratchet).
 
-1. **Synchronous Commit Barrier**:
-   Output Log append and witness network calls **MUST NOT begin** until `kvstore.WriteBatch` has successfully completed and durably persisted to disk (`pebble.Sync`).
-   KV storage writes and Output Log publication are not independent concurrent goroutines. The coordinator coordinates a serialized batch execution loop per batch S_k:
-   `store.WriteBatch(entries, S_k)` (blocking disk persistence) -> `publisher.PublishBatch(...)` (root prediction + Output Log append + witness cosignatures + in-memory MPT ratchet).
-2. **Crash Invariant Guarantee (`m_kv_size >= Output_Size`)**:
-   Because storage persistence strictly precedes Output Log publication, the invariant `m_kv_size >= Output_Size` is preserved under all crash, kill, and power loss scenarios. Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted KV store chunks. If a crash occurs between storage persistence and Output Log append, `m_kv_size > S_OUT`; startup recovery safely ignores chunks beyond `S_OUT` via point-in-time `store.GetSubRoot(keyHash, S_OUT)` queries.
-3. **State Ratcheting**: Earlier stages (ingestion, chunk indexing) operate ahead of the serving plane to maximize throughput. Downstream stages only expose data committed by verified checkpoints.
-4. **Serving Isolation**:
-   ```text
-   Serving_Size == MPT_Size <= Output_Size
-   ```
-   Readers are strictly isolated from in-flight writes ahead of `Serving_Size` via watermark index filtering.
+### 1.5 Universal Crash Invariant Guarantee
+Because storage persistence strictly precedes Output Log publication:
+```text
+m_kv_size >= Output_Size
+```
+This invariant holds under all crash, kill, and power loss scenarios. Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted or missing KV store chunks. If a crash occurs after storage sync but before Output Log publishing, `m_kv_size > Output_Size`; startup recovery safely ignores chunks beyond `Output_Size` via point-in-time `store.GetSubRoot(keyHash, Output_Size)` queries.
 
-### 4.4 Operational Modes & Alternative Catch-Up Pipeline
+### 1.6 Fatal Panic on Root Prediction Divergence
+In `publisher.PublishBatch`, the future `MapRoot` is pre-calculated lock-free via `mptMgr.Predict`. The state commitment (`hex(predictedMapRoot) + "\n" + rawInputLogCP`) is appended to the Tessera Output Log. When writer lock `treeMu` is acquired and mutations are committed (`CommitWithVersionLocked`), the actual computed root is asserted against `predictedMapRoot`:
+```go
+if actualRoot != predictedMapRoot {
+    p.mptMgr.Unlock()
+    panic(fmt.Sprintf("FATAL: MPT root prediction mismatch after output log append: actual root %x != predicted root %x", actualRoot, predictedMapRoot))
+}
+```
+If `actualRoot != predictedMapRoot`, the node must terminate immediately with a fatal panic. Continuing execution would publish an equivocal commitment to the Output Log.
 
-#### Motivation
-During initial synchronization or bulk catch-up (e.g. ingesting tens of millions of historical leaves from genesis), live read queries are inactive (`/readyz` returns HTTP 503). In this scenario, running `mpt.Predict` across tens of millions of leaves causes two severe scalability bottlenecks:
-1. **Memory Accumulation**: Running `mpt.Predict` across tens of millions of leaves would accumulate massive in-memory mutation maps and incur substantial heap allocation and tree cloning overhead.
-2. **Witness Roundtrip Bottleneck**: Requiring tens of thousands of slow remote witness cosignature network RPCs (one per batch) introduces unnecessary latency and throttles bulk catch-up throughput.
+### 1.7 Serving Isolation Invariant
+```text
+Serving_Size == MPT_Size <= Output_Size
+```
+Readers are strictly isolated from in-flight writes ahead of `Serving_Size`. HTTP queries snapshot `ServingState` and generate MPT proofs under `treeMu.RLock()`. All subsequent storage reads filter indices to satisfy `idx < Serving_Size`, ensuring readers never observe uncommitted or un-witnessed records.
 
-#### Catch-Up Ingestion Mode (Alternative Pipeline)
-To maximize throughput during bulk sync, `vindexd` supports an alternative **Catch-Up Ingestion Mode**:
+### 1.8 Threat Model & Omission Resistance
+- **Untrusted Index Operator**: The VIndex operator is untrusted. An adversary cannot forge proofs, omit occurrences, or equivocate state commitments without breaking SHA-256 or being detected by independent witnesses.
+- **Trusted Input Log**: The Input Log is assumed to have an authentic, append-only history protected by cryptographic checkpoints.
+- **Proof of Completeness**: Every lookup response combines two cryptographic proofs:
+  1. **MPT Proof (`mpt-proof-v1`)**: Proves whether `KeyHash` exists in `MapRoot`. Non-inclusion proves key absence across the entire log history. Inclusion proves the key maps to a specific 32-byte `MiniLogRoot`.
+  2. **RFC 6962 Compact Range Proof (`prefix-compact-range-v1` + `indices-v1`)**: Proves that the returned leaf indices, when accumulated with the prefix compact range, hash to `MiniLogRoot`.
 
-- **Pipeline Invariant**:
-  ```text
-  Ingestion Checkpoint >= Pebble Checkpoint == In-Memory MPT Checkpoint
-  ```
-  *(Output Log publication and remote witnessing are decoupled and disabled during catch-up).*
-- **Mechanics**: Ingestion streams batches into Pebble via `store.WriteBatch` and immediately updates the in-memory working tree via direct in-place `mpt.Set(...)` and `mpt.Snap(...)`.
-- **Memory Efficiency**: Working memory remains flat (O(1) heap overhead per batch in `mmap`), eliminating O(N) heap map bloat and avoiding `Predict` tree cloning overhead.
-- **Read Serving**: The HTTP read server returns `HTTP 503 Service Unavailable` (`/readyz` unhealthy).
-
-#### Mode Transition Sequence (Catch-Up Mode -> Normal Serving Mode)
-Upon reaching the target synchronization point, `vindexd` transitions explicitly from Catch-Up Mode into Normal Serving Mode:
-
-1. **Catch-Up Completion**: The catch-up loop completes all batch ingestion up to `Target_CP`.
-2. **Root Availability**: The MPT root is already computed in the working tree (`mpt.Root()`).
-3. **Output Log Append**: Append a single `StateCommitment` (`hex(MapRoot) + "\n" + Target_CP.Raw`) to the Output Log.
-4. **Remote Witness Cosigning**: Submit the checkpoint to remote witnesses and collect a cosignature quorum.
-5. **MPT Disk Fsync**: Fsync MPT working files to disk via `mptMgr.Sync()`.
-6. **Atomic State Ratchet**: Set the atomic `servingState` pointer to the witnessed checkpoint.
-7. **Readiness Probe Transition**: Flip `/readyz` to `HTTP 200 OK` and enter Normal Serving Mode with the active serving invariant established.
-
-> [!NOTE]
-> **Scope Note**: While this alternative Catch-Up Ingestion Mode is specified in Section 4.4, the vast majority of this documentation suite focuses on the steady-state Normal Serving Mode. The subsystem documentation will be expanded to cover catch-up pipeline variants as validated by implementation and experimentation.
-
----
-
-## 5. Security, Trust & Verification Model
-
-### 5.1 Threat Model & Trust Assumptions
-
-- **Untrusted Index Operator**: The VIndex operator is assumed to be untrusted. An adversary controlling the operator cannot forge index proofs, omit valid occurrences, or equivocate state commitments without breaking SHA-256 or being detected by independent witnesses.
-- **Trusted Input Log**: The Input Log is assumed to have an authentic, append-only history protected by cryptographic checkpoints. VIndex inherits the admission criteria of the Input Log without secondary filtering.
-- **Immutable & Deterministic `MapFn`**: The mapping logic is compiled to WebAssembly. Any host or guest execution trap triggers a strict `HALT` policy to prevent silent state divergence across witness nodes.
-
-### 5.2 Proof of Omission Resistance
-
-When a client queries a key, the response proves completeness through two layered proofs:
-1. **MPT Proof (`mpt-proof-v1`)**: Proves whether `KeyHash` exists in the MPT at `MapRoot`.
-   - If **Non-Inclusion**: Cryptographically proves that no leaf in the Input Log has ever mapped to this key.
-   - If **Inclusion**: Cryptographically binds `KeyHash` to its specific 32-byte `MiniLogRoot`.
-2. **Sub-Log Merkle Compact Range Proof (`prefix-compact-range-v1` + `indices-v1`)**:
-   - The returned indices and historical compact range hashes are hashed according to RFC 6962 (`LeafHash = SHA256(0x00 || BigEndian(idx))`).
-   - The client computes `CompactRange.Root()` and asserts equality with `MiniLogRoot`.
-   - Because `MapRoot` is witnessed in the Output Log, the operator cannot omit an index without causing the mini-log root to mismatch.
-
-### 5.3 Equivocation Resistance via Witnessed Output Log
-
-The Output Log uses Tessera (`tlog-tiles`) backed by independent witness cosignatures ([signed-note](https://c2sp.org/signed-note), [tlog-checkpoint](https://c2sp.org/tlog-checkpoint)). The Map Operator cannot present different views of index state to different clients without producing conflicting signed checkpoints detectable by public monitors.
-
-### 5.4 Input Log Cryptographic Authentication & Verification
-
-VIndex enforces strict, end-to-end cryptographic verification before ingesting or indexing any data from upstream Input Logs:
-
-1. **Checkpoint Origin Signature**: Mandatory cryptographic verification of the log origin signature before accepting any target checkpoint note.
-2. **Witness Policy ([c2sp.org/tlog-policy](https://c2sp.org/tlog-policy))**: Optional verification of witness cosignature quorums against the configured witness policy.
-3. **Merkle Consistency Proofs**: Mandatory Merkle consistency proof verification whenever the target checkpoint advances (`CP_old` -> `CP_new`), proving that the log is an append-only progression.
-4. **Tile & Leaf Merkle Tree Authentication**: All downloaded data/tree tiles and leaf entries are authenticated against the target checkpoint root before mapping or indexing.
-
-#### Realization via `filippo.io/torchwood`
-- `torchwood.VerifyCheckpoint(raw, policy)`: Parses the checkpoint note, validates the log origin signature, and verifies compliance with witness policy quorums.
-- `golang.org/x/mod/sumdb/tlog.CheckTree(...)`: Verifies Merkle consistency proofs between consecutive checkpoints during target ratcheting.
-- `torchwood.Client` & `torchwood.Client.Entries(ctx, tree, start)`: Fetches data and tree tiles, verifies tree tiles against `tree.Hash`, computes leaf record hashes (`tlog.RecordHash`), and verifies leaf hashes against Level-0 tree tiles prior to mapping.
-- `torchwood.PermanentCache`: Caches verified non-partial tiles on disk to serve as the immutable log of record powering Zero-WAL crash recovery.
-- Format adapters (`WithTilePath`, `WithCutEntry`): Configures tile paths and entry cut boundaries for standard log layouts (`tlog-tiles`, `static-ct`, `sumdb`).
-
-### 5.5 Inductive Backward Verification Protocol
-
+### 1.9 Inductive Backward Verification Protocol
 Client-side verification of paginated queries operates as an inductive backward chain:
-
-```text
-  [Client Query: Page 1 (Tip, before=nil)]
-       │
-       ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Step 1: Base Verification (Page 1)                          │
-  │ • Extract MapRoot from Output Log checkpoint & leaf         │
-  │ • Verify mpt-proof-v1(KeyHash) against MapRoot -> MiniLogRoot│
-  │ • Init CompactRange with prefix-compact-range-v1            │
-  │ • Append LeafHash(idx) for each idx in indices-v1           │
-  │ • Assert CompactRange.Root() == MiniLogRoot                 │
-  │ • Retain prefix-compact-range-v1 as Target-CR-1             │
-  └──────────────────────────────┬──────────────────────────────┘
-                                 │
-                                 ▼ (Next Query: before = next_before)
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Step 2: Inductive Verification (Page 2)                     │
-  │ • Init CompactRange with Page 2 prefix-compact-range-v1     │
-  │ • Append LeafHash(idx) for each idx in Page 2 indices-v1    │
-  │ • Assert CompactRange.Root() matches Target-CR-1            │
-  │ • Retain Page 2 prefix-compact-range-v1 as Target-CR-2      │
-  └──────────────────────────────┬──────────────────────────────┘
-                                 │
-                                 ▼ (Repeat backward...)
-  ┌─────────────────────────────────────────────────────────────┐
-  │ Step N: Genesis Reached                                     │
-  │ • prefix-compact-range-v1 == empty (0 historical entries)   │
-  │ • Entire historical sequence cryptographically verified     │
-  └─────────────────────────────────────────────────────────────┘
-```
 
 1. **Base Step (Page 1 / Tip Query, `before == nil`)**:
    - Extract `MapRoot` from the verified Output Log checkpoint and leaf.
    - Verify `mpt-proof-v1` against `MapRoot` to extract `MiniLogRoot`.
-   - Initialize `CompactRange` with `prefix-compact-range-v1` (commits to historical prefix `0 .. next_before-1`). If no earlier entries exist, the prefix is empty.
+   - Initialize `compact.Range` with `prefix-compact-range-v1` (commits to historical prefix `0 .. next_before-1`). If no earlier entries exist, the prefix is empty.
    - Append `LeafHash(idx) = SHA256(0x00 || BigEndian(idx))` for each index in `indices-v1`.
    - Assert `CompactRange.Root() == MiniLogRoot`.
    - Retain `prefix-compact-range-v1` as the expected target compact range for the subsequent continuation page.
-
 2. **Inductive Step (Continuation Pages, `before != nil`)**:
-   - Initialize a new `CompactRange` with the continuation page's `prefix-compact-range-v1`.
+   - Initialize a new `compact.Range` with the continuation page's `prefix-compact-range-v1`.
    - Append `LeafHash(idx)` for each index in the continuation page's `indices-v1`.
    - Assert that the resulting compact range state matches the prefix compact range retained from the preceding page.
    - Retain the current page's `prefix-compact-range-v1` for the next backward continuation step.
    - Repeat until genesis (empty prefix compact range) is reached.
+3. **Context Dependency**: Standalone continuation queries (`before != nil`) executed without prior page context cannot be verified against `MapRoot` in isolation because `MiniLogRoot` commits only to the full mini-log accumulator at the tip. Continuation pages must be verified inductively starting from Page 1 downward.
 
-3. **Context Dependency**:
-   - Standalone continuation queries (`before != nil`) executed without prior page context cannot be verified against `MapRoot` in isolation because `MiniLogRoot` commits only to the full mini-log accumulator at the tip. Continuation pages must be verified inductively starting from Page 1 downward.
+### 1.10 Moving-Goalpost Prevention
+When indexing high-velocity logs, the log head advances continuously. Polling unverified checkpoints risks synchronization starvation. The coordinator freezes verified target sync checkpoints into Pebble metadata (`m_target_checkpoint`) prior to batch processing, ensuring that the ingestion pipeline processes fixed ranges to completion before advancing.
 
 ---
 
-## 6. Storage & Physical Hardware Topology
+## 2. Verified Performance Optimizations
 
-### 6.1 Dual-Disk Physical Isolation
+### 2.1 Zero-WAL Direct Inverted Chunk Commits
+Rather than staging entries in a transient Write-Ahead Log, VIndex streams mapped batches directly into Pebble inverted chunk records (`'c' + KeyHash + ^chunkNum`) with a synchronous durability barrier (`pebble.Sync`).
+- **Throughput Advantage**: Full Go SumDB ingestion throughput increased by **+24.7%** (from 192,783 to 240,467 leaves/sec), indexing 54.3M leaves in 3m 46s.
+- **Tail Latency Eradication**: P99 read latencies dropped by **~93–99%** (down from 1,214 ms under WAL compaction to 11.3 ms for 1-to-1 workloads, and down from 847.8 ms to 62.2 ms for CT fanout).
+- **Instant Warm Recovery**: Restart time-to-first-serve dropped to **2.4 ms**, eliminating WAL scanning and replay.
+- **Storage Footprint**: Pebble database size in CT fanout tests dropped by **99%** (from 1.2 GB to 9.91 MB).
 
-Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is **strongly recommended**:
+### 2.2 Bundled WebAssembly Execution (`map_bundle`)
+The host passes up to 256 contiguous leaves to the guest WASM sandbox in a single invocation (`map_bundle`), slashing FFI boundary crossings from 768 per tile (in per-leaf mapping) to 2–3 per tile. FFI CPU overhead dropped from **~23% of total CPU time to < 1%**.
 
+### 2.3 Host Hardware SIMD Cryptography
+WASM guest plugins extract and emit raw canonical Claim Subject preimages (e.g. lowercase Punycode domain strings, escaped Go module paths). The Go host hashes preimages using standard `crypto/sha256`, which leverages hardware vector instructions (**x86 SHA-NI** or **ARMv8 Crypto**). This eliminated the **~55% CPU software crypto bottleneck** inside WebAssembly bytecode.
+
+### 2.4 Bitwise Inverted Chunk Keys & 33-Byte Prefix Bloom Filters
+Index records use the key encoding:
 ```text
-┌──────────────────────────────────────┐     ┌──────────────────────────────────────┐
-│       Disk A (NVMe SSD): Data        │     │       Disk B (NVMe SSD): Tree        │
-│ • Pebble DB (chunks 'c', metadata 'm')│    │ • MPT mmap working tree              │
-│ • Local Managed Tile Cache           │     │ • MPT append-only leaf file          │
-└──────────────────────────────────────┘     └──────────────────────────────────────┘
+Key = 'c' (1B) + KeyHash (32B) + BigEndian(^chunkNum) (8B)
 ```
+where `^chunkNum = math.MaxUint64 - chunkNum`.
+Because Pebble Bloom filters evaluate exclusively during forward prefix seeks (`SeekPrefixGE`), inverting chunk numbers places the newest active chunk lexicographically first. A single `SeekPrefixGE('c' + KeyHash)` checks the 33-byte Bloom filter and lands directly on the active chunk in O(1) time without scanning historical chunks, eliminating up to 7.5x append latency penalties on deep keys.
 
-- **Compaction Conflict**: Periodic MPT disk compaction writes full memory images (e.g. 10 GB for 100M keys) sequentially. If sharing a disk with Pebble, this saturates disk I/O, stalls Pebble memtable flushes, and triggers LSM write stalls.
-- **Durability Invariant**: `TileReaper` remains pending during startup recovery and runs concurrently during steady-state ingestion with `SafeWatermark = mptDurableSize` (which is initialized to `S_OUT` following `mptMgr.Sync()` upon startup recovery completion). Raw tiles on Disk A are retained until Disk B's MPT working state is durably fsync'd. Because `mptDurableSize` is strictly bounded by `m_kv_size` (`Target_CP >= Cached_Tiles >= m_kv_size >= Output_Size >= mptDurableSize`), `min(m_kv_size, mptDurableSize) == mptDurableSize`. Leaves below `mptDurableSize` are already committed to Pebble and durably fsync'd in MPT disk files, so crash recovery never requires raw tiles below `mptDurableSize`.
+### 2.5 16-Bit Relative Index Offsets & Delimitless Binary Chunk Schema
+Within each 65,536-leaf chunk, indices are stored as 2-byte offsets `uint16(index % 65536)`, saving 75% storage compared to 8-byte integers. Chunks serialize `CoveredSize` (8B), `bits.OnesCount64(CoveredSize)` compact hashes (32B each), and relative indices (2B each) without internal delimiters, enabling exact boundary slicing.
 
-### 6.2 Resource Sizing & Memory Footprint
+### 2.6 Split-Locking for Sub-5ms MPT Write Critical Section
+The authenticated trie subsystem isolates background disk persistence (`writeMu`) from in-memory lookup reads (`treeMu.RLock()`):
+- Disk fsync operations (`Sync()`, taking 5–20ms) run under `writeMu` and never acquire `treeMu`.
+- HTTP lookup handlers calling `Prove()` execute under `treeMu.RLock()` without blocking.
+- The exclusive write lock (`treeMu.Lock()`) is held strictly for in-memory node updates and pointer ratcheting, completing in microseconds (< 5ms).
+- Benchmark telemetry showed 12.8x higher lookup throughput under disk sync (678,000 vs 53,000 reads/sec) compared to coarse global locking.
+
+### 2.7 Two-Generational Active Chunk Cache
+The storage engine maintains a bounded 2-generational cache (`currentCache` and `previousCache` in `KVIndexer`, capped at 32,768 entries). This eliminates more than 90% of Pebble block cache read I/O on active chunks during sequential batching without coarse full-cache invalidation freezes.
+
+### 2.8 Pipelined Concurrency with Resequencer Min-Heap
+CPU-bound mapping runs across a parallel worker pool (`max(1, GOMAXPROCS - 1)` workers, ~4 MB RAM/worker). Completed batches are buffered in a priority queue min-heap keyed by `BundleIdx = StartLeafIdx / 256`, re-serializing out-of-order completions into strictly ascending chronological sequence before delivery to the serialized commit plane.
+
+### 2.9 SafeWatermark Bounded Tile Reaper
+The local tile cache serves as the immutable log of record. `TileReaper` prunes cached tiles strictly below:
+```text
+SafeWatermark = min(m_kv_size, MPT_Durable_Size) == MPT_Durable_Size
+```
+Tiles in the window `[MPT_Durable_Size .. m_kv_size)` are preserved, guaranteeing that dirty crash recovery replays missing MPT state directly from local disk without network egress.
+
+---
+
+## 3. Miscellaneous / Optional Considerations
+
+### 3.1 Dual-Disk Physical NVMe Isolation
+Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is recommended for large installations:
+- **Disk A (NVMe SSD)**: Pebble DB (`'c'` chunks, `'m'` metadata) and local managed tile cache.
+- **Disk B (NVMe SSD)**: MPT `mmap` working tree and append-only leaf files.
+Physical separation isolates heavy sequential MPT compaction writes from Pebble LSM memtable flushes, preventing compaction write stalls.
+
+### 3.2 Resource Sizing & Memory Footprint Scaling Matrix
+Because key hashes are uniformly distributed, MPT batch updates touch scattered nodes. Sufficient RAM must be provisioned to keep active MPT nodes resident:
 
 | Scale (Unique Keys) | MPT Memory (`mmap`) | MPT Leaf Disk | Pebble Disk | Recommended RAM | Recommended GCP VM |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -276,144 +197,64 @@ Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is **st
 | **Large (1B)** | ~104 GB | ~32 GB | ~100 GB | 256 GB | `n2-megamem-16` |
 | **Very Large (2B)** | ~208 GB | ~64 GB | ~200 GB | 512+ GB | `m4-megamem-64` |
 
----
+### 3.3 Forward-Compatibility: Prefix-Trie & Subtree Indexing
+While VIndex v1 provides point lookups by 32-byte key hashes, guest plugins emit raw canonical Claim Subject preimages (e.g. domain names, package paths). This allows future VIndex versions to construct auxiliary prefix-trie indices (for `*.example.com` or `github.com/org/*` subtree queries) without altering guest WASM ABIs.
 
-## 7. Observability, SLOs & Disaster Recovery
+### 3.4 Pluggable Adaptive HTTP Transport
+For initial log catchup against rate-limited CDNs, `TileFetcher` can accept custom `http.RoundTripper` implementations providing token-bucket rate limiting or AIMD adaptive concurrency.
 
-### 7.1 Prometheus Metrics
+### 3.5 Operational Observability, Prometheus Metrics & SLO Thresholds
+The daemon exports Prometheus metrics covering ingestion lag (`vindex_ingestion_lag`), mapping latency (`vindex_map_bundle_duration_seconds`), commit lock durations (`vindex_mpt_write_duration_seconds`), and read latencies (`vindex_lookup_latency_seconds`). Standard SLO targets: P99 read latency < 50ms, ingestion lag < 60s, read availability >= 99.9%.
 
-`vindexd` exports structured Prometheus metrics:
-
-- **Ingestion & Mapping**:
-  - `vindex_ingestion_lag` (Gauge): Distance between Input Log head and `m_kv_size`.
-  - `vindex_map_bundle_duration_seconds` (Histogram): Duration of WASM `map_bundle` tile executions.
-  - `vindex_map_errors_total` (Counter): Count of mapping failures by policy (`HALT`).
-- **Commitment & Witnessing**:
-  - `vindex_indexing_lag` (Gauge): Distance between `m_kv_size` and `Output_Size`.
-  - `vindex_witness_wait_seconds` (Histogram): Time waiting for remote witness cosignatures.
-  - `vindex_mpt_write_duration_seconds` (Histogram): Critical section duration under MPT write lock.
-- **Serving**:
-  - `vindex_lookup_latency_seconds` (Histogram): HTTP lookup endpoint latency.
-  - `vindex_lookup_results_returned` (Histogram): Count of indices returned per query.
-
-### 7.2 Service Level Objectives (SLOs) & Alerting Thresholds
-
-- **Single-Node SLO Targets**:
-  - **Read Latency**: P99 < 50ms for point lookups.
-  - **Ingestion Lag**: < 60s behind published Input Log checkpoints.
-  - **Availability**: 99.9% read availability.
-- **Alerting Triggers**:
-  - **Ingestion Lag**: Ingestion lag > 10,000 leaves for > 15 minutes.
-  - **MPT Lock Contention**: MPT write lock duration > 20ms.
-  - **Witness Timeout Rate**: Remote witness cosignature timeout rate > 1%.
-
-### 7.3 Operational Probes & Health Checks
-
-- `GET /healthz`: Liveness probe. Returns HTTP 200 if the daemon event loop is running and healthy.
-- `GET /readyz`: Readiness probe. Returns HTTP 200 once Zero-WAL startup recovery completes and `ServingState` is active; returns HTTP 503 during startup recovery, active disk rebuilds, or following a fatal trap.
-
-### 7.4 Rollout, Lifecycle & Disaster Recovery
-
-#### 1. Genesis Catch-Up Mode
-
-High-throughput fast-forward bulk ingestion from leaf 0 to a target checkpoint. In this mode, `vindexd` maximizes parallelism across Wazero WASM sandboxes, executes bundled tile mapping (`map_bundle`), bypasses per-batch witness roundtrips, and streams entries directly into Pebble DB and the in-memory MPT via direct `mpt.Set` and `mpt.Snap` operations before activating serving endpoints. See [Section 4.4](#44-operational-modes--alternative-catch-up-pipeline) for the complete Catch-Up Ingestion Mode pipeline invariants, memory efficiency mechanics, and atomic mode transition sequence.
-
-#### 2. Single-Host Disaster Recovery
-
-- **Disk B (MPT) Crash**: If the disk storing MPT working files fails or corrupts, the MPT is rebuilt entirely in RAM directly from local Disk A Pebble inverted chunks (`'c' + KeyHash + ^chunkNum`) without network egress.
-- **Disk A (Pebble) Crash**: If the primary storage disk fails, state is replayed directly from the local tile cache or streamed from the upstream Input Log.
-- **Trap / Invariant Violation**: Any unexpected state divergence, WASM runtime fault, or invariant violation triggers a deterministic `HALT` policy. This immediately freezes the serving pointer and preserves local state on disk for post-mortem forensics.
+### 3.6 Single-Host Disaster Recovery Procedures
+- **MPT Disk Corruption**: Rebuilt entirely in RAM from Pebble inverted chunks (`'c'`) via `store.GetSubRoot` point queries without network egress.
+- **Pebble Storage Corruption**: Replayed from local tile cache or streamed from upstream Input Log.
+- **Runtime Trap / Invariant Divergence**: Deterministic `HALT` policy freezes state and preserves disk data for forensics.
 
 ---
 
-## 8. Major Design Evolutions via Closed-Loop Spec -> Implement -> Measure -> Update Cycles
+## 4. Retired Ideas & Alternatives Considered
 
-The Plan of Record (PoR) for VIndex v1 was hardened through empirical, closed-loop engineering iterations where initial architectural assumptions were implemented, measured under production-scale workloads, and systematically evolved.
+### 4.1 Backfill Mode (Genesis Catch-Up Mode) Retirement
+- **What Was Proposed & Investigated**:
+  A dedicated bulk ingestion mode ("Backfill Mode" or "Genesis Catch-Up Mode") was designed and implemented across `vindex.Backfill`, `Coordinator.Backfill`, and `vindexd --backfill`. In this mode, leaf batches were streamed directly into Pebble and applied directly to in-memory MPT nodes via `mptMgr.SetBatch`, completely bypassing per-batch lock-free root prediction (`mpt.Predict`), Tessera Output Log publishing, and witness cosignatures. The mode used coarse periodic snapshotting and disk sync intervals (`backfillSnapInterval = 1,000,000`, `backfillSyncInterval`), followed by a post-catchup publishing step (`pub.PublishDirect`) upon reaching the target checkpoint.
+- **Why It Was Investigated**:
+  Theoretical concern that during initial synchronization from genesis (tens of millions of leaves), running `mpt.Predict` and publishing Output Log commitments per batch would cause severe memory accumulation, excessive heap cloning, and witness network roundtrip bottlenecks.
+- **Empirical Findings (from BENCHMARK_RESULTS.md)**:
+  An 8-run empirical benchmark matrix on multi-core NVMe hardware comparing Normal Serving Mode (`SyncOnce`) against Backfill Mode revealed:
+  1. **Normal Mode is 85.1% Faster on Go SumDB**: Normal Mode achieved **90,797.2 leaves/sec** vs. Backfill Mode's **49,063.6 leaves/sec**. Normal Mode batches storage updates and streams leaf bundles efficiently without the per-batch in-memory MPT mutation overhead that throttles Backfill Mode.
+  2. **100% Read Starvation in Backfill Mode**: Backfill Mode shut down the HTTP read server, causing 0% query availability for the entire ingestion window. In contrast, Normal Mode sustained sub-2ms P50 latency with 100% availability under concurrent queries while ingesting.
+  3. **Identical Memory Footprint**: Backfill Mode yielded no meaningful RSS reduction (saving only 20–30 MB out of a 220 MB working set) because Pebble LSM write buffers and MPT node allocations dominate memory.
+  4. **Production Personalities Never Adopted Backfill**: Real demonstrator CLIs (`sumdbindex`, `mtcindex`) never called Backfill Mode; both achieved headline rates (240,467 leaves/sec) using Normal Serving Mode (`SyncOnce`).
+- **Why Permanently Set Aside & Pruned**:
+  Backfill Mode provided zero throughput advantage, introduced severe read starvation, duplicated batch streaming logic, and created dead code across 6 source files and 3 test files. It was permanently pruned from the codebase in Milestone M3.
 
-### 8.1 Evolution 1: MapFn Bundling & Host-Side Preimage Hashing
+### 4.2 Intermediate Write-Ahead Log in Storage ('w' Prefix & WalReaper)
+- **Proposed**: Staging mapped records under a transient `'w'` prefix in Pebble DB before an asynchronous background worker (`WalReaper`) converted them into inverted chunks (`'c'`) and deleted `'w'` keys.
+- **Findings**: Caused double-write disk amplification, massive LSM compaction churn, and severe P99 read latency spikes (up to 1,214 ms).
+- **Resolution**: Retired in favor of the Zero-WAL direct inverted chunk commit architecture.
 
-```text
-Baseline Design (Per-Leaf Mapping + In-Guest Crypto):
-  Tile (256 leaves) ──► 768 FFI Transitions (allocate, map_leaf, reset per leaf) ──► ~23% CPU in FFI
-                    ──► In-Guest Software SHA-256 in WASM Bytecode                ──► ~55% CPU in Crypto
+### 4.3 Per-Leaf WebAssembly Invocation (`map_leaf`)
+- **Proposed**: Invoking WASM `map_leaf` individually for every leaf entry.
+- **Findings**: Generated 768 FFI boundary crossings per 256-leaf tile, consuming ~23% of total host CPU time in FFI overhead.
+- **Resolution**: Replaced with bundled tile mapping (`map_bundle`), reducing FFI transitions to 2–3 per tile (< 1% CPU).
 
-PoR Design (Bundled Tile Mapping + Host Hardware SIMD Crypto):
-  Tile (256 leaves) ──► 1 allocate + 1 map_bundle + 1 reset (2-3 FFI calls)       ──► < 1% CPU in FFI
-                    ──► Guest emits Raw Canonical Preimages
-                    ──► Host computes Hardware SHA-256 (SHA-NI / ARMv8 Crypto)   ──► Hardware Speed (0% WASM crypto)
-                    ──► Preserves Preimages for future Prefix-Trie indexing
-```
+### 4.4 In-Guest Software Cryptographic Hashing
+- **Proposed**: Compiling SHA-256 cryptographic hashing into guest WebAssembly bytecode.
+- **Findings**: Consumed ~55% of all CPU cycles during mapping due to lack of SIMD vector instructions inside WASM.
+- **Resolution**: Delegated hashing to the Go host (`crypto/sha256`), leveraging hardware vector instructions (SHA-NI / ARMv8 Crypto).
 
-- **Problem & Profiling Telemetry**:
-  In the initial v1 specification, the WebAssembly interface mapped entries on a per-leaf basis (`map_leaf(ptr, len) -> (out_ptr, out_len)`), with guest bytecode computing SHA-256 hashes internally. Comprehensive CPU profiling during 54M-leaf SumDB and 10M-leaf CT ingestion runs revealed two severe bottlenecks:
-  1. **FFI Boundary Overhead (~23% CPU)**: For every 256-leaf tile, the host executed 3 FFI calls per leaf (`allocate`, `map_leaf`, `reset`), totaling 768 FFI boundary crossings per tile. FFI parameter marshaling, memory boundary assertions, and context switches consumed ~23% of total CPU time.
-  2. **In-Guest Software SHA-256 (~55% CPU)**: Compiling software cryptographic hashing routines into WebAssembly bytecode prevented the guest from accessing host CPU vector/SIMD cryptographic instructions. Software SHA-256 inside WASM consumed ~55% of all CPU cycles during mapping.
-- **Plan of Record (PoR) Architecture**:
-  1. **Bundled Tile Execution (`map_bundle`)**: Instead of 768 FFI calls per tile, the host writes bundled leaves (`1 <= N <= 256`) into guest memory in a single structured buffer and invokes `map_bundle` once. FFI transitions dropped from 768 to 2–3 per tile, reducing FFI overhead from ~23% to < 1% of CPU time, with full support for partial tiles on unaligned checkpoint boundaries or log heads.
-  2. **Host-Side Hardware SHA-256**: Guest plugins extract and emit raw canonical Claim Subject preimages (e.g. lowercase Punycode domain strings, escaped Go module paths). The Go host runtime hashes preimages using standard `crypto/sha256`, which leverages hardware-accelerated SIMD instructions (Intel/AMD SHA-NI extensions or ARMv8 Crypto instructions). This eliminated the ~55% software crypto bottleneck.
-  3. **Preservation of Preimages for Future Subtree / Prefix Indexing**: By returning raw preimages rather than opaque hashes, the host runtime retains the exact domain strings and module paths. This provides forward compatibility for future prefix-trie search capabilities (Section 9.5) without altering guest WASM plugin ABIs.
+### 4.5 Sparse Merkle Trees (SMT) & Verkle Trees
+- **Sparse Merkle Trees (SMT)**: Rejected due to prohibitive memory and disk I/O across 256-level tree depths.
+- **Verkle Trees**: Rejected due to high CPU polynomial commitment generation costs during high-throughput ingestion.
+- **Resolution**: Standardized on binary Sparse Merkle Patricia Trie in `mmap` (`torchwood/mpt`).
 
-### 8.2 Evolution 2: Removal of the Write-Ahead Log (WAL)
+### 4.6 Forward Paging (`start=X&limit=M`)
+- **Proposed**: Returning indices in ascending chronological order from a start cursor.
+- **Findings**: Requires either returning unverified future state, maintaining complex arbitrary suffix subtree proofs, or forcing clients to scan millions of historical entries to reach the latest state.
+- **Resolution**: Standardized on backward paging (`before=X&limit=M`), leveraging the natural prefix property of Merkle compact ranges and inverted chunk layout.
 
-```text
-Baseline Design (Pebble 'w' Prefix WAL + Async WalReaper):
-  Ingest ──► WriteBatch('w' WAL) ──► Disk Sync ──► Output Log ──► WalReaper Compaction ──► Inverted Chunks ('c')
-  Result: Double-write disk amplification, high LSM compaction churn, P99 latency spikes (847–1,214 ms).
-
-PoR Design (Zero-WAL Direct Commit + TileReaper):
-  Ingest ──► Direct WriteBatch('c' Chunks) with pebble.Sync ──► Output Log & MPT Ratchet
-  Result: +24.7% throughput (240k leaves/s), 2.4 ms warm recovery, ~93–99% P99 latency reduction.
-```
-
-- **Problem & Profiling Telemetry**:
-  The prototype staged index records under a transient `'w'` prefix in Pebble DB before an asynchronous background worker (`WalReaper`) converted them into inverted chunks (`'c'`) and deleted the `'w'` keys. Telemetry revealed severe performance pathologies:
-  1. **Double-Write Amplification & LSM Churn**: Every mapping was written to disk twice and then deleted, saturating NVMe write bandwidth and triggering massive Pebble LSM compaction cascades.
-  2. **Severe Tail Read Latency Spikes**: LSM compaction stalls in Pebble caused P99 lookup latencies to spike to **1,214 ms** (1-to-1 mapping) and **847.8 ms** (CT fanout).
-  3. **Slow Startup Recovery**: Crash recovery required scanning and replaying unindexed WAL entries from Pebble.
-- **Plan of Record (PoR) Architecture**:
-  1. **Direct Inverted Chunk Commits**: Mapped batches are committed directly into Pebble inverted chunk records (`'c' + KeyHash + ^chunkNum`) with a synchronous durability barrier (`pebble.Sync`).
-  2. **Immutable Tile Cache as Log of Record**: Verified raw entry tiles stored by `torchwood.PermanentCache` serve as the immutable log of record. If an unclean crash occurs, Stage 1 startup recovery deterministically replays missing tiles in < 500ms using O(1) `store.GetSubRoot` point queries with **zero storage mutations**.
-  3. **Empirical Results**:
-     - Throughput increased by **+24.7%** (from 192k to 240,467 leaves/sec on full Go SumDB).
-     - Warm recovery time-to-first-serve dropped to **2.4 ms**.
-     - P99 read tail latencies dropped by **~93–99%** (to 11.3 ms for 1-to-1 and 62.2 ms for CT fanout).
-     - Pebble database footprint in CT tests dropped by **99%** (from 1.2 GB down to 9.91 MB).
-
----
-
-## 9. Architectural Decisions & Alternatives Considered
-
-### 9.1 Authenticated Data Structure & Single-Host Coupling
-- *Selected*: In-memory Binary Merkle Patricia Trie (`torchwood/mpt` backed by `mmap`). Delivers ~52 bytes/node density, sub-5ms commit locks, and lock-free root prediction (`mpt.Predict`). Keeping the MPT in memory backed by local NVMe requires high-spec single-host hardware optimized for bulk log catch-up.
-- *Rejected*: Sparse Merkle Trees (SMT) were rejected due to severe memory and disk I/O overhead across 256-level trie depths. Verkle Trees were rejected due to prohibitive CPU update costs during high-throughput bulk ingestion.
-
-### 9.2 Storage Engine & Encapsulation Principle
-- *Selected*: Embedded Pebble LSM key-value store encapsulated behind an abstract `IndexStore` interface. Provides zero network hops, single-host NVMe optimization, 33-byte prefix Bloom filters, and fast inverted chunk seeks (`^chunkNum`).
-- *Architectural Isolation Principle*: **Pebble is strictly contained within the `kvstore` subsystem**. All Pebble concepts (SSTables, memtables, iterators, batches, bitwise key inversion, and binary chunk formats) are completely hidden behind the `IndexStore` domain interface. No external subsystem (`coordinator`, `server`, `ingest`, `tree`) imports Pebble or accesses low-level iterators. This guarantees that the underlying storage implementation can be seamlessly swapped (e.g. for SQLite, DuckDB, RocksDB, or a cloud-managed KV) without affecting any other part of the system.
-- *Rejected*: Distributed KV stores (e.g. Cloud Bigtable, Spanner, Cassandra) were ruled out as the default engine because the MPT already requires single-host deployment; remote RPC hops introduce network latency and degrade bulk catch-up throughput.
-
-### 9.3 Commit & Durability Pipeline
-- *Selected*: Zero-WAL architecture with a synchronous storage persistence barrier. Uses the immutable Input Log tile cache as the log of record, completely eliminating write amplification and WAL tail repair during crash recovery. Mandates strict, synchronous disk persistence of the KV store (`store.WriteBatch` with `pebble.Sync`) before Output Log publication and witness network RPCs begin.
-- *Rejected / Retired*: A WAL-in-Pebble design (staging index records under a transient 'w' prefix with an asynchronous WAL reaper) was initially implemented and evaluated. Removing the WAL in favor of direct chunk indexing proved measurably superior in empirical benchmarks: it increased full Go SumDB ingestion throughput by +24.7% (from ~192k to ~240k leaves/sec), reduced end-to-end build duration by ~20%, and eliminated double-write disk amplification and LSM compaction churn.
-
-### 9.4 Pagination Model & Traversal Direction
-- *Selected - Backward Paging (`before=X&limit=M`)*:
-  - **Merkle Log Prefix Property**: Merkle tree compact ranges natively commit to a contiguous prefix of history (`0 .. K-1`). Returning the latest tail entries alongside a single `prefix-compact-range-v1` allows O(log N) cryptographic verification of all prior history in a single response, without requiring complex arbitrary suffix/middle sub-tree proofs.
-  - **Access Pattern & Recency Bias**: Transparency log auditing is heavily biased toward the most recent entries (new certificates, latest package releases, fresh signatures). Earlier entries are typically stale, superseded, or already observed by recurring index auditors. Backward paging delivers the freshest data on Page 1 immediately.
-  - **Storage & Traversal Alignment**: Inverted chunk storage (`'c' + KeyHash + ^chunkNum`) naturally positions the active, newest chunk first, enabling O(1) seek and chronological reverse traversal.
-- *Rejected - Forward Paging (`start=X&limit=M`)*: Forward paging would require either returning unverified future state, maintaining complex arbitrary suffix sub-tree proofs, or forcing clients to traverse millions of historical entries to reach the latest state.
-
-### 9.5 Future Architectural Extensions: Prefix-Trie & Subtree Indexing
-
-While VIndex v1 standardizes on 32-byte point lookups (`KeyHash = SHA256(canonicalSubject)`), preserving canonical preimages across `map_bundle` executions creates a clean architectural foundation for future prefix search extensions:
-- **Subdomain & Path Discovery**: In CT and package repositories, querying all subdomains under `*.example.com` or all subpackages under `github.com/org/*` requires prefix-trie indexing.
-- **Unified Guest Contract**: Because guest WASM modules emit canonical string preimages rather than one-way hashes, future index versions can index raw radix paths or subtree roots without modifying plugin implementations or recompiling guest modules.
-
----
-
-## 10. Companion Documentation
-
-- **[WASM MapFn Plugin SDK & Runtime](../mapfn/README.md)**: WebAssembly guest ABI, 256-leaf `map_bundle` protocol, host SHA-NI crypto, multi-language SDKs, and offline verification harness.
-- **[Applications & Ecosystems](./APPLICATIONS.md)**: Ecosystem mapping guides (Certificate Transparency, Merkle Tree Certificates, Go SumDB, Sigstore, Sigsum).
-- **[Benchmarks & Performance](./BENCHMARKS.md)**: Empirical performance benchmarks (Zero-WAL vs WAL, 54M local / 61M live CDN SumDB ingestion, 10M CT fanout load tests, closed-loop telemetry).
-- **[Hammer Design](../hammer/README.md)**: Load testing, synthetic generation, and invariant verification framework.
+### 4.7 Distributed Key-Value Engines (Cloud Bigtable, Spanner, Cassandra)
+- **Proposed**: Backing the inverted chunk store with a distributed NoSQL database.
+- **Findings**: The authenticated MPT already requires single-host physical RAM/mmap locality; remote RPC hops degrade bulk ingestion throughput by orders of magnitude without solving tree state replication.
+- **Resolution**: Embedded Pebble LSM engine encapsulated behind the `IndexStore` interface.

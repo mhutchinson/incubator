@@ -2,30 +2,6 @@
 
 This deployment bundle runs a fully functional, self-contained **Verifiable Index (VIndex) personality for the Go Checksum Database (SumDB)**, complete with upstream proxying, WASM MapFn execution, Caddy gateway routing, Prometheus metrics, and a pre-provisioned Grafana dashboard.
 
-## Architecture
-
-```
-                                      +---------------------------------------------+
-                                      |                Caddy Gateway                |
-                                      |             (http://localhost:8080)          |
-                                      +---------------------------------------------+
-                                            /                  |               \
-                       /checkpoint, /tile/* |                  | /sumdb/*       \ /grafana/*
-                       /index/*, / (Web UI) |                  |                 \
-                                            v                  v                  v
-                             +-------------------+    +-----------------+    +-----------------+
-                             |      vindexd      |    |    sumdbproxy   |    |     Grafana     |
-                             |   (WASM: sumdb)   |    |    (:8089)      |    |     (:3000)     |
-                             +-------------------+    +-----------------+    +-----------------+
-                                      |    ^                   |                      ^
-                         fetches tiles|    |                   | fetches upstream     | queries
-                                      +----+                   v                      v
-                                                        sum.golang.org       +-----------------+
-                                                                             |    Prometheus   |
-                                                                             |     (:9090)     |
-                                                                             +-----------------+
-```
-
 ## Quickstart
 
 ### 1. Launch the Stack
