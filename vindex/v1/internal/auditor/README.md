@@ -44,39 +44,44 @@ The verifier operates as an independent external auditor paired with a safe fore
 
 ## 2. Detailed Design
 
-### 2.1 Ecosystem Audit Architecture: Client SDK vs. Log Auditor
+### 2.1 Ecosystem Audit Architecture & Configuration: Client SDK vs. Log Auditor
 
 VIndex verification operates across two distinct, complementary boundaries:
 
 | Role & Component | Execution Scope | Target Consumer | Threat Coverage |
 | :--- | :--- | :--- | :--- |
-| **Client Query Verification** (`vindex/v1/client`) | Evaluates individual query responses against witnessed Output Log checkpoints. | End-user apps, CLIs, light clients. | Verifies inclusion/non-inclusion of queried key; verifies witness signatures; verifies backward pagination chain. |
-| **Full-Log Independent Auditor** (`vindex/v1/internal/auditor`) | Independently re-indexes all Input Log leaves from leaf 0 and reconstructs the full MPT. | Standalone monitoring daemon (`vindex-audit`). | Detects operator equivocation, forged map roots, targeted omission of unqueried keys, and log rollbacks. |
+| **Client Query Verification** (`vindex/v1/client`) | Evaluates individual query responses against witnessed Output Log checkpoints. | End-user apps, CLIs, light clients. | Verifies inclusion/non-inclusion of queried key; verifies witness cosignatures against policy; verifies backward pagination chain. |
+| **Full-Log Independent Auditor** (`vindex/v1/internal/auditor`) | Independently re-indexes all Input Log leaves from leaf 0 and reconstructs the full MPT. | Standalone monitoring daemon (`vindex-audit`). | Detects operator equivocation, forged map roots, targeted omission of unqueried keys, and log rollbacks; enforces policy witness quorum. |
+
+#### Auditor Configuration & Witness Policy Enforcement
+The auditor daemon is provisioned with network endpoints, verifiers, and trust policies via its configuration. Crucially, Output Log checkpoint validation verifies origin signatures and witness cosignatures against a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note does not satisfy the witness quorum or origin requirements defined by the policy, it is rejected before processing any leaves.
 
 ### 2.2 The Continuous Audit Loop (`AuditOnce`)
 The standalone auditor daemon continuously polls both logs, executing the following 5-step audit loop:
 
 | Step | Phase | Action & Operations | Verification Check |
 | :--- | :--- | :--- | :--- |
-| **1** | **Poll Output Checkpoint** | Fetches latest Output Log `/checkpoint`. | Verifies origin note signatures and witness cosignatures. |
+| **1** | **Poll Output Checkpoint** | Fetches latest Output Log `/checkpoint`. | Verifies origin signatures and witness cosignatures against configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If witness quorum or origin requirements are unsatisfied, rejected before processing leaves. |
 | **2** | **Stream Output Leaves** | Streams Output Log leaves in the range `[verifiedOutputWatermark .. targetOutputSize)`. | Asserts Merkle inclusion proof against the verified Output Log root. |
-| **3** | **Fetch & Map Input Tiles** | Downloads missing Input Log tiles up to `targetInputSize`. | Authenticates tiles against Input Log root and runs sandboxed mapping. |
+| **3** | **Fetch & Map Input Tiles** | Downloads missing Input Log tiles up to `targetInputSize`, filters replayed leaves (`leafIdx < persistedInputWatermark`), and writes chunk updates atomically with verified input watermark via `store.WriteBatch`. | Authenticates tiles against Input Log root, enforces replay deduplication, and runs sandboxed mapping. |
 | **4** | **Reconstruct Local MPT** | Reconstructs mini-log sub-roots for all modified search keys. | Computes candidate `localMapRoot` in local memory. |
-| **5** | **Assert Root Equality** | Asserts `localMapRoot == committedMapRoot`. | **Match**: Ratchets verified watermarks.<br>**Mismatch**: Triggers state-preserving halt, freezes database files, emits alerts, and pins serving to `Serving_CP` (or revokes serving if `--fail_closed=true`). |
+| **5** | **Assert Root Equality** | Asserts `localMapRoot == committedMapRoot`. | **Match**: Advances verified Output Log watermark and ratchets public serving checkpoint (`Serving_CP`); storage progression remains strictly atomic.<br>**Mismatch**: Triggers state-preserving halt, freezes database files, emits alerts, and pins serving to `Serving_CP` (or revokes serving if `--fail_closed=true`). |
 
 #### Step Details:
-1. **Discover & Authenticate Output Checkpoint**: Polls the Output Log's `/checkpoint` endpoint, verifies origin note signatures and witness cosignatures using configured public keys.
+1. **Discover & Authenticate Output Checkpoint**: Polls the Output Log's `/checkpoint` endpoint. Output Log checkpoint validation verifies origin signatures and witness cosignatures against a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note does not satisfy the witness quorum or origin requirements defined by the policy, it is rejected before processing any leaves.
 2. **Stream State Commitments**: Downloads new Output Log leaves using standard Merkle tile fetching. Verifies inclusion proofs for each leaf against the Output Log checkpoint root (`proof.VerifyInclusion`).
 3. **Fetch & Map Input Tiles**: For each state commitment leaf specifying `targetInputSize`:
    - Validates monotonic progression: `targetInputSize >= verifiedInputWatermark`.
-   - Downloads missing Input Log tiles from the upstream log.
-   - Evaluates the WASM `MapFn` on input leaves and appends occurrence indices to the local Pebble DB (`store.WriteBatch`).
+   - Downloads missing Input Log tiles from the upstream log and authenticates them against the Input Log root.
+   - Evaluates the WASM `MapFn` on input leaves.
+   - **Replay Deduplication Invariant**: On restart or crash replay, any input leaf indices already persisted (`leafIdx < persistedInputWatermark`) are filtered out prior to appending to active chunks, ensuring idempotent crash recovery and preventing duplicate index entries from corrupting compact ranges.
+   - **Atomic Watermark Persistence**: Appends occurrence indices to inverted chunk records and writes updates to Pebble DB via `store.WriteBatch`. The batch persists the verified input watermark (`KeyVerifierInputWatermark`) atomically in the same batch as the inverted chunk updates, preventing open windows where storage is durable but watermark is stale.
 4. **Reconstruct Local MPT**: Queries `store.GetSubRoot(keyHash, targetInputSize)` for all modified keys and computes the local candidate root:
    ```go
    localMapRoot, err := v.mptMgr.CommitWithVersionLocked(modifiedSubRoots, int64(targetInputSize))
    ```
 5. **Root Equality Assertion**: Asserts `localMapRoot == committedMapRoot`.
-   - If equal: advances verifier metadata watermarks in Pebble (`KeyVerifierOutputWatermark`, `KeyVerifierInputWatermark`, `KeyVerifierLastRoot`) and updates the mirror serving state.
+   - If equal: advances the verified Output Log watermark (`KeyVerifierOutputWatermark`, `KeyVerifierLastRoot`) and ratchets the public serving checkpoint (`Serving_CP`), while storage progression remains strictly atomic.
    - If divergent: enters the state-preserving halt protocol.
 
 ### 2.3 Root Mismatch Alerting & State-Preserving Halt
@@ -190,6 +195,7 @@ type AuditorConfig struct {
 	OutputLogURL      string
 	OutputLogOrigin   string
 	OutputLogVerifier note.Verifier
+	OutputLogPolicy   string // C2SP tlog-policy enforcing origin and witness quorum
 	MapWasmPath       string
 	DataDir           string
 	ServeMirror       bool

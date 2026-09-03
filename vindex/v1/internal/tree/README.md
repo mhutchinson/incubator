@@ -42,11 +42,13 @@ The commitment plane maps 32-byte key hashes (`KeyHash`) to 32-byte mini-log roo
 2. **Memory-Mapped Storage**: Tree nodes and leaves are stored in append-only files managed via memory mapping (`mmap`), allowing fast lookups without loading entire historical trees into the Go heap.
 3. **SubRoot Values**: The value committed at each leaf is the RFC 6962 mini-log root computed by `kvstore.GetSubRoot`, authenticating all occurrences of that key in the Input Log.
 
-### 2.2 The 3-Step Atomic Commitment Dance
-The publisher coordinates the progression from KV storage to public commitment through a structured 3-step sequence. To keep reader lock contention under 5 milliseconds while guaranteeing that no unprovable root is ever published, the commit sequence operates like the classic idol swap in *Raiders of the Lost Ark*:
-1. **Weighing the sandbag (lock-free preparation)**: Pre-computing the exact future root (`mpt.Predict`), writing the commitment to the Output Log, and gathering witness cosignatures without holding the trie write lock.
-2. **The split-second swap (< 5ms critical section)**: Acquiring the publisher lock, committing the mutations, verifying root equality, and ratcheting serving state in under 5 milliseconds before releasing the lock.
-3. **The hair-trigger boulder (fatal panic)**: If the actual root diverges by even a single byte from the prediction (`actualRoot != predictedMapRoot`), the temple collapses: the node halts immediately with a fatal panic, freezing disk state before an unprovable or equivocal state can be served.
+### 2.2 The 3-Step Atomic Commitment Sequence
+The publisher coordinates the progression from KV storage to public commitment through a structured 3-step sequence designed to satisfy two strict system constraints:
+
+1. **System Constraint 1 (Zero Unwitnessed State)**: Readers must never observe or obtain proofs against an in-memory root that has not yet been committed to the append-only Output Log and signed by a threshold of external witnesses. Mutating the tree before publishing would leak unwitnessed state to readers.
+2. **System Constraint 2 (Sub-Millisecond Read Latency)**: Readers must never block on external network I/O. Because appending to the Output Log and collecting witness cosignatures takes 50ms–200ms+, holding an exclusive tree write lock across network calls would stall concurrent client queries and violate read latency SLOs (< 15ms P99).
+3. **Solution (Separate Prediction from Mutation)**: Pre-compute the deterministic future root (`mpt.Predict`) without mutating the live trie, append to the Output Log, and gather witness cosignatures while readers query unblocked. Once proofs and signatures are secured, acquire the lock briefly (< 5ms) to commit in-memory mutations, verify `assert(actualRoot == predictedMapRoot)`, and atomically ratchet the serving pointer.
+4. **Why Panic on Divergence**: `Predict` and `Commit` are deterministic functions over identical inputs. Any divergence is an internal invariant violation / software defect in the tree implementation. Halting immediately prevents the node from serving proofs that contradict the witnessed log.
 
 #### PublishBatch Locking & Concurrency:
 The publisher lock protects the in-memory trie commit and the serving state update. Concurrent batch publications are not supported without an external coordinator lock; the Coordinator serializes batch execution.
@@ -54,7 +56,7 @@ The publisher lock protects the in-memory trie commit and the serving state upda
 | Step | Phase | Operations | Lock State | Reader Impact |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | **Lock-Free Prediction & Witnessing** | 1. `predictedMapRoot = mpt.Predict(modifiedSubRoots)`<br>2. `outputLog.Append(predictedMapRoot, inputLogCP)`<br>3. `witness.Witness(outputLogCheckpoint)` | No tree lock held | **Zero blocking**; concurrent queries run unimpeded. |
-| **2** | **The Atomic Swap** | 1. Acquire publisher lock<br>2. Commit mutations to in-memory trie<br>3. Assert `actualRoot == predictedMapRoot`<br>4. Ratchet `ServingState`<br>5. Release publisher lock | Publisher lock held | **< 5ms** critical section duration. |
+| **2** | **Atomic Mutation & Ratchet** | 1. Acquire publisher lock<br>2. Commit mutations to in-memory trie<br>3. Assert `actualRoot == predictedMapRoot`<br>4. Ratchet `ServingState`<br>5. Release publisher lock | Publisher lock held | **< 5ms** critical section duration. |
 | **3** | **Background Durability** | 1. Flush dirty mmap pages to disk<br>2. Advance `MPT_Durable_Size` | Disk persistence lock held; publisher lock released | **Zero blocking**; disk fsync runs outside reader lock. |
 
 #### Step Details:
@@ -63,7 +65,7 @@ The publisher lock protects the in-memory trie commit and the serving state upda
    - The commitment string (`hex(predictedMapRoot) + "\n" + rawInputLogCP`) is appended to the Tessera Output Log.
    - The new Output Log checkpoint is submitted to external witnesses to gather threshold cosignatures.
    - **Throughout this entire phase, concurrent readers execute lookups without blocking.**
-2. **The Split-Second Swap**:
+2. **Atomic Mutation & Ratchet**:
    - The publisher acquires the exclusive publisher lock.
    - Mutates in-memory MPT nodes in place.
    - Asserts `actualRoot == predictedMapRoot`. If mismatched, panics immediately.

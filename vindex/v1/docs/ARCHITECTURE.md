@@ -271,7 +271,10 @@ Because key hashes are uniformly distributed, MPT updates touch scattered trie b
 | **Large (1B)** | ~104 GB | ~32 GB | ~100 GB | 256 GB | `n2-megamem-16` |
 | **Very Large (2B)** | ~208 GB | ~64 GB | ~200 GB | 512+ GB | `m4-megamem-64` |
 
-### 4.3 Forward-Compatibility: Prefix-Trie & Subtree Indexing
+### 4.3 Future Work (Non-v1 Scope): Auxiliary Prefix-Trie Indexing
+
+> **Note**: VIndex v1 implements exact 32-byte point lookups exclusively. Auxiliary prefix-trie indexing and subtree searches are non-v1 future design considerations.
+
 While VIndex v1 provides point lookups by 32-byte key hashes, guest plugins emit raw canonical Claim Subject preimages (e.g. domain names, package paths). This allows future VIndex versions to construct auxiliary prefix-trie indices (for `*.example.com` or `github.com/org/*` subtree queries) without altering guest WASM ABIs.
 
 ### 4.4 Prometheus Metrics & SLO Thresholds

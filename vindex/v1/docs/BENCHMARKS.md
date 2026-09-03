@@ -1,159 +1,218 @@
-# VIndex v1 Benchmarks & Empirical Evaluation
+# VIndex v1 Benchmark Suite & Performance Specification
 
-This document details empirical benchmarks, real-world workload evaluations, comparative analysis against retired architectural baselines, and capacity sizing telemetry for **VIndex v1**.
+This document defines the formal benchmark specification, testing taxonomy, standard hardware environment, Service Level Objectives (SLOs), and execution procedures for **VIndex v1**.
 
 ---
 
-## 0. Headline Metrics & Key Highlights
+## Executive Summary
 
-The production Zero-WAL direct commit pipeline streams mapped leaf entries directly into Pebble inverted chunk records (`'c'`) with synchronous durability barriers (`pebble.Sync`), backed by bundled tile WebAssembly execution (`map_bundle`), host hardware SIMD SHA-256 computation, and dynamic `TileReaper` pruning over verified input tiles.
+Validating the performance, scalability, and cryptographic correctness of a verifiable index requires a principled testing taxonomy. Historical evaluations often suffered from **methodological conflation**: synthetic microbenchmarks testing isolated data structures in memory (such as raw trie insertions or byte hashing) were conflated with multi-stage, end-to-end ingestion and query serving pipelines. This conflation obscured actual hardware bottlenecks, obscured the impact of LSM-tree compaction stalls under sustained I/O, and created misleading expectations for real-world production deployments.
 
-### Production Key Performance Indicators (KPIs)
+The VIndex v1 Benchmark Suite resolves this conflation by partitioning performance evaluation across **four strictly isolated tiers**:
 
-| Performance Dimension | Production Result (PoR) | Comparison vs. Baseline Architecture | Impact & Significance |
+1. **Tier 1: Subsystem Microbenchmarks**: Isolates individual core components (the Pebble key-value store, the WebAssembly guest mapping runtime, and the Sparse Merkle Patricia Trie engine) to establish baseline computational and algorithmic ceilings independent of inter-process communication or pipeline queueing.
+2. **Tier 2: End-to-End Ingestion Pipelines**: Evaluates full-pipeline continuous ingestion and catch-up from upstream Input Logs into committed, witnessed Output Logs under the Zero-WAL direct commit architecture, measuring sustained throughput across both low-fanout (1-to-1) and high-fanout (1-to-N) data distributions.
+3. **Tier 3: Query Serving Under Active Load**: Measures read query latency percentiles (P50 and P99) and request throughput (QPS) of the C2SP HTTP read server while the daemon concurrently processes and commits maximum write ingestion traffic, requiring 100% cryptographic proof verification on all responses.
+4. **Tier 4: Crash Recovery**: Evaluates the time required for the coordinator and storage engine to recover, verify durability invariants, and open the HTTP serving interface following both clean process shutdowns and abrupt dirty crashes.
+
+---
+
+## 1. Standard Test Environment & Hardware Specification
+
+To ensure reproducibility across benchmark executions, all standardized tests must run on a dedicated bare-metal host conforming to the following baseline:
+
+### 1.1 Hardware Configuration
+
+- **Host Processor**: Dedicated 24-core / 48-thread x86_64 host (or equivalent modern multi-core architecture) with physical cores pinned or scheduled via `runtime.GOMAXPROCS(24)`.
+- **Cryptographic Vector Extensions**: Host hardware SIMD acceleration for SHA-256 (Intel/AMD SHA-NI extensions or ARMv8 Cryptographic Instructions). The Go runtime must utilize hardware-accelerated SHA-256 for all tile hashing and MPT commitments.
+- **Storage Subsystem**: Dedicated local NVMe Solid State Drive mounted with `ext4` or `xfs` and default write barriers enabled (`discard,noatime`). Virtualized disks (e.g. network-attached cloud block storage) introduce unpredictable hypervisor flush latency and must not be used for baseline benchmark runs.
+- **Durable Barrier Policy**: Pebble batch commits must execute with synchronous disk flushing enabled (`pebble.Sync`), ensuring that reported write throughput reflects true durability rather than volatile page-cache buffering.
+
+### 1.2 Network & Communication Topology
+
+- **Dual-Process Loopback Harness**: All integration tests execute as two distinct operating system processes communicating over local loopback TCP (`127.0.0.1`):
+  - **Upstream Producer**: The [`vindex-hammer`](../hammer/README.md) test harness serves standard C2SP `tlog-tiles` endpoints on port `:8085`.
+  - **System Under Test**: The `vindexd` indexing daemon serves C2SP query endpoints on port `:8088`.
+- **Rationale**: The loopback topology eliminates wide-area network jitter, transit latency, and external CDN throttling while fully exercising the operating system network stack, HTTP/1.1 transport pooling, socket buffers, and connection concurrency.
+
+### 1.3 Concurrency & Pipeline Scheduling Model
+
+VIndex divides processing across discrete pipeline stages, allocating goroutines and CPU cores as follows:
+
+| Stage | Subsystem | Resource Allocation & Concurrency | Role |
 | :--- | :--- | :--- | :--- |
-| **Ingestion Throughput (Go SumDB Mirror)** | **240,467 leaves/sec** | +24.7% throughput gain | 54.3M leaves indexed in 3m 46s |
-| **Ingestion Throughput (Live CDN)** | **~114,167 leaves/sec** | Network-saturating ingestion | 60.9M leaves indexed in 8m 54s over HTTP |
-| **MapFn FFI CPU Overhead** | **< 1% CPU** | **Down from ~23% CPU** | Boundary crossings cut from 768 to 2–3 per tile |
-| **MapFn Cryptography Bottleneck** | **0% CPU in WASM** | **Down from ~55% CPU in WASM** | Leverages host x86 SHA-NI / ARMv8 Crypto SIMD |
-| **Median Read Latency (P50)** | **0.780 ms** | Sub-millisecond serving | 50% lower median latency during active writes |
-| **Tail Read Latency (P99, 1-to-1)** | **11.343 ms** | **~99% tail reduction** | Down from 1,214 ms under WAL compaction stalls |
-| **Tail Read Latency (P99, CT Fanout)** | **62.218 ms** | **~93% tail reduction** | Down from 847.8 ms under WAL compaction stalls |
-| **Warm Recovery (Time-to-First-Serve)** | **2.4 ms** | **Instant warm recovery** | Zero WAL replay or index rebuild on restart |
-| **Pebble Storage Footprint (CT Fanout)** | **9.91 MB** | **99% space savings** | Eliminates temporary WAL bloat (down from 1.2 GB) |
+| **Stage 1** | [`internal/ingest`](../internal/ingest/README.md) | I/O-bound goroutines | Downloads 256-leaf tiles from upstream HTTP server into local tile cache. |
+| **Stage 2** | [`mapfn`](../mapfn/README.md) & [`internal/ingest`](../internal/ingest/README.md) | `GOMAXPROCS - 1` worker pool | Executes WASM `map_bundle` in Wazero; offloads preimage hashing to host SIMD SHA-256. |
+| **Stage 2b** | [`internal/ingest`](../internal/ingest/README.md) | Single in-memory goroutine | Min-heap priority queue re-sequences finished tile bundles into strictly monotonic order. |
+| **Stage 3** | [`internal/kvstore`](../internal/kvstore/README.md) | Single sequential committer | Appends inverted chunk records (`'c' + KeyHash + ^chunkNum`) and commits via `pebble.Sync`. |
+| **Stage 4** | [`internal/tree`](../internal/tree/README.md) | Single publisher goroutine | Predicts `MapRoot` lock-free, appends to Output Log, and ratchets trie under short write lock (< 5 ms). |
+| **Stage 5** | [`internal/server`](../internal/server/README.md) | Concurrent HTTP worker pool | Serves C2SP read queries under shared read lock (`treeMu.RLock()`). |
 
 ---
 
-## 1. Test Environment & Hardware Configuration
+## 2. Standard Benchmark Matrix
 
-All benchmarks were conducted under a standardized local dual-process topology on dedicated multi-core hardware:
+The following matrix defines the standard suite of benchmarks, their component scope, workload profiles, target Service Level Objectives (SLOs), and performance budgets. All measured result fields are designated for re-evaluation under the unified test runner.
 
-- **Host Operating System**: Linux
-- **Processor Architecture**: 24-core host (`runtime.GOMAXPROCS(0) = 24`) with hardware SHA-NI / ARMv8 Crypto support
-- **Storage Subsystem**: Dedicated local NVMe Solid State Drive
-- **Dual-Process Topology**:
-  - `vindex-hammer`: Tessera POSIX Input Log sequencer and Checkpoint Drip Proxy listening on `http://127.0.0.1:8085`.
-  - `vindexd`: Verifiable Index Daemon (Ingestion, KV Indexer, Output Log Publisher, and HTTP Serving API) listening on `http://127.0.0.1:8088`.
-- **Communication Channel**: Local loopback HTTP (`:8085` -> `:8088`).
-
-### Concurrency Pipeline Topology
-
-| Stage | Subsystem | Physical Role | Concurrency Allocation |
-| :--- | :--- | :--- | :--- |
-| **Stage 1** | `internal/ingest` | Fetches tiles over HTTP; unpacks into 256-leaf `LeafBundle`s. | I/O-bound background goroutines |
-| **Stage 2** | `mapfn` | Maps bundles via Wazero `map_bundle`; Go host executes SIMD SHA-256. | `GOMAXPROCS - 1` parallel workers (23 workers) |
-| **Stage 2b** | `internal/ingest` | Min-heap priority queue re-sequences finished batches. | In-memory priority queue |
-| **Stage 3** | `internal/kvstore` | Batches updates into Pebble inverted chunks (`'c'`) with `pebble.Sync`. | Single sequential write committer |
-| **Stage 4** | `internal/tree` | Predicts `MapRoot` lock-free; appends Output Log; ratchets trie under < 5ms lock. | Publisher goroutine |
-| **Stage 5** | `internal/server` | Serves C2SP HTTP lookups under `treeMu.RLock()`. | Concurrent HTTP server threads |
+| Benchmark Tier | Benchmark Name | Subsystem Scope | Workload Profile | Target SLO / Performance Budget | Measured Result |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Tier 1: Subsystem Microbenchmarks** | Raw KV Inverted Storage | [`internal/kvstore`](../internal/kvstore/README.md) | Direct batch writes to Pebble inverted chunks (`'c' + KeyHash + ^chunkNum`); 64K-entry chunk roll-overs; 16-bit relative index encoding; `pebble.Sync` barrier. | >= 150,000 index entries/s sustained; zero compaction stalls exceeding 100 ms. | `TODO (Pending Reimplementation)` |
+| **Tier 1: Subsystem Microbenchmarks** | WASM Mapping Overhead | [`mapfn`](../mapfn/README.md) | 256-leaf tile batch execution (`map_bundle`); linear memory pack-and-wipe; host SIMD SHA-256 preimage extraction; Wazero compilation mode. | Boundary crossing CPU overhead < 1% total CPU; >= 50,000 leaves/s per CPU core. | `TODO (Pending Reimplementation)` |
+| **Tier 1: Subsystem Microbenchmarks** | MPT Commit Duration | [`internal/tree`](../internal/tree/README.md) | Binary Sparse Merkle Patricia Trie path mutation; lock-free root prediction (`mpt.Predict`); 4,096-leaf mutation batch commit. | Root prediction < 10 ms for 4K leaves; exclusive lock duration (`treeMu.Lock()`) < 5 ms. | `TODO (Pending Reimplementation)` |
+| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | `TODO (Pending Reimplementation)` |
+| **Tier 2: End-to-End Ingestion Pipelines** | Certificate Transparency (High-Fanout 1-to-N) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream Certificate Transparency log tiles; X.509 ASN.1 certificate parsing; 1-to-N mapping (15 to 50 SAN domains per cert); heavy chunk roll-overs. | >= 40,000 certs/s (~600,000 index updates/s); 33-byte prefix Bloom filter seek efficiency >= 99%. | `TODO (Pending Reimplementation)` |
+| **Tier 3: Query Serving Under Active Load** | Point Lookup Latency (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Single-chunk lookup (`GET /vindex/v1/lookup/{keyhash}`) under 100% active ingestion write load; client verifies checkpoint, MPT proof, and mini-log. | Median (P50) < 1.0 ms; Tail (P99) < 15.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
+| **Tier 3: Query Serving Under Active Load** | High-Fanout Paged Lookup (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Backward pagination (`before=X`) across multi-chunk historical records (> 65,536 entries per key) under concurrent ingestion compaction load. | Median (P50) < 5.0 ms; Tail (P99) < 75.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
+| **Tier 3: Query Serving Under Active Load** | Max Read Concurrency QPS | [`internal/server`](../internal/server/README.md) | Query saturation test with concurrent HTTP workers querying static committed checkpoint across 24 cores over loopback. | >= 10,000 QPS per single node process; sub-5ms P50 latency. | `TODO (Pending Reimplementation)` |
+| **Tier 4: Crash Recovery** | Warm Restart Time-to-First-Serve | [`internal/coordinator`](../internal/coordinator/README.md) | Clean process shutdown where MPT persisted size matches Output Log checkpoint size (`mptPersistedSize == S_OUT`); verify and start HTTP server. | Time-to-first-serve < 5.0 ms; zero tile replays or index rebuilds required. | `TODO (Pending Reimplementation)` |
+| **Tier 4: Crash Recovery** | Dirty Crash Fast-Forward Replay | [`internal/coordinator`](../internal/coordinator/README.md) | Abrupt `SIGKILL` mid-batch; restart engine; replay uncommitted tiles from durable local cache; verify MPT subroots and ratchet state. | Time-to-first-serve < 500.0 ms; zero data loss; zero upstream network re-fetches. | `TODO (Pending Reimplementation)` |
 
 ---
 
-## 2. Production End-to-End Workload Results
+## 3. Test Methodology & Execution Procedures
 
-### 2.1 Full Go SumDB Ingestion & Verification
-This benchmark evaluated end-to-end ingestion, indexing, state commitment, and cryptographic verification of the entire public Go Module Checksum Database (`sum.golang.org`):
+### 3.1 Subsystem Microbenchmark Harnesses
 
-#### Live Remote CDN Ingest:
-- **Total Input Leaves**: 60,965,405 leaves (100% of live Go SumDB)
-- **Total Ingestion Duration**: **8m 54s (534s)**
-- **Average Ingestion Throughput**: **~114,167 leaves/sec** (peaked at ~170,000 leaves/sec)
-- **CPU Utilization**: ~220–230% across parallel tile fetch and map worker pool
-- **Storage Footprint on Disk**:
-  - Inverted Chunk DB (Pebble): **345 MB**
-  - MPT Storage (`mmap` working files): **~1.1 GB**
+#### A. Inverted KV Storage Benchmark (`internal/kvstore`)
+Tests the ingestion and lookup performance of the Pebble-backed inverted index without WASM or MPT overhead:
 
-#### Local File Mirror Ingest:
-- **Total Input Leaves**: 54,345,728 leaves
-- **Total Ingestion Duration**: **3m 46s (226s)**
-- **Average Ingestion Throughput**: **240,467 leaves/sec**
-- **Bottleneck**: Saturated local NVMe sequential write bandwidth; zero FFI or lock contention bottlenecks.
+```bash
+# Run raw KV inverted storage benchmarks with bitwise chunk inversion
+go test -v -benchmem -run=^$ \
+  -bench=^BenchmarkInvertedStorage \
+  ./vindex/v1/internal/kvstore/...
+```
 
-### 2.2 Certificate Transparency (High-Fanout Stress Test)
-Evaluated mapping certificates with 1-to-N fanout (average 15 SAN domains per certificate):
-- **Write Throughput**: Sustained ~85,000 leaves/sec (~1,275,000 index updates/sec into Pebble DB).
-- **Compaction Behavior**: 33-byte prefix Bloom filters eliminated read amplification during active chunk location.
-- **P99 Read Latency**: Maintained at **62.2ms** during peak ingestion.
+Parameters evaluated:
+- Write throughput across uniform random 32-byte keyhashes versus skewed key distributions.
+- Seek latency when finding the most recent chunk (`'c' + KeyHash + 0x00...`) using the 33-byte prefix Bloom filter.
+- Impact of chunk rollovers at the 65,536-entry boundary with 16-bit relative index encoding.
 
-### 2.3 Concurrent Read-Write Latency Profile
-Measured read query latency for `GET /vindex/lookup/{keyhash}` under full ingestion write load:
+#### B. WASM Mapping Engine Harness (`cmd/vindex-wasm`)
+Measures the pure execution latency and memory allocation overhead of guest WASM plugins:
 
-| Metric | Production Result | Baseline WAL Architecture | Change |
-| :--- | :--- | :--- | :--- |
-| **P50 Latency (Median)** | **0.780 ms** | 1.540 ms | **50% faster** |
-| **P90 Latency** | **2.140 ms** | 14.200 ms | **85% faster** |
-| **P99 Latency (1-to-1)** | **11.343 ms** | 1,214.000 ms | **99% tail reduction** |
-| **P99 Latency (1-to-N Fanout)** | **62.218 ms** | 847.800 ms | **93% tail reduction** |
+```bash
+# Benchmark WASM plugin bundle execution and memory arena reset
+vindex-wasm bench \
+  --plugin=./vindex/v1/mapfn/examples/sumdb/plugin.wasm \
+  --bundle_size=256 \
+  --iterations=10000 \
+  --simd=true
+```
 
-Under the baseline WAL architecture, periodic LSM level compactions caused severe disk stalls, pushing P99 read latency beyond 1.2 seconds. The Zero-WAL direct inverted commit pipeline eliminates intermediate compaction debt, keeping P99 tail latency under 12ms for 1-to-1 keys.
+Parameters evaluated:
+- FFI boundary transitions per 256-leaf tile bundle (target: <= 3 FFI calls per tile).
+- Host SIMD SHA-256 offload latency versus software in-guest hashing.
+- Memory allocation rate within the guest linear memory arena (`pack-and-wipe` lifecycle).
 
-### 2.4 Time-to-First-Serve Crash Recovery
-Tested recovery latency across clean and dirty shutdown scenarios:
-- **Clean Restart (Phase 1 Instant Warm Start)**: **2.4 ms**. The coordinator verifies `mptPersistedSize == S_OUT` and opens the HTTP read server immediately.
-- **Dirty Hard Kill (Phase 2 Fast-Forward Replay)**: **< 480 ms**. The coordinator replays un-synced tiles from the local disk cache, queries `store.GetSubRoot` to rebuild in-memory MPT nodes, asserts root equality, and opens the read server in under 500 milliseconds with zero network requests.
+#### C. MPT Tree Commitment Benchmark (`internal/tree`)
+Evaluates Sparse Merkle Patricia Trie path mutations and root calculation:
 
----
+```bash
+# Benchmark lock-free root prediction and tree commitment
+go test -v -benchmem -run=^$ \
+  -bench=^BenchmarkMPTCommit \
+  ./vindex/v1/internal/tree/...
+```
 
-## 3. Empirical Architectural Comparisons
-
-### 3.1 Zero-WAL Direct Commit vs. Intermediate WAL ('w' Prefix & WalReaper)
-- **Baseline Architecture**: Staged mapped key-index updates under a temporary `'w'` prefix in Pebble DB. An asynchronous background goroutine (`WalReaper`) read `'w'` records, aggregated them, and wrote them to inverted chunk records (`'c'`).
-- **Telemetry Findings**:
-  1. **Double-Write Amplification**: Every entry was written twice to disk, doubling NVMe write bandwidth consumption.
-  2. **Compaction Stalls**: Staging churn generated excessive small SSTable files, overwhelming Pebble's background compactor and causing periodic 1.2-second write/read stalls.
-  3. **Storage Bloat**: Temporary WAL records accumulated up to 1.2 GB of disk space during catch-up before the reaper could process them.
-- **Production Zero-WAL Impact**: Direct commits reduced Pebble disk footprint from 1.2 GB to **9.91 MB** during tests and slashed P99 read latency from 1,214ms to **11.3ms**.
-
-### 3.2 Bundled FFI (`map_bundle`) vs. Per-Leaf FFI (`map_leaf`)
-- **Baseline Architecture**: Invoked an exported guest function `map_leaf(ptr, len)` individually for every log leaf.
-- **Telemetry Findings**:
-  - Processing a 256-leaf tile generated 768 FFI calls (`alloc` + `map_leaf` + `reset` x 256).
-  - CPU profiling revealed that **~23% of total host CPU time** was consumed purely by boundary crossing overhead.
-- **Production `map_bundle` Impact**: Passing all 256 leaves in a single contiguous memory slab reduced FFI crossings to 2–3 per tile, dropping FFI CPU overhead to **< 1%**.
-
-### 3.3 Host Hardware SIMD Cryptography vs. In-Guest Software Crypto
-- **Baseline Architecture**: Compiled SHA-256 cryptographic hashing libraries directly into the guest WebAssembly bytecode.
-- **Telemetry Findings**:
-  - Software bitwise hashing inside WebAssembly bytecode consumed **~55% of all CPU cycles** during the mapping phase due to the lack of hardware vector instructions.
-- **Production Host SIMD Impact**: Having the guest emit raw canonical string preimages and delegating hashing to the Go host runtime (backed by x86 SHA-NI / ARMv8 Crypto instructions) completely eliminated the 55% WASM CPU bottleneck.
-
-### 3.4 Normal Serving Mode vs. Retired Backfill Mode
-A dedicated bulk ingestion mode ("Backfill Mode") was evaluated on the full 61.7M-leaf Go SumDB dataset to test whether bypassing root prediction would accelerate genesis catch-up:
-
-| Evaluation Metric | Normal Serving Mode (Production) | Backfill Mode (Retired) | Empirical Advantage |
-| :--- | :--- | :--- | :--- |
-| **Ingestion Throughput** | **90,797 leaves/sec** | 49,064 leaves/sec | **Normal Mode is 85.1% Faster** |
-| **Read Availability** | **100% Available** (P50 < 2ms) | **0% Available** (100% Starvation) | Full query availability during catch-up |
-| **RAM Footprint (RSS)** | ~220 MB | ~195 MB | Statistically negligible (~25 MB) |
-| **Code Surface** | Unified single-pipeline | Split dual-pipeline | Eliminates redundant ingestion code |
-
-*Conclusion*: Normal Serving Mode was 85.1% faster because streaming leaf bundles and batching storage updates amortized overhead efficiently, while Backfill Mode's un-batched in-memory trie mutations throttled ingestion while completely starving HTTP readers. Backfill Mode was permanently retired in favor of unified normal serving mode catch-up.
-
-### 3.5 Pebble Storage Layouts (`pebble-tests` Suite)
-Benchmarks from [github.com/mhutchinson/pebble-tests](https://github.com/mhutchinson/pebble-tests) across 20M entries demonstrated the superiority of bitwise key inversion (`^chunkNum`) over forward chronological ordering:
-
-| Workload Mode (1M Entries) | Engine | Write Throughput | Write Latency (p50) | Write Latency (p99) |
-| :--- | :--- | :---: | :---: | :---: |
-| **Mode A** *(10 hot keys)* | `chunk_scan` | 190,912 QPS | 2.93 ms | 103.78 ms |
-| | **`inverted_prefix_chunk_scan`** | 175,523 QPS | 3.37 ms | 107.45 ms |
-| **Mode B** *(1M sparse keys)* | `chunk_scan` | 27,923 QPS | 35.96 ms | 105.03 ms |
-| | **`inverted_prefix_chunk_scan`** | **41,431 QPS (+48.4%)** | **23.73 ms** | **45.97 ms** |
-| **Mode C** *(100k mixed keys)* | `chunk_scan` | 40,144 QPS | 21.83 ms | 85.38 ms |
-| | **`inverted_prefix_chunk_scan`** | **64,446 QPS (+60.5%)** | **13.66 ms** | **66.60 ms** |
+Parameters evaluated:
+- Duration of speculative root calculation (`mpt.Predict`) across 1,024, 2,048, and 4,096 leaf mutation batches.
+- Critical section duration during write lock acquisition (`treeMu.Lock()`) when swapping the active serving root pointer.
 
 ---
 
-## 4. Operational Sizing & Capacity Planning Guide
+### 3.2 End-to-End Pipeline & Stress Testing (`hammer`)
 
-Based on production telemetry across real-world logs, hardware capacity requirements scale predictably with unique key cardinality:
+The primary harness for Tier 2 (Ingestion), Tier 3 (Serving under load), and Tier 4 (Recovery) is the [`vindex-hammer`](../hammer/README.md) crash test rig.
 
-| Scale (Unique Keys) | Inverted Chunk DB (Pebble) | MPT Storage (`mmap`) | Recommended System RAM | Target Hardware Spec |
-| :--- | :--- | :--- | :--- | :--- |
-| **Small (10M)** | ~1 GB | ~1.04 GB | 8 GB | 2-4 vCPU, 8 GB RAM, NVMe |
-| **Medium (100M)** | ~10 GB | ~10.4 GB | 64 GB | 8-16 vCPU, 64 GB RAM, NVMe |
-| **Large (1B)** | ~100 GB | ~104 GB | 256 GB | 16-32 vCPU, 256 GB RAM, Dual NVMe |
-| **Very Large (2B)** | ~200 GB | ~208 GB | 512+ GB | 32-64 vCPU, 512 GB RAM, Dual NVMe |
+#### A. Synthetic Workload Generation (Zipfian Distribution)
+Real package ecosystems and certificate transparency logs exhibit heavy key skew, where a small fraction of popular keys receive a majority of entries. To model this, the hammer generator implements a power-law Zipfian distribution:
 
-### Key Capacity Planning Rules:
-1. **MPT RAM Residency**: While leaf payloads reside in `mmap` files, uniform 32-byte key hash distribution scatters lookups across trie branch nodes. Ensure sufficient host RAM to cache active branch levels.
-2. **Dual NVMe Physical Separation**: For high-velocity logs (>50,000 writes/sec), deploy Pebble DB on NVMe Disk A and MPT working files on NVMe Disk B to prevent compaction I/O contention.
+- **Skew Parameter**: `s = 1.2` (models heavy Pareto tail).
+- **Target Key Space**: 10,000 unique keys across 1,000,000 generated leaves.
+- **Stress Vector**: Forces hot keys across multiple 65,536-entry chunk boundaries (`^0 -> ^1 -> ^2`), validating chunk splitting, reverse chronological ordering, and SSTable compaction under maximum write amplification.
+
+```bash
+# Start the vindex-hammer upstream producer with Zipfian skew and drip scheduling
+vindex-hammer \
+  --mode=producer \
+  --listen=127.0.0.1:8085 \
+  --num_leaves=1000000 \
+  --zipf_s=1.2 \
+  --drip_rate=20 \
+  --checkpoint_interval=1000
+```
+
+#### B. Concurrent Ingestion and Verification Runner
+While `vindexd` ingests from the hammer upstream producer, a pool of concurrent client workers issues verifying queries against `vindexd`:
+
+```bash
+# Start vindexd pointing to the hammer producer
+vindexd \
+  --input_log_url=http://127.0.0.1:8085 \
+  --db_dir=/tmp/vindex-bench/db \
+  --tile_dir=/tmp/vindex-bench/tiles \
+  --listen=127.0.0.1:8088 \
+  --wasm_plugin=./vindex/v1/mapfn/examples/sumdb/plugin.wasm
+
+# Launch verifying read hammer against vindexd
+vindex-hammer \
+  --mode=reader \
+  --vindex_url=http://127.0.0.1:8088 \
+  --read_qps=500 \
+  --read_workers=24 \
+  --verify_proofs=true \
+  --assert_monotonic=true
+```
+
+#### C. Invariant Assertion Rules
+The reader worker pool enforces zero-tolerance correctness invariants on 100% of read queries:
+1. **Cryptographic Proof Validity**: Every Output Log checkpoint signature, Merkle inclusion proof, MPT inclusion/non-inclusion proof, and RFC 6962 compact range root must verify cleanly using [`client.Verifier`](../client/README.md).
+2. **Monotonic History Invariant**: For subsequent queries on the same key where `S_new >= S_old`, the returned index set `I_new` must be a strict superset of `I_old`, with an identical historical prefix:
+   ```text
+   I_new[0 : len(I_old)] == I_old
+   ```
+3. **Zero Read Starvation**: Point lookup latency must not drop requests or exceed timeouts during peak LSM compaction or tile commit cycles.
+
+---
+
+### 3.3 Real-World Ecosystem Dataset Evaluation
+
+In addition to synthetic workloads, the benchmark suite evaluates complete mirrors of production transparency logs:
+
+#### A. Go SumDB Mirror Dataset
+- **Workload Type**: Low-fanout 1-to-1 key mapping (module path to version record).
+- **Dataset Size**: Full mirror of `sum.golang.org` (> 54 million leaves, ~15 GB tile mirror).
+- **Execution Command**:
+  ```bash
+  # Execute full-scale oneshot ingestion benchmark on local Go SumDB mirror
+  sumdbindex \
+    --input_log_dir=/path/to/sumdb/mirror \
+    --db_dir=/tmp/vindex-sumdb/db \
+    --wasm_plugin=./vindex/v1/mapfn/examples/sumdb/plugin.wasm \
+    --oneshot=true
+  ```
+
+#### B. Certificate Transparency Mirror Dataset
+- **Workload Type**: High-fanout 1-to-N mapping (X.509 certificate to 15-50 SAN domains).
+- **Dataset Size**: Mirror of Certificate Transparency shards (e.g. MTC Shard3, Oak, Argon).
+- **Execution Command**:
+  ```bash
+  # Execute oneshot ingestion benchmark on Certificate Transparency tile mirror
+  mtcindex \
+    --input_log_dir=/path/to/ct/mirror \
+    --db_dir=/tmp/vindex-ct/db \
+    --wasm_plugin=./vindex/v1/mapfn/examples/ct/plugin.wasm \
+    --oneshot=true
+  ```
+
+---
+
+## 4. Reporting & Verification Requirements
+
+When executing benchmark runs to populate the Standard Benchmark Matrix:
+
+1. **Hardware Telemetry**: All benchmark reports must capture CPU model, core frequency, RAM capacity, NVMe model, kernel version, and Go runtime version (`go version`).
+2. **Resource Accounting**: Measurements must report wall duration, user CPU time, system CPU time, average CPU utilization percentage, peak Resident Set Size (RSS) captured via `/usr/bin/time -v`, and final on-disk database footprint.
+3. **Latency Percentiles**: Read query latency must report distribution percentiles (P50, P90, P99, Max) computed from a minimum of 100,000 executed client requests under active write load.
+4. **Zero-Failure Gate**: Any run encountering an invariant violation, cryptographic proof mismatch, or unhandled panics is marked invalid and fails the evaluation gate.

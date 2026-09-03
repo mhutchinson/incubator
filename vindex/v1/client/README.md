@@ -22,7 +22,7 @@ The client SDK functions like a bank customer verifying an itemized transaction 
 - **Goals**:
   - Provide a lightweight, zero-dependency public Go package (`vindex/v1/client`) usable by external applications, CLIs, and monitoring services.
   - Implement strict cryptographic verification for all query responses (`/vindex/v1/lookup/{keyhash}` and `/vindex/v1/checkpoint`).
-  - Verify Output Log checkpoint note signatures against configured witness public keys.
+  - Verify Output Log checkpoint note signatures and witness cosignatures against a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`).
   - Verify Output Log Merkle inclusion proofs for the committed `MapRoot`.
   - Verify MPT inclusion and non-inclusion proofs for requested 32-byte key hashes.
   - Reconstruct and assert RFC 6962 compact ranges for mini-log sub-roots against returned occurrence indices.
@@ -56,14 +56,14 @@ For every lookup request, the client SDK executes the following deterministic 5-
 
 | Step | Phase | Operations | Mathematical Assertion |
 | :--- | :--- | :--- | :--- |
-| **1** | **Checkpoint Authentication** | Verifies note format and cryptographic signatures on the Output Log checkpoint. | Number of valid witness cosignatures >= configured threshold `MinWitnessSignatures`. |
+| **1** | **Checkpoint Authentication** | Verifies note format and cryptographic signatures on the Output Log checkpoint. | Enforces origin verification and witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). |
 | **2** | **Output Log Merkle Proof** | Verifies the Merkle inclusion proof committing `MapRoot` into the Output Log. | `proof.VerifyInclusion(OutputTreeSize, LeafIndex, MapRootCommitment) == OutputTreeRoot`. |
 | **3** | **MPT Proof Verification** | Evaluates the bitwise Sparse Merkle Tree path traversal against `MapRoot`. | **Inclusion**: Proves `SubRoot` exists at `KeyHash`.<br>**Non-Inclusion**: Proves path terminates in empty node or mismatched prefix. |
 | **4** | **Mini-Log Compact Range** | Reconstructs RFC 6962 compact range from returned leaf indices and prefix compact range. | `CompactRange.GetRootHash() == SubRoot`. |
 | **5** | **Monotonic History Check** | When evaluating consecutive queries on key K where S_new >= S_old: | `I_new[:len(I_old)] == I_old` (historical indices cannot mutate or disappear). |
 
 #### Step Details:
-1. **Checkpoint Authentication**: Fetches and parses the checkpoint note. Asserts that the origin string matches expectations and verifies cryptographic signatures against the configured trusted witness keys.
+1. **Checkpoint Authentication**: Fetches and parses the checkpoint note. Asserts that the origin string matches expectations and enforces witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note fails to satisfy the witness quorum or origin requirements defined by the policy, it is rejected immediately (`ErrUntrustedCheckpoint`).
 2. **Output Log Merkle Inclusion**: Parses the inclusion proof for the Output Log leaf containing the state commitment. Recomputes the audit path and asserts equality with the authenticated Output Log root.
 3. **Sparse Merkle Tree Verification**: Evaluates the 256-bit path for the 32-byte key hash:
    - For an **inclusion proof**, asserts that hashing up the provided sibling nodes reproduces the committed `MapRoot`, proving that the returned `SubRoot` is authentically bound to the key.
@@ -113,7 +113,7 @@ When a key has more occurrence records than fit in a single response (or when pa
 
 | Error Code | Root Cause | Client Action |
 | :--- | :--- | :--- |
-| `ErrUntrustedCheckpoint` | Checkpoint note missing required witness signatures or invalid origin. | Reject response immediately; abort query. |
+| `ErrUntrustedCheckpoint` | Checkpoint note fails witness quorum or origin requirements of configured `tlog-policy`. | Reject response immediately; abort query. |
 | `ErrOutputInclusionFailed` | Output Log Merkle inclusion proof does not evaluate to the checkpoint root. | Security alert; abort query (possible server equivocation). |
 | `ErrMPTProofInvalid` | Sparse Merkle Tree bitwise path does not match the committed `MapRoot`. | Security alert; abort query (server attempted to forge trie state). |
 | `ErrSubRootMismatch` | Reconstructed compact range does not match the verified `SubRoot`. | Security alert; abort query (server altered or truncated occurrences). |
@@ -128,14 +128,15 @@ The client library provides a stateless query interface implementing strict zero
   - VIndex service URL.
   - 32-byte search key hash (`KeyHash = SHA256(ClaimSubject)`).
   - Input Log verifier.
-  - Output Log verifier.
+  - Output Log verifier and witness policy: configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`) enforcing witness cosignature quorum.
   - Optional `before` pagination cursor.
   - Optional `limit`.
 - **Outputs**:
   - Ordered list of uint64 Input Log occurrence indices.
   - Raw signed Input Log checkpoint.
 - **Guarantees**:
-  - Client unconditionally rejects unverified or cryptographically inconsistent responses. Any invalid checkpoint signature, Merkle inclusion proof failure, trie path defect, or compact range mismatch triggers an immediate verification error.
+  - Output Log checkpoint verification enforces witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`).
+  - Client unconditionally rejects unverified or cryptographically inconsistent responses. Any invalid checkpoint signature, witness quorum failure, Merkle inclusion proof failure, trie path defect, or compact range mismatch triggers an immediate verification error.
 
 ---
 

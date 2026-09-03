@@ -184,7 +184,9 @@ The WASM `MapFn` extracts the 32-byte public key hash directly from the fixed bi
 
 ---
 
-## 3. Forward Compatibility: Prefix-Trie & Subtree Indexing
+## 3. Future Work (Non-v1 Scope): Prefix-Trie & Subtree Indexing
+
+> **Note**: VIndex v1 implements exact 32-byte point lookups exclusively. Subdomain discovery and organizational namespace prefix searches are unreleased forward-compatibility design concepts, not supported query operations in v1.
 
 While VIndex v1 provides point lookups by exact 32-byte key hashes, preserving raw canonical Claim Subject preimages across the `map_bundle` guest-host boundary provides critical forward compatibility for future search extensions:
 
