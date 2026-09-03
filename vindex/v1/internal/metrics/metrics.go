@@ -149,4 +149,37 @@ var (
 		Name: "vindex_mpt_mmap_bytes",
 		Help: "Virtual memory size of the MPT mmap allocation.",
 	})
+
+	// Independent Verifier / Auditor Metrics
+	VerifierRootMismatchesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "vindex_verifier_root_mismatches_total",
+		Help: "Cumulative number of detected root hash mismatches between local MPT calculation and OutputLog leaf commitments.",
+	})
+
+	VerifierRootMismatch = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "vindex_verifier_root_mismatch",
+		Help: "Current root mismatch status (0 = no mismatch / healthy, 1 = root mismatch detected).",
+	})
 )
+
+// RecordVerifierRootMismatch records a root hash mismatch event by incrementing
+// VerifierRootMismatchesTotal and setting VerifierRootMismatch to 1.
+func RecordVerifierRootMismatch() {
+	VerifierRootMismatchesTotal.Inc()
+	VerifierRootMismatch.Set(1)
+}
+
+// ResetVerifierRootMismatch resets the VerifierRootMismatch gauge to 0 (healthy).
+// Primarily used during verifier initialization and test setup.
+func ResetVerifierRootMismatch() {
+	VerifierRootMismatch.Set(0)
+}
+
+// SetVerifierRootMismatch sets the VerifierRootMismatch gauge based on the provided boolean flag.
+func SetVerifierRootMismatch(mismatched bool) {
+	if mismatched {
+		VerifierRootMismatch.Set(1)
+	} else {
+		VerifierRootMismatch.Set(0)
+	}
+}
