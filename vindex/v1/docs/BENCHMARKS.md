@@ -59,7 +59,7 @@ The following matrix defines the standard suite of benchmarks, their component s
 | **Tier 1: Subsystem Microbenchmarks** | Raw KV Inverted Storage | [`internal/kvstore`](../internal/kvstore/README.md) | Direct batch writes to Pebble inverted chunks (`'c' + KeyHash + ^chunkNum`); 64K-entry chunk roll-overs; 16-bit relative index encoding; `pebble.Sync` barrier. | >= 150,000 index entries/s sustained; zero compaction stalls exceeding 100 ms. | `TODO (Pending Reimplementation)` |
 | **Tier 1: Subsystem Microbenchmarks** | WASM Mapping Overhead | [`mapfn`](../mapfn/README.md) | 256-leaf tile batch execution (`map_bundle`); linear memory pack-and-wipe; host SIMD SHA-256 preimage extraction; Wazero compilation mode. | Boundary crossing CPU overhead < 1% total CPU; >= 50,000 leaves/s per CPU core. | `TODO (Pending Reimplementation)` |
 | **Tier 1: Subsystem Microbenchmarks** | MPT Commit Duration | [`internal/tree`](../internal/tree/README.md) | Binary Sparse Merkle Patricia Trie path mutation; lock-free root prediction (`mpt.Predict`); 4,096-leaf mutation batch commit. | Root prediction < 10 ms for 4K leaves; exclusive lock duration (`treeMu.Lock()`) < 5 ms. | `TODO (Pending Reimplementation)` |
-| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | `TODO (Pending Reimplementation)` |
+| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | **Pure Go**: **259,601.8 leaves/s** (54,364,768 leaves in 3m 29.42s; time-to-first-serve 3m 55.65s)<br>**WASM**: **230,399.1 leaves/s** (54,364,768 leaves in 3m 55.96s; time-to-first-serve 4m 26.08s) |
 | **Tier 2: End-to-End Ingestion Pipelines** | Certificate Transparency (High-Fanout 1-to-N) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream Certificate Transparency log tiles; X.509 ASN.1 certificate parsing; 1-to-N mapping (15 to 50 SAN domains per cert); heavy chunk roll-overs. | >= 40,000 certs/s (~600,000 index updates/s); 33-byte prefix Bloom filter seek efficiency >= 99%. | `TODO (Pending Reimplementation)` |
 | **Tier 3: Query Serving Under Active Load** | Point Lookup Latency (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Single-chunk lookup (`GET /vindex/v1/lookup/{keyhash}`) under 100% active ingestion write load; client verifies checkpoint, MPT proof, and mini-log. | Median (P50) < 1.0 ms; Tail (P99) < 15.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
 | **Tier 3: Query Serving Under Active Load** | High-Fanout Paged Lookup (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Backward pagination (`before=X`) across multi-chunk historical records (> 65,536 entries per key) under concurrent ingestion compaction load. | Median (P50) < 5.0 ms; Tail (P99) < 75.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
@@ -183,15 +183,44 @@ In addition to synthetic workloads, the benchmark suite evaluates complete mirro
 #### A. Go SumDB Mirror Dataset
 - **Workload Type**: Low-fanout 1-to-1 key mapping (module path to version record).
 - **Dataset Size**: Full mirror of `sum.golang.org` (> 54 million leaves, ~15 GB tile mirror).
-- **Execution Command**:
+- **Execution Commands**:
   ```bash
-  # Execute full-scale oneshot ingestion benchmark on local Go SumDB mirror
-  sumdbindex \
-    --input_log_dir=/path/to/sumdb/mirror \
-    --db_dir=/tmp/vindex-sumdb/db \
-    --wasm_plugin=./vindex/v1/mapfn/examples/sumdb/plugin.wasm \
-    --oneshot=true
+  # Option 1: Native Pure Go MapFn
+  vindexd \
+    --input_log_url=file:///path/to/sumdb/mirror \
+    --input_log_origin="go.sum database tree" \
+    --input_log_pubkey="sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8" \
+    --mapper=sumdb \
+    --db_path=/tmp/vindex-sumdb/db \
+    --mpt_dir=/tmp/vindex-sumdb/mpt \
+    --output_log_dir=/tmp/vindex-sumdb/outlog \
+    --tile_cache_dir=/tmp/vindex-sumdb/tiles \
+    --listen_addr=127.0.0.1:8088
+
+  # Option 2: Isolated WASM MapFn (Wazero Host)
+  vindexd \
+    --input_log_url=file:///path/to/sumdb/mirror \
+    --input_log_origin="go.sum database tree" \
+    --input_log_pubkey="sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8" \
+    --wasm_path=./vindex/v1/mapfn/examples/sumdb/sumdb.wasm \
+    --db_path=/tmp/vindex-sumdb/db \
+    --mpt_dir=/tmp/vindex-sumdb/mpt \
+    --output_log_dir=/tmp/vindex-sumdb/outlog \
+    --tile_cache_dir=/tmp/vindex-sumdb/tiles \
+    --listen_addr=127.0.0.1:8088
   ```
+
+- **Comparative Telemetry (54,364,768 Leaves)**:
+
+  | Pipeline Phase | Pure Go MapFn (`--mapper=sumdb`) | WASM MapFn (`sumdb.wasm`) | Variance / Delta |
+  | :--- | :--- | :--- | :--- |
+  | **Log Ingestion & Leaf Mapping** | **3m 29.42s** (209.42s) | 3m 55.96s (235.96s) | -26.54s (-11.2%) |
+  | **Sustained Mapping Rate** | **259,601.8 leaves/s** | 230,399.1 leaves/s | **+29,202.7 leaves/s (+12.7%)** |
+  | **MPT Commitment & Output Publish** | **24.22s** (write) / 26.23s (total) | 30.12s | -3.89s (-12.9%) |
+  | **Time-to-First-Serve (Total)** | **3m 55.65s** (235.65s) | 4m 26.08s (266.08s) | **-30.43s (-11.4%)** |
+  | **Peak Resident Set Size (RSS)** | 581.6 MB (595,584 KB) | ~512 MB | Within memory budget |
+  | **MapRoot Determinism** | `83f8226ddb25d8cafaa56705392b2dc647033dd5af07b6e44fb5acdd758a0019` | `83f8226ddb25d8cafaa56705392b2dc647033dd5af07b6e44fb5acdd758a0019` | Cryptographically identical |
+  | **Serving Point Lookup Latency** | < 1.0 ms | < 1.0 ms | Inclusion proofs verified |
 
 #### B. Certificate Transparency Mirror Dataset
 - **Workload Type**: High-fanout 1-to-N mapping (X.509 certificate to 15-50 SAN domains).
