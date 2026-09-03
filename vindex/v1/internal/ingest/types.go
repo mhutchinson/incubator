@@ -65,6 +65,12 @@ type BundleMapper interface {
 	MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEntry, error)
 }
 
+// RunnerProvider is an optional optimization interface for LeafMappers that can furnish dedicated runners per worker.
+type RunnerProvider interface {
+	LeafMapper
+	NewRunner(ctx context.Context) (LeafMapper, error)
+}
+
 
 // Merge combines another MappedBatch into this one.
 func (b *MappedBatch) Merge(other *MappedBatch) {

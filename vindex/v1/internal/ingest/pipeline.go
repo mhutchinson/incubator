@@ -183,6 +183,26 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 		mapWg.Add(1)
 		go func() {
 			defer mapWg.Done()
+
+			workerMapper := p.mapper
+			if host, ok := p.mapper.(*WASMHost); ok {
+				runner, err := host.NewRunner(pipeCtx)
+				if err != nil {
+					recordError(fmt.Errorf("failed to create worker wasm runner: %w", err))
+					return
+				}
+				defer func() { _ = runner.Close(context.Background()) }()
+				workerMapper = runner
+			} else if rp, ok := p.mapper.(RunnerProvider); ok {
+				runner, err := rp.NewRunner(pipeCtx)
+				if err != nil {
+					recordError(fmt.Errorf("failed to create worker runner: %w", err))
+					return
+				}
+				defer func() { _ = runner.Close(context.Background()) }()
+				workerMapper = runner
+			}
+
 			for bundle := range leafBundleChan {
 				select {
 				case <-pipeCtx.Done():
@@ -216,7 +236,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 
 				subLeaves := bundle.Leaves[startIdx-bundle.StartLeafIdx : endIdx-bundle.StartLeafIdx]
 
-				if bm, ok := p.mapper.(BundleMapper); ok {
+				if bm, ok := workerMapper.(BundleMapper); ok {
 					bundleResults, err := bm.MapBundle(bundleCtx, subLeaves)
 					if err != nil {
 						metrics.MapErrorsTotal.WithLabelValues("HALT").Inc()
@@ -231,17 +251,31 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 							numLeavesMapped++
 							totalKeysGenerated += len(entries)
 
-							var keys [][32]byte
-							for _, e := range entries {
-								keys = append(keys, e.KeyHash)
+							isSortedUnique := true
+							for k := 1; k < len(entries); k++ {
+								if bytes.Compare(entries[k-1].KeyHash[:], entries[k].KeyHash[:]) >= 0 {
+									isSortedUnique = false
+									break
+								}
 							}
-							slices.SortFunc(keys, func(a, b [32]byte) int {
-								return bytes.Compare(a[:], b[:])
-							})
-							keys = slices.Compact(keys)
 
-							for _, k := range keys {
-								keyMap[k] = append(keyMap[k], leafIdx)
+							if isSortedUnique {
+								for _, e := range entries {
+									keyMap[e.KeyHash] = append(keyMap[e.KeyHash], leafIdx)
+								}
+							} else {
+								var keys [][32]byte
+								for _, e := range entries {
+									keys = append(keys, e.KeyHash)
+								}
+								slices.SortFunc(keys, func(a, b [32]byte) int {
+									return bytes.Compare(a[:], b[:])
+								})
+								keys = slices.Compact(keys)
+
+								for _, k := range keys {
+									keyMap[k] = append(keyMap[k], leafIdx)
+								}
 							}
 						}
 					}
@@ -251,7 +285,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 						if leafIdx < startIdx || leafIdx >= endIdx {
 							continue
 						}
-						entries, err := p.mapper.MapLeaf(bundleCtx, leaf)
+						entries, err := workerMapper.MapLeaf(bundleCtx, leaf)
 						if err != nil {
 							metrics.MapErrorsTotal.WithLabelValues("HALT").Inc()
 							if bundleCtx.Err() == context.DeadlineExceeded && pipeCtx.Err() == nil {
@@ -264,17 +298,31 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 						numLeavesMapped++
 						totalKeysGenerated += len(entries)
 
-						var keys [][32]byte
-						for _, e := range entries {
-							keys = append(keys, e.KeyHash)
+						isSortedUnique := true
+						for k := 1; k < len(entries); k++ {
+							if bytes.Compare(entries[k-1].KeyHash[:], entries[k].KeyHash[:]) >= 0 {
+								isSortedUnique = false
+								break
+							}
 						}
-						slices.SortFunc(keys, func(a, b [32]byte) int {
-							return bytes.Compare(a[:], b[:])
-						})
-						keys = slices.Compact(keys)
 
-						for _, k := range keys {
-							keyMap[k] = append(keyMap[k], leafIdx)
+						if isSortedUnique {
+							for _, e := range entries {
+								keyMap[e.KeyHash] = append(keyMap[e.KeyHash], leafIdx)
+							}
+						} else {
+							var keys [][32]byte
+							for _, e := range entries {
+								keys = append(keys, e.KeyHash)
+							}
+							slices.SortFunc(keys, func(a, b [32]byte) int {
+								return bytes.Compare(a[:], b[:])
+							})
+							keys = slices.Compact(keys)
+
+							for _, k := range keys {
+								keyMap[k] = append(keyMap[k], leafIdx)
+							}
 						}
 					}
 				}

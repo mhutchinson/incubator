@@ -94,9 +94,20 @@ func runBenchCmd(ctx context.Context, args []string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			runner, err := host.NewRunner(ctx)
+			if err != nil {
+				errMu.Lock()
+				if execErr == nil {
+					execErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+			defer func() { _ = runner.Close(ctx) }()
+
 			for idx := range taskChan {
 				t0 := time.Now()
-				_, err := host.MapLeaf(ctx, inputBytes)
+				_, err := runner.MapLeaf(ctx, inputBytes)
 				d := time.Since(t0)
 				if err != nil {
 					errMu.Lock()

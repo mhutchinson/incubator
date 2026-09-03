@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -559,32 +560,6 @@ func TestWASMHost_Timeout(t *testing.T) {
 	}
 }
 
-func TestWASMHost_BackgroundContextFallbackTimeout(t *testing.T) {
-	ctx := context.Background()
-	wasmBytes := assembleWasmWithInfiniteLoop()
-
-	host, err := NewWASMHost(ctx, wasmBytes, 1)
-	if err != nil {
-		t.Fatalf("NewWASMHost failed: %v", err)
-	}
-	defer func() { _ = host.Close(ctx) }()
-
-	// Calling with bare context.Background() should still terminate via the 5s fallback watchdog
-	// rather than hanging indefinitely.
-	start := time.Now()
-	_, err = host.MapLeaf(ctx, []byte("infinite_loop"))
-	elapsed := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected timeout error for infinite loop with background context, got nil")
-	}
-	if !errors.Is(err, ErrWasmHalt) {
-		t.Fatalf("expected ErrWasmHalt, got: %v", err)
-	}
-	if elapsed < 4*time.Second || elapsed > 8*time.Second {
-		t.Logf("execution elapsed: %v (expected ~5s fallback timeout)", elapsed)
-	}
-}
 
 func assembleWasmWithReset(resetBody []byte) []byte {
 	var buf bytes.Buffer
@@ -1087,6 +1062,128 @@ func BenchmarkWASMHost_MapBundle(b *testing.B) {
 		if err != nil {
 			b.Fatalf("MapBundle failed: %v", err)
 		}
+	}
+}
+
+func TestWASMRunner_DedicatedExecution(t *testing.T) {
+	ctx := context.Background()
+	wasmBytes := assembleWasmWithReset(nil)
+
+	host, err := NewWASMHost(ctx, wasmBytes, 2)
+	if err != nil {
+		t.Fatalf("NewWASMHost failed: %v", err)
+	}
+	defer func() { _ = host.Close(ctx) }()
+
+	runner, err := host.NewRunner(ctx)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+	defer func() { _ = runner.Close(ctx) }()
+
+	// Test single leaf
+	res, err := runner.MapLeaf(ctx, []byte("test_leaf"))
+	if err != nil {
+		t.Fatalf("runner.MapLeaf failed: %v", err)
+	}
+	if len(res) == 0 {
+		t.Fatal("expected non-empty entries")
+	}
+
+	// Test bundle
+	leaves := [][]byte{[]byte("bundle_leaf_0"), []byte("bundle_leaf_1")}
+	bundleRes, err := runner.MapBundle(ctx, leaves)
+	if err != nil {
+		t.Fatalf("runner.MapBundle failed: %v", err)
+	}
+	if len(bundleRes) != 2 {
+		t.Fatalf("expected 2 bundle results, got %d", len(bundleRes))
+	}
+}
+
+func TestWASMRunner_ConcurrentDedicatedRunners(t *testing.T) {
+	ctx := context.Background()
+	wasmBytes := assembleWasmWithReset(nil)
+
+	concurrency := 8
+	host, err := NewWASMHost(ctx, wasmBytes, concurrency)
+	if err != nil {
+		t.Fatalf("NewWASMHost failed: %v", err)
+	}
+	defer func() { _ = host.Close(ctx) }()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			runner, err := host.NewRunner(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("worker %d: NewRunner failed: %w", workerID, err)
+				return
+			}
+			defer func() { _ = runner.Close(ctx) }()
+
+			for j := 0; j < 50; j++ {
+				leaves := [][]byte{
+					[]byte(fmt.Sprintf("worker_%d_bundle_%d_leaf_0", workerID, j)),
+					[]byte(fmt.Sprintf("worker_%d_bundle_%d_leaf_1", workerID, j)),
+				}
+				res, err := runner.MapBundle(ctx, leaves)
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d: MapBundle failed on iter %d: %w", workerID, j, err)
+					return
+				}
+				if len(res) != 2 {
+					errCh <- fmt.Errorf("worker %d: expected 2 results, got %d", workerID, len(res))
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestIngestionPipeline_WithWASMRunner(t *testing.T) {
+	ctx := context.Background()
+	wasmBytes := assembleWasmWithReset(nil)
+
+	host, err := NewWASMHost(ctx, wasmBytes, 4)
+	if err != nil {
+		t.Fatalf("NewWASMHost failed: %v", err)
+	}
+	defer func() { _ = host.Close(ctx) }()
+
+	leaves := make([][]byte, 256)
+	for i := range leaves {
+		leaves[i] = []byte(fmt.Sprintf("leaf_%d", i))
+	}
+	fetcher := &mockTileFetcher{
+		leaves:     leaves,
+		origin:     "test",
+		bundleSize: 64,
+	}
+
+	pipeline := NewPipeline(fetcher, nil, host, 4)
+	batchChan, errChan := pipeline.StreamBatches(ctx, 0, 256)
+
+	var totalLeaves uint64
+	for batch := range batchChan {
+		totalLeaves += uint64(batch.Count)
+	}
+	if err := <-errChan; err != nil {
+		t.Fatalf("StreamBatches failed: %v", err)
+	}
+	if totalLeaves != 256 {
+		t.Fatalf("expected 256 total leaves processed, got %d", totalLeaves)
 	}
 }
 

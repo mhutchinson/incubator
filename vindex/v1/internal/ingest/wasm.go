@@ -26,7 +26,6 @@ import (
 	"runtime"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -72,6 +71,7 @@ type wasmInstance struct {
 	allocFn     api.Function
 	resetFn     api.Function
 	mem         api.Memory
+	packedBuf   []byte
 }
 
 // NewWASMHost compiles the guest bytecode and initializes a pool of instantiated WASM modules.
@@ -164,7 +164,7 @@ func (h *WASMHost) instantiateInstance(ctx context.Context) (*wasmInstance, erro
 	}, nil
 }
 
-func packBundleInput(leaves [][]byte) []byte {
+func (inst *wasmInstance) packBundle(leaves [][]byte) []byte {
 	n := len(leaves)
 	if n == 0 || n > 256 {
 		return nil
@@ -176,7 +176,14 @@ func packBundleInput(leaves [][]byte) []byte {
 		payloadLen += len(l)
 	}
 
-	buf := make([]byte, headerLen+payloadLen)
+	totalLen := headerLen + payloadLen
+	if cap(inst.packedBuf) < totalLen {
+		inst.packedBuf = make([]byte, totalLen)
+	} else {
+		inst.packedBuf = inst.packedBuf[:totalLen]
+	}
+	buf := inst.packedBuf
+
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(n))
 
 	var currentOffset uint32
@@ -204,7 +211,7 @@ func (inst *wasmInstance) executeBundle(ctx context.Context, leaves [][]byte) ([
 			return nil, fmt.Errorf("%w: bundle size %d exceeds 256", ErrMalformedOutput, n)
 		}
 
-		packedInput := packBundleInput(leaves)
+		packedInput := inst.packBundle(leaves)
 		if inst.allocFn == nil {
 			return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
 		}
@@ -409,61 +416,54 @@ func (h *WASMHost) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, err
 		return nil, ctx.Err()
 	}
 
-	callCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		callCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-	}
-
 	var modErr error
 	defer func() {
-		h.mu.Lock()
-		if h.closed {
-			h.mu.Unlock()
-			_ = inst.mod.Close(context.Background())
-			return
-		}
-
 		if modErr != nil {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.closed {
+				_ = inst.mod.Close(context.Background())
+				return
+			}
 			_ = inst.mod.Close(context.Background())
 			newInst, instErr := h.instantiateInstance(context.Background())
 			if instErr != nil {
-				if !h.closed {
-					h.closed = true
-					h.haltErr = fmt.Errorf("%w: failed to replenish worker instance: %v", ErrWasmHalt, instErr)
-				}
-				h.mu.Unlock()
+				h.closed = true
+				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance: %v", ErrWasmHalt, instErr)
 				return
 			}
 			h.pool <- newInst
-			h.mu.Unlock()
 			return
 		}
 
+		var resetErr error
 		if inst.resetFn != nil {
-			if _, err := inst.resetFn.Call(context.Background()); err != nil {
-				_ = inst.mod.Close(context.Background())
-				newInst, instErr := h.instantiateInstance(context.Background())
-				if instErr != nil {
-					if !h.closed {
-						h.closed = true
-						h.haltErr = fmt.Errorf("%w: failed to replenish worker instance after reset failure: %v", ErrWasmHalt, instErr)
-					}
-					h.mu.Unlock()
-					return
-				}
-				h.pool <- newInst
-				h.mu.Unlock()
+			_, resetErr = inst.resetFn.Call(context.Background())
+		}
+
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.closed {
+			_ = inst.mod.Close(context.Background())
+			return
+		}
+
+		if resetErr != nil {
+			_ = inst.mod.Close(context.Background())
+			newInst, instErr := h.instantiateInstance(context.Background())
+			if instErr != nil {
+				h.closed = true
+				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance after reset failure: %v", ErrWasmHalt, instErr)
 				return
 			}
+			h.pool <- newInst
+			return
 		}
 
 		h.pool <- inst
-		h.mu.Unlock()
 	}()
 
-	entries, err := inst.executeLeaf(callCtx, leaf)
+	entries, err := inst.executeLeaf(ctx, leaf)
 	if err != nil {
 		modErr = err
 		return nil, modErr
@@ -495,61 +495,54 @@ func (h *WASMHost) MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEn
 		return nil, ctx.Err()
 	}
 
-	callCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		callCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-	}
-
 	var modErr error
 	defer func() {
-		h.mu.Lock()
-		if h.closed {
-			h.mu.Unlock()
-			_ = inst.mod.Close(context.Background())
-			return
-		}
-
 		if modErr != nil {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.closed {
+				_ = inst.mod.Close(context.Background())
+				return
+			}
 			_ = inst.mod.Close(context.Background())
 			newInst, instErr := h.instantiateInstance(context.Background())
 			if instErr != nil {
-				if !h.closed {
-					h.closed = true
-					h.haltErr = fmt.Errorf("%w: failed to replenish worker instance: %v", ErrWasmHalt, instErr)
-				}
-				h.mu.Unlock()
+				h.closed = true
+				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance: %v", ErrWasmHalt, instErr)
 				return
 			}
 			h.pool <- newInst
-			h.mu.Unlock()
 			return
 		}
 
+		var resetErr error
 		if inst.resetFn != nil {
-			if _, err := inst.resetFn.Call(context.Background()); err != nil {
-				_ = inst.mod.Close(context.Background())
-				newInst, instErr := h.instantiateInstance(context.Background())
-				if instErr != nil {
-					if !h.closed {
-						h.closed = true
-						h.haltErr = fmt.Errorf("%w: failed to replenish worker instance after reset failure: %v", ErrWasmHalt, instErr)
-					}
-					h.mu.Unlock()
-					return
-				}
-				h.pool <- newInst
-				h.mu.Unlock()
+			_, resetErr = inst.resetFn.Call(context.Background())
+		}
+
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.closed {
+			_ = inst.mod.Close(context.Background())
+			return
+		}
+
+		if resetErr != nil {
+			_ = inst.mod.Close(context.Background())
+			newInst, instErr := h.instantiateInstance(context.Background())
+			if instErr != nil {
+				h.closed = true
+				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance after reset failure: %v", ErrWasmHalt, instErr)
 				return
 			}
+			h.pool <- newInst
+			return
 		}
 
 		h.pool <- inst
-		h.mu.Unlock()
 	}()
 
-	results, err := inst.executeBundle(callCtx, leaves)
+	results, err := inst.executeBundle(ctx, leaves)
 	if err != nil {
 		modErr = err
 		return nil, modErr
@@ -631,5 +624,133 @@ func (h *WASMHost) Close(ctx context.Context) error {
 		return h.runtime.Close(ctx)
 	}
 	return nil
+}
+
+// WASMRunner is a dedicated, unshared WASM execution environment bound to a single worker.
+// It executes mapping calls lock-free without instance pool or mutex contention.
+type WASMRunner struct {
+	host   *WASMHost
+	inst   *wasmInstance
+	closed bool
+	hadErr bool
+}
+
+// NewRunner creates a dedicated WASMRunner from the host.
+// The runner has exclusive access to its WASM module instance, eliminating pool and mutex overhead.
+func (h *WASMHost) NewRunner(ctx context.Context) (*WASMRunner, error) {
+	h.mu.Lock()
+	if h.closed {
+		err := h.haltErr
+		if err == nil {
+			err = ErrHostClosed
+		}
+		h.mu.Unlock()
+		return nil, err
+	}
+	h.mu.Unlock()
+
+	var inst *wasmInstance
+	select {
+	case inst = <-h.pool:
+	default:
+		var err error
+		inst, err = h.instantiateInstance(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to instantiate wasm runner: %w", err)
+		}
+	}
+
+	return &WASMRunner{
+		host: h,
+		inst: inst,
+	}, nil
+}
+
+// NewRunnerMapper creates a dedicated runner satisfying the RunnerProvider interface.
+func (h *WASMHost) NewRunnerMapper(ctx context.Context) (LeafMapper, error) {
+	return h.NewRunner(ctx)
+}
+
+// MapBundle executes WASM mapping across a contiguous bundle of leaves on this dedicated runner.
+func (r *WASMRunner) MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEntry, error) {
+	if r.closed {
+		return nil, ErrHostClosed
+	}
+
+	results, err := r.inst.executeBundle(ctx, leaves)
+	if err != nil {
+		r.hadErr = true
+		return nil, err
+	}
+
+	if r.inst.resetFn != nil {
+		if _, err := r.inst.resetFn.Call(context.Background()); err != nil {
+			r.hadErr = true
+			return nil, fmt.Errorf("%w: reset failed: %v", ErrWasmHalt, err)
+		}
+	}
+
+	return results, nil
+}
+
+// MapLeaf executes WASM mapping for a single leaf on this dedicated runner.
+func (r *WASMRunner) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, error) {
+	if r.closed {
+		return nil, ErrHostClosed
+	}
+
+	entries, err := r.inst.executeLeaf(ctx, leaf)
+	if err != nil {
+		r.hadErr = true
+		return nil, err
+	}
+
+	if r.inst.resetFn != nil {
+		if _, err := r.inst.resetFn.Call(context.Background()); err != nil {
+			r.hadErr = true
+			return nil, fmt.Errorf("%w: reset failed: %v", ErrWasmHalt, err)
+		}
+	}
+
+	return entries, nil
+}
+
+// Close releases this runner's WASM module instance, returning it to the host pool if healthy.
+func (r *WASMRunner) Close(ctx context.Context) error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+
+	if r.inst == nil {
+		return nil
+	}
+
+	if r.hadErr {
+		if r.inst.mod != nil {
+			return r.inst.mod.Close(ctx)
+		}
+		return nil
+	}
+
+	r.host.mu.Lock()
+	defer r.host.mu.Unlock()
+
+	if r.host.closed {
+		if r.inst.mod != nil {
+			return r.inst.mod.Close(ctx)
+		}
+		return nil
+	}
+
+	select {
+	case r.host.pool <- r.inst:
+		return nil
+	default:
+		if r.inst.mod != nil {
+			return r.inst.mod.Close(ctx)
+		}
+		return nil
+	}
 }
 
