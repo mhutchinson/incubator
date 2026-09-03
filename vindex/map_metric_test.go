@@ -118,6 +118,7 @@ func TestVerifiableIndex_Metrics(t *testing.T) {
 
 	if foundMetric == nil {
 		t.Fatal("metric vindex.map_fn.keys not found")
+		return
 	}
 
 	histogram, ok := foundMetric.Data.(metricdata.Histogram[int64])
@@ -170,7 +171,8 @@ func verifyFloat64Histogram(t *testing.T, rm metricdata.ResourceMetrics, name st
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			if m.Name == name {
-				foundMetric = &m
+				mCopy := m
+				foundMetric = &mCopy
 				break
 			}
 		}
@@ -178,6 +180,7 @@ func verifyFloat64Histogram(t *testing.T, rm metricdata.ResourceMetrics, name st
 
 	if foundMetric == nil {
 		t.Fatalf("metric %s not found", name)
+		return
 	}
 
 	histogram, ok := foundMetric.Data.(metricdata.Histogram[float64])
