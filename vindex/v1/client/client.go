@@ -167,24 +167,11 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 		outProof = append(outProof, h)
 	}
 
-	// Parse leaf data: Line 1 = MapRoot (hex), Line 2+ = Raw Input Log Checkpoint
-	leafLines := bytes.SplitN(leafBody, []byte("\n"), 2)
-	if len(leafLines) < 2 {
-		return nil, fmt.Errorf("output-log-leaf-v1 malformed: expected map root and input checkpoint lines")
+	mapRoot, inCPHeader, rawInCP, err := tree.ParseOutputLogLeaf(leafBody)
+	if err != nil {
+		return nil, fmt.Errorf("output-log-leaf-v1 malformed: %w", err)
 	}
-	mapRootHex := strings.TrimSpace(string(leafLines[0]))
-	mapRootBytes, err := hex.DecodeString(mapRootHex)
-	if err != nil || len(mapRootBytes) != sha256.Size {
-		return nil, fmt.Errorf("invalid map root hex in output log leaf: %q", mapRootHex)
-	}
-	var mapRoot [sha256.Size]byte
-	copy(mapRoot[:], mapRootBytes)
-
-	rawInCP := bytes.TrimSpace(leafLines[1])
-	if len(rawInCP) > 0 && rawInCP[len(rawInCP)-1] != '\n' {
-		rawInCP = append(rawInCP, '\n')
-	}
-	rawLeafData := []byte(hex.EncodeToString(mapRootBytes) + "\n" + string(bytes.TrimRight(rawInCP, "\n")) + "\n")
+	rawLeafData := tree.FormatOutputLogLeaf(mapRoot, rawInCP)
 
 	// Verify Output Log inclusion
 	leafHash := rfc6962.DefaultHasher.HashLeaf(rawLeafData)
@@ -203,11 +190,7 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 		}
 		inCP = parsed
 	} else {
-		parsed, err := tree.ParseCheckpointHeader(rawInCP)
-		if err != nil {
-			return nil, fmt.Errorf("%w: input log checkpoint header invalid: %v", ErrCheckpointFailed, err)
-		}
-		inCP = parsed
+		inCP = inCPHeader
 	}
 	inputLogSize := inCP.Size
 
@@ -475,6 +458,11 @@ func New(baseURLStr string, cfg VerifierConfig, httpClient *http.Client) (*Clien
 	}, nil
 }
 
+// NewClient creates a new VIndex Client (alias for New).
+func NewClient(baseURLStr string, cfg VerifierConfig, httpClient *http.Client) (*Client, error) {
+	return New(baseURLStr, cfg, httpClient)
+}
+
 // Lookup queries the VIndex server for the given keyHash and verifies all cryptographic proofs.
 func (c *Client) Lookup(ctx context.Context, keyHash [sha256.Size]byte, before *uint64, limit uint64) (*LookupResponse, error) {
 	hexKeyHash := hex.EncodeToString(keyHash[:])
@@ -651,17 +639,10 @@ func VerifyLookupResponse(keyHash [sha256.Size]byte, resp LegacyLookupResponse, 
 	}
 
 	// Leaf format: MapRoot hex + \n + InputLogCP
-	leafLines := bytes.SplitN(resp.OutputLogLeaf, []byte("\n"), 2)
-	if len(leafLines) < 2 {
-		return nil, nil, fmt.Errorf("output log leaf malformed")
+	mapRoot, _, inCp, err := tree.ParseOutputLogLeaf(resp.OutputLogLeaf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("output log leaf malformed: %w", err)
 	}
-	mapRootBytes, err := hex.DecodeString(string(leafLines[0]))
-	if err != nil || len(mapRootBytes) != sha256.Size {
-		return nil, nil, fmt.Errorf("invalid map root hex in output log leaf")
-	}
-	var mapRoot [sha256.Size]byte
-	copy(mapRoot[:], mapRootBytes)
-	inCp := leafLines[1]
 
 	origin := inLogOrigin
 	if origin == "" {
