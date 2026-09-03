@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -37,13 +38,20 @@ const (
 	maxLookupLimit     uint64 = 1000
 )
 
+// HealthChecker determines whether the server or underlying subsystems are healthy.
+// It returns nil if healthy, or an error detailing the health failure.
+type HealthChecker func() error
+
 // ReadServer serves HTTP lookup and checkpoint queries.
 type ReadServer struct {
-	store     kvstore.IndexStore
-	mptMgr    *tree.Manager
-	publisher *tree.OutputPublisher
-	chunkSize uint64
-	enableUI  bool
+	store         kvstore.IndexStore
+	mptMgr        *tree.Manager
+	publisher     *tree.OutputPublisher
+	chunkSize     uint64
+	enableUI      bool
+	healthMu      sync.RWMutex
+	healthChecker HealthChecker
+	readyChecker  HealthChecker
 }
 
 // NewReadServer creates a new ReadServer instance.
@@ -76,6 +84,26 @@ func (s *ReadServer) SetEnableUI(enable bool) {
 	s.enableUI = enable
 }
 
+// Publisher returns the underlying OutputPublisher.
+func (s *ReadServer) Publisher() *tree.OutputPublisher {
+	return s.publisher
+}
+
+// SetHealthChecker registers a dynamic health check callback for /healthz. If hc is nil,
+// the server defaults to returning healthy (HTTP 200 "ok\n").
+func (s *ReadServer) SetHealthChecker(hc HealthChecker) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	s.healthChecker = hc
+}
+
+// SetReadyChecker registers a dynamic readiness check callback for /readyz and /syncz.
+func (s *ReadServer) SetReadyChecker(rc HealthChecker) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	s.readyChecker = rc
+}
+
 // RegisterRoutes registers HTTP endpoints on the provided ServeMux.
 func (s *ReadServer) RegisterRoutes(mux *http.ServeMux) {
 	if s.enableUI {
@@ -95,6 +123,7 @@ func (s *ReadServer) RegisterRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/healthz", s.HandleHealthz)
 	mux.HandleFunc("/readyz", s.HandleReadyz)
+	mux.HandleFunc("/syncz", s.HandleReadyz)
 	mux.Handle("/metrics", promhttp.Handler())
 }
 
@@ -153,16 +182,49 @@ func (s *ReadServer) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	s.healthMu.RLock()
+	hc := s.healthChecker
+	s.healthMu.RUnlock()
+
+	if hc != nil {
+		if err := hc(); err != nil {
+			http.Error(w, fmt.Sprintf("unhealthy: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
 }
 
-// HandleReadyz handles GET /readyz (readiness probe).
+// HandleReadyz handles GET /readyz and /syncz (readiness and sync probe).
 func (s *ReadServer) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	s.healthMu.RLock()
+	rc := s.readyChecker
+	if rc == nil {
+		rc = s.healthChecker
+	}
+	s.healthMu.RUnlock()
+	if rc != nil {
+		if err := rc(); err != nil {
+			type jsonDiagnosticsProvider interface {
+				JSONDiagnostics() []byte
+			}
+			if diag, ok := err.(jsonDiagnosticsProvider); ok {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write(diag.JSONDiagnostics())
+				return
+			}
+			http.Error(w, fmt.Sprintf("unhealthy: %v", err), http.StatusServiceUnavailable)
+			return
+		}
 	}
 	state := s.publisher.GetServingState()
 	if state == nil || len(state.RawCheckpoint) == 0 {
