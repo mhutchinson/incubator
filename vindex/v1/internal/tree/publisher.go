@@ -83,9 +83,7 @@ func (p *OutputPublisher) PublishBatch(ctx context.Context, modifiedSubRoots map
 	}
 
 	// 2. Format StateCommitment: hex(MapRoot) + "\n" + rawInputLogCP + "\n"
-	hexRoot := hex.EncodeToString(predictedMapRoot[:])
-	trimmedInCP := bytes.TrimRight(rawInputLogCP, "\n")
-	leafData := []byte(hexRoot + "\n" + string(trimmedInCP) + "\n")
+	leafData := FormatOutputLogLeaf(predictedMapRoot, rawInputLogCP)
 
 	// 3. Append to Output Log
 	leafIdx, rawCP, err := p.outputLog.Append(ctx, leafData)

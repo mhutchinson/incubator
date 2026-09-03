@@ -16,13 +16,10 @@
 package coordinator
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
@@ -31,7 +28,7 @@ import (
 var (
 	ErrInvariantViolation = errors.New("state progression invariant violation")
 	ErrRootMismatch       = fmt.Errorf("%w: MPT root does not match Output Log commitment", ErrInvariantViolation)
-	ErrOutputLogCorrupted = errors.New("output log leaf format corrupted")
+	ErrOutputLogCorrupted = tree.ErrOutputLogCorrupted
 )
 
 // OutputLogReader defines the methods needed to read historical Output Log entries during recovery.
@@ -43,21 +40,5 @@ type OutputLogReader interface {
 }
 
 func parseOutputLogLeaf(leafData []byte) (mapRoot [sha256.Size]byte, inCP *log.Checkpoint, rawInCP []byte, err error) {
-	lines := bytes.SplitN(bytes.TrimSpace(leafData), []byte("\n"), 2)
-	if len(lines) < 2 {
-		return [sha256.Size]byte{}, nil, nil, fmt.Errorf("%w: expected map root and input checkpoint", ErrOutputLogCorrupted)
-	}
-	mapRootHex := strings.TrimSpace(string(lines[0]))
-	mapRootBytes, err := hex.DecodeString(mapRootHex)
-	if err != nil || len(mapRootBytes) != sha256.Size {
-		return [sha256.Size]byte{}, nil, nil, fmt.Errorf("%w: invalid map root hex %q", ErrOutputLogCorrupted, mapRootHex)
-	}
-	copy(mapRoot[:], mapRootBytes)
-
-	rawInCP = bytes.TrimSpace(lines[1])
-	inCP, err = tree.ParseCheckpointHeader(rawInCP)
-	if err != nil {
-		return [sha256.Size]byte{}, nil, nil, fmt.Errorf("%w: invalid input checkpoint: %v", ErrOutputLogCorrupted, err)
-	}
-	return mapRoot, inCP, rawInCP, nil
+	return tree.ParseOutputLogLeaf(leafData)
 }
