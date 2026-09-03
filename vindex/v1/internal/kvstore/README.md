@@ -24,7 +24,7 @@ In an LSM-tree database (such as Pebble), storing this mapping naively leads to 
   - Eliminate disk I/O on missing keys via full-table 33-byte prefix Bloom filters.
   - Maximize storage density by encoding occurrence indices as 16-bit relative offsets within 64K chunks.
   - Guarantee zero-overhead sub-root point-in-time calculation (`GetSubRoot`) to support lock-free MPT prediction and Zero-WAL crash recovery.
-  - Enforce synchronous durability (`pebble.Sync`) before state commitment handoff to guarantee `m_kv_size >= Output_Size`.
+  - Enforce synchronous durability (`pebble.Sync`) before state commitment handoff to guarantee persisted KV storage watermark >= Output_Size.
 - **Non-Goals**:
   - **No Distributed Storage**: Operates strictly as a single-host embedded database; distributed clustering and remote RPC storage backends are explicitly out of scope.
   - **No Cross-Key Range Scans**: Supports point queries by exact 32-byte key hash; lexical prefix scanning across different keys is out of scope for v1.
@@ -45,12 +45,12 @@ In an LSM-tree database (such as Pebble), storing this mapping naively leads to 
 ### 2.1 Logical Model & Inverted Chunk Key Layout
 To eliminate write amplification, each key's mini-log is partitioned into logical chunks of 65,536 entries (`ChunkSize = 65536`). 
 
-Keys are formatted with a 1-byte domain separation prefix, 32-byte key hash, and an 8-byte big-endian bitwise-inverted chunk number:
+Chunk keys are 41 bytes: `'c'` (1 byte) + `KeyHash` (32 bytes) + `^BigEndian(chunkNum)` (8 bytes, bitwise inverted so newer chunks sort first):
 
 ```text
-Key = [Prefix 'c' (1B)] + [KeyHash (32B)] + [^chunkNum (8B, BigEndian)]
+Key (41 bytes) = [Prefix 'c' (1B)] + [KeyHash (32B)] + [^BigEndian(chunkNum) (8B)]
 ```
-where `^chunkNum = math.MaxUint64 - chunkNum`.
+where `^BigEndian(chunkNum) = math.MaxUint64 - chunkNum`.
 
 #### The Inverted Ordering Mechanism:
 Because chunk numbers are bitwise-inverted, the **highest (newest) chunk has the lexicographically smallest key** among all chunks for that key prefix.
@@ -63,11 +63,21 @@ Because chunk numbers are bitwise-inverted, the **highest (newest) chunk has the
 ### 2.2 Delimitless Binary Chunk Serialization & Compact Ranges
 Values store a cumulative RFC 6962 compact range covering all prior chunks, plus a dense array of 16-bit relative offsets for the current chunk:
 
+```text
+CoveredSize uint64 (8 bytes, BigEndian) || CompactHashes (32 bytes * bits.OnesCount64(CoveredSize)) || RelativeIndices (uint16, 2 bytes BigEndian * N)
+```
+
 | Byte Offset | Field Name | Data Type | Description |
 | :--- | :--- | :--- | :--- |
-| `0` | `CoveredSize` | `uint64` (8B) | Total number of entries in all prior chunks (`chunkNum * 65536`). |
-| `8` | `CompactHashes` | `[K][32]byte` | Compact range hashes committing to the prior `CoveredSize` leaves, where `K = bits.OnesCount64(CoveredSize)`. |
-| `8 + 32*K` | `RelativeIndices` | `[]uint16` | Dense 2-byte offsets: `uint16(index % 65536)` for each occurrence in this chunk. |
+| `0` | `CoveredSize` | `uint64` (8 bytes, BigEndian) | Total number of entries in all prior chunks (`chunkNum * 65536`). |
+| `8` | `CompactHashes` | `[K][32]byte` | Compact range hashes committing to the prior `CoveredSize` leaves, where `K = bits.OnesCount64(CoveredSize)` (32 bytes * K). |
+| `8 + 32*K` | `RelativeIndices` | `[]uint16` (2 bytes BigEndian * N) | Dense 2-byte offsets: `uint16(index % 65536)` for each occurrence in this chunk. |
+
+#### Mini-Log Leaf Hashing:
+Each mini-log entry commits to an occurrence index in the Input Log. Mini-log leaf hashing strictly adheres to RFC 6962:
+- The absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00.
+- Interior nodes are hashed with RFC 6962 node domain separator 0x01.
+- When an active chunk reaches capacity (`ChunkSize = 65536`), all its relative indices are converted to absolute indices, hashed as RFC 6962 leaves with domain separator 0x00, and appended to the chunk's running compact range.
 
 #### Delimitless Deserialization:
 Because the number of compact range hashes is mathematically determined by `bits.OnesCount64(CoveredSize)`, the boundary between the compact range and the relative indices is computed dynamically in memory:
@@ -86,8 +96,8 @@ To avoid repeatedly reading active chunk descriptors from Pebble during sequenti
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
 - **[Correctness Invariant] Synchronous Persistence Barrier**:
-  - *Rule*: `store.WriteBatch` must execute `pebble.Sync` and durably flush all modified `'c'` records and metadata (`m_kv_size`) to disk before returning to the Coordinator.
-  - *Rationale*: Enforces `m_kv_size >= Output_Size` across all crash and power-loss scenarios.
+  - *Rule*: `store.WriteBatch` must execute `pebble.Sync` and durably flush all modified `'c'` records and metadata (persisted KV storage watermark) to disk before returning to the Coordinator.
+  - *Rationale*: Enforces `persisted KV storage watermark >= Output_Size` across all crash and power-loss scenarios.
   - *Consequence ("Or Else")*: If the node crashed after appending a state commitment to the Output Log but before Pebble synced to disk, the published root would reference missing KV chunks. The node would be permanently unable to produce inclusion proofs for its own witnessed checkpoints.
 
 - **[Correctness Invariant] Point-in-Time Sub-Root Isolation (`GetSubRoot`)**:
@@ -107,40 +117,21 @@ To avoid repeatedly reading active chunk descriptors from Pebble during sequenti
   - *Mechanism*: Caches active chunk structs across sequential batches.
   - *Impact*: Cuts Pebble block read I/O by >90% during sustained high-concurrency ingestion.
 
-### 2.5 Go Interfaces & Public Types
+### 2.5 Storage Engine Contract
 
-```go
-package kvstore
+The storage subsystem manages physical chunk persistence, mini-log compact ranges, and point lookups:
 
-import (
-	"crypto/sha256"
-
-	"github.com/transparency-dev/merkle/compact"
-)
-
-// IndexStore defines the persistent storage engine interface for VIndex.
-type IndexStore interface {
-	// WriteBatch appends occurrences and atomically flushes modified chunks with pebble.Sync.
-	WriteBatch(entries map[[sha256.Size]byte][]uint64, newKVSize uint64) error
-
-	// GetSubRoot calculates the RFC 6962 mini-log root for keyHash as of inputLogSize.
-	GetSubRoot(keyHash [sha256.Size]byte, inputLogSize uint64) ([]byte, error)
-
-	// Lookup returns occurrence indices for keyHash strictly before 'before', limited to 'limit'.
-	Lookup(keyHash [sha256.Size]byte, before uint64, limit int) (indices []uint64, compactRange *compact.Range, err error)
-
-	// Close cleanly flushes and shuts down the underlying database.
-	Close() error
-}
-
-// Chunk represents an active or immutable 64K index partition.
-type Chunk struct {
-	ChunkNum        uint64
-	CoveredSize     uint64
-	CompactRange    *compact.Range
-	RelativeIndices []uint16
-}
-```
+- **Physical Format & Key Layout**:
+  - Chunks are keyed by 41 bytes: `'c'` (1 byte) + `KeyHash` (32 bytes) + `^BigEndian(chunkNum)` (8 bytes bitwise inverted).
+  - Bitwise inversion places the newest active chunk first under the key prefix, enabling true O(1) active chunk seeks with 33-byte prefix Bloom filtering.
+  - Chunk values use a delimitless binary serialization format: an 8-byte big-endian `CoveredSize`, followed by RFC 6962 compact range hashes committing to prior chunks, followed by dense 2-byte relative index offsets (`uint16(index % 65536)`).
+- **Write Contract & Rollover**:
+  - Monotonic batch writes accumulate leaf occurrences and commit synchronously to disk.
+  - When an active chunk reaches 65,536 entries (`ChunkSize = 65536`), it is frozen into an immutable historical chunk, its relative offsets are accumulated into the running compact range, and a new active chunk is allocated.
+- **Lookup Contract & Snapshot Filtering**:
+  - Point lookups retrieve occurrence indices strictly before the optional `before` cursor up to `limit`.
+  - Inverted chunk records are filtered against `maxInputLogSize`, strictly ignoring any uncommitted future entries written ahead of the active serving state.
+  - Generates prefix compact ranges for backward pagination continuity.
 
 ---
 

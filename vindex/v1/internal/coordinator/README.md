@@ -22,7 +22,7 @@ Without a central orchestrator managing these components behind strict black-box
 ### 1.2 Centralized Watermark Authority & Separation of Concerns
 The Coordinator serves as the **single source of truth** for system lifecycle and watermark governance:
 - Worker subsystems expose clean, black-box functional interfaces and do not inspect each other's internal metadata or storage engines.
-- The Coordinator alone tracks the global progression chain, evaluates persistence boundaries, and calculates the authoritative `SafeWatermark = min(m_kv_size, MPT_Durable_Size)` communicated to `TileReaper`.
+- The Coordinator alone tracks the global progression chain, evaluates persistence boundaries, and calculates the authoritative `SafeWatermark = min(persisted KV storage watermark, MPT_Durable_Size)` communicated to `TileReaper`.
 
 ### 1.3 Goals & Non-Goals
 - **Goals**:
@@ -49,13 +49,13 @@ The Coordinator serves as the **single source of truth** for system lifecycle an
 The coordinator executes batch synchronization through a structured, 6-step sequential lifecycle:
 
 | Step | Phase | Action & Subsystem Invocation | Durability Transition |
-| :--- | :--- | :--- | :--- |
-| **1** | **Poll & Freeze** | Polls upstream Input Log `/checkpoint`, verifies signature notes, and writes `m_target_checkpoint` to Pebble metadata. | Freezes target sync boundary. |
+| :- | :--- | :--- | :--- |
+| **1** | **Poll & Freeze** | Polls upstream Input Log `/checkpoint`, verifies signature notes, and writes target input checkpoint to Pebble metadata. | Freezes target sync boundary. |
 | **2** | **Tile Ingestion** | `fetcher.FetchTiles` downloads missing 256-leaf tiles into `ManagedTileCache`. | Durably stages verified tiles on disk. |
 | **3** | **Parallel Mapping** | `pipeline.StreamBatches` feeds tiles to WASM workers, hashes preimages via host SIMD, and re-sequences batches. | In-memory key-index aggregation. |
-| **4** | **Storage Commit** | Aggregates 4,096 leaves (`DefaultCommitBatchSize`) and calls `store.WriteBatch` with blocking `pebble.Sync`. | **Ratchets `m_kv_size` durably to disk and persists `KV_CP`.** |
-| **5** | **Commitment & Promotion** | Calls `publisher.PublishBatch`: predicts `MapRoot` lock-free, appends to Output Log, collects witness cosignatures, and ratchets `ServingState` under < 5ms lock. | **Promotes state to Output Log (`Output_CP`) & Serving (`Serving_CP`).** |
-| **6** | **Pruning Notification** | Computes `SafeWatermark = min(m_kv_size, MPT_Durable_Size)` and notifies `TileReaper`. | Bounded disk cache garbage collection. |
+| **4** | **Storage Commit** | Aggregates 4,096 leaves (`DefaultCommitBatchSize`) and calls `store.WriteBatch` with blocking `pebble.Sync`. | **Ratchets persisted KV storage watermark durably to disk and persists `KV_CP`.** |
+| **5** | **Commitment & Promotion** | Calls `publisher.PublishBatch`: predicts `MapRoot` lock-free, appends to Output Log, collects witness cosignatures, and ratchets `ServingState` via atomic state promotion under publisher lock (< 5ms). | **Promotes state to Output Log (`Output_CP`) & Serving (`Serving_CP`).** |
+| **6** | **Pruning Notification** | Computes `SafeWatermark = min(persisted KV storage watermark, MPT_Durable_Size)` and notifies `TileReaper`. | Bounded disk cache garbage collection. |
 
 ### 2.2 Checkpoint Governance & Progression Chain
 
@@ -66,7 +66,7 @@ The coordinator executes batch synchronization through a structured, 6-step sequ
 | **`Target_CP`** | Input Log | `Target_CP.Size` | Durable (`pebble.Sync` in Pebble metadata) | Upstream poll & origin note verification | Upper goalpost for current sync cycle; prevents moving-goalpost starvation. |
 | **`KV_CP`** | Input Log | `KV_CP.Size` | Durable (`pebble.Sync` in Pebble LSM) | Atomic flush of `'c'` chunk records | Durably binds indexed `'c'` chunk records to the verified Input Log state they cover. |
 | **`Output_CP`** | Output Log | `Output_CP.InputSize` (committed in leaf) | Durable (Tessera Output Log storage) | Append commitment leaf & witness cosigning | Cryptographically commits to index root (`MapRoot` + covered Input Log checkpoint). |
-| **`Serving_CP`** | Output Log Leaf | `Serving_CP.InputSize` | Volatile (In-memory atomic pointer) | Pointer swap under `treeMu.Lock()` (< 5ms) | Active state exposed to client HTTP readers. |
+| **`Serving_CP`** | Output Log Leaf | `Serving_CP.InputSize` | Volatile (In-memory atomic pointer) | Pointer swap via atomic state promotion under publisher lock (< 5ms) | Active state exposed to client HTTP readers. |
 
 **Monotonic Checkpoint Progression Invariant**:
 ```text
@@ -75,13 +75,13 @@ Target_CP.Size >= KV_CP.Size >= Output_CP.InputSize >= Serving_CP.InputSize
 Every relation is `>=`:
 - `Target_CP.Size >= KV_CP.Size`: Batch aggregation advances toward the target checkpoint in discrete commit slices.
 - `KV_CP.Size >= Output_CP.InputSize`: KV storage persistence strictly precedes Output Log publication.
-- `Output_CP.InputSize >= Serving_CP.InputSize`: Output Log publication and witness collection execute outside reader locking; `Output_CP` advances before the in-memory serving pointer is swapped under `treeMu.Lock()`.
+- `Output_CP.InputSize >= Serving_CP.InputSize`: Output Log publication and witness collection execute outside reader locking; `Output_CP` advances before the in-memory serving pointer is swapped via atomic state promotion under publisher lock.
 
 #### Intermediate Buffers & Trailing Durability
-- `Target_CP -> KV_CP`: Ingest stages data through `Cached_Tiles` (disk) and worker mapping queues; `m_kv_size` accumulates in Pebble write batches until committed at `m_kv_size == KV_CP.Size`.
+- `Target_CP -> KV_CP`: Ingest stages data through `Cached_Tiles` (disk) and worker mapping queues; persisted KV storage watermark accumulates in Pebble write batches until committed at `KV_CP.Size`.
 - `KV_CP -> Output_CP`: Lock-free MPT prediction calculates candidate `MapRoot`.
 - `Output_CP -> Serving_CP`: In-memory atomic swap ratchets `ServingState` (< 5ms critical section).
-- `Trailing Serving_CP`: `MPT_Durable_Size` fsyncs to disk in the background under `writeMu`, satisfying `Serving_CP.InputSize >= MPT_Durable_Size`.
+- `Trailing Serving_CP`: `MPT_Durable_Size` fsyncs to disk in the background, satisfying `Serving_CP.InputSize >= MPT_Durable_Size`.
 
 ### 2.3 Authoritative `SafeWatermark` Calculation for `TileReaper`
 To guarantee that the ingestion cache never deletes tiles needed for crash recovery, the Coordinator calculates the authoritative safe pruning boundary:
@@ -93,9 +93,9 @@ Because storage persistence strictly precedes Output Log publication (`kvSize >=
 ### 2.4 Moving-Goalpost Prevention
 On high-traffic transparency logs, the log head advances continuously. If the coordinator polled unverified checkpoints on every iteration, the sync target would constantly move, starving downstream commitment.
 
-The Coordinator prevents this by writing the verified target checkpoint note into Pebble DB metadata (`m_target_checkpoint`) prior to batch processing. The entire pipeline processes that fixed slice to completion before the coordinator advances to a new target.
+The Coordinator prevents this by writing the verified target checkpoint note into Pebble DB metadata (target input checkpoint) prior to batch processing. The entire pipeline processes that fixed slice to completion before the coordinator advances to a new target.
 
-### 2.5 Zero-WAL Startup Recovery Sequence
+### 2.5 Zero-WAL Startup Recovery Sequence & Uncommitted KV Writes
 On daemon launch, the coordinator executes a deterministic 3-phase recovery sequence before opening network endpoints:
 
 1. **Phase 1: Instant Warm Start (< 5ms)**:
@@ -108,8 +108,9 @@ On daemon launch, the coordinator executes a deterministic 3-phase recovery sequ
      - Reconstructs mini-log sub-roots for modified keys up to `Output_CP.InputSize` with **zero writes to the database**.
      - Updates in-memory MPT nodes and asserts that the resulting root strictly matches the Output Log leaf commitment.
      - Flushes MPT persistence to disk, activates `Serving_CP`, and **opens the Read Server (< 500ms)**.
-3. **Phase 3: Background Catch-Up**:
-   - Resumes forward ingestion from `KV_CP.Size` toward `Target_CP.Size`.
+3. **Phase 3: Background Catch-Up & Uncommitted KV Writes**:
+   - Resumes forward ingestion from `Serving_CP.InputLogSize` toward `Target_CP.Size`.
+   - **Handling Uncommitted KV Writes**: If a crash occurred after Pebble durably synced a batch to disk but before `PublishBatch` committed to the Output Log (`persisted KV storage watermark > ServingState.InputLogSize`), `SyncOnce` streams starting from `ServingState.InputLogSize`. When re-processing entries that were already written to disk, `kvstore/writer.go` detects `unpersisted == 0` for already-written keys and reconstructs their sub-roots directly from Pebble without re-writing storage. This allows uncommitted batches to be safely published to the Output Log upon initial sync without duplicate entries or storage churn.
 
 ### 2.6 In-Situ Invariants & Performance Optimizations
 
@@ -127,43 +128,29 @@ On daemon launch, the coordinator executes a deterministic 3-phase recovery sequ
   - *Mechanism*: Buffers mapped leaves into 4,096-leaf commit batches (`DefaultCommitBatchSize = 4096`) before invoking storage and commitment.
   - *Impact*: Amortizes `pebble.Sync` disk write latency and external witness network RPCs across 4,096 leaves, sustaining high indexing throughput (>90,000 leaves/sec).
 
-### 2.7 Go Interfaces & Public Types
+### 2.7 Coordination Contract & State Guarantees
 
-```go
-package coordinator
+The coordinator acts as the single source of truth for pipeline progression and lifecycle management:
 
-import (
-	"context"
-
-	"github.com/transparency-dev/formats/log"
-)
-
-// Coordinator orchestrates the end-to-end VIndex pipeline.
-type Coordinator struct {
-	fetcher   TileFetcher
-	cache     ManagedTileCache
-	pipeline  MappingPipeline
-	store     IndexStore
-	mptMgr    MPTManager
-	publisher Publisher
-}
-
-// SyncOptions configures batch processing parameters.
-type SyncOptions struct {
-	CommitBatchSize uint64
-	PollInterval    time.Duration
-	FlushTimeout    time.Duration
-}
-
-// Watermarks captures the instantaneous cross-subsystem progression state.
-type Watermarks struct {
-	TargetCheckpoint uint64
-	CachedTiles      uint64
-	KVSize           uint64
-	OutputLogSize    uint64
-	MPTDurableSize   uint64
-}
-```
+- **Inputs**:
+  - Input Log fetcher.
+  - Local tile cache.
+  - Mapping pipeline.
+  - KV store.
+  - Trie manager.
+  - Output publisher.
+- **Recovery Contract**:
+  - Enforces 3-phase startup recovery:
+    1. Verifies that persisted trie state equals the storage watermark.
+    2. Replays uncommitted tiles from the local disk cache to align with the Output Log tip with zero database writes.
+    3. Resumes ingestion without duplicating persisted writes.
+- **Durability Invariant**:
+  - Storage durability strictly precedes public log commitment:
+    ```text
+    KV_Storage_Durability >= Output_Log_Leaf.InputLogSize
+    ```
+- **Concurrency**:
+  - The background polling loop runs synchronously per iteration; catch-up and steady-state ingestion are strictly single-threaded.
 
 ---
 

@@ -9,7 +9,7 @@ This document defines the cryptographic commitment engine, tree synchronization 
 ### 1.1 Problem Statement & Concurrency Dilemma
 The tree subsystem binds the search index into an authenticated 32-byte cryptographic root (`MapRoot`), anchors it in an immutable Output Log, and serves cryptographic inclusion and non-inclusion proofs to HTTP readers.
 
-Because readers must verify proofs against a coherent snapshot, all mutations to the in-memory Sparse Merkle Patricia Trie (MPT) require taking a write lock (`treeMu.Lock()`). This creates a severe operational dilemma:
+Because readers must verify proofs against a coherent snapshot, all mutations to the in-memory Sparse Merkle Patricia Trie (MPT) require taking an exclusive publisher lock. This creates a severe operational dilemma:
 1. **The Reader Starvation Trap**: A full commit requires computing tree updates, persisting MPT files to disk (5–20ms), appending a state commitment entry to the Output Log, and awaiting cosignatures from external witnesses over the network (50–200ms). If the writer lock is held across this entire sequence, concurrent HTTP readers are starved. Under heavy traffic, query availability collapses and lookups time out.
 2. **The Equivocation Trap**: If the system writes a state commitment to the append-only Output Log and *subsequently* encounters an in-memory trie mutation error or calculation mismatch, the node has permanently committed an unprovable root to public witnesses, destroying operator trust.
 
@@ -45,41 +45,44 @@ The commitment plane maps 32-byte key hashes (`KeyHash`) to 32-byte mini-log roo
 ### 2.2 The 3-Step Atomic Commitment Dance
 The publisher coordinates the progression from KV storage to public commitment through a structured 3-step sequence. To keep reader lock contention under 5 milliseconds while guaranteeing that no unprovable root is ever published, the commit sequence operates like the classic idol swap in *Raiders of the Lost Ark*:
 1. **Weighing the sandbag (lock-free preparation)**: Pre-computing the exact future root (`mpt.Predict`), writing the commitment to the Output Log, and gathering witness cosignatures without holding the trie write lock.
-2. **The split-second swap (< 5ms critical section)**: Acquiring `treeMu.Lock()`, committing the mutations, verifying root equality, and ratcheting `ServingState` in under 5 milliseconds.
+2. **The split-second swap (< 5ms critical section)**: Acquiring the publisher lock, committing the mutations, verifying root equality, and ratcheting serving state in under 5 milliseconds before releasing the lock.
 3. **The hair-trigger boulder (fatal panic)**: If the actual root diverges by even a single byte from the prediction (`actualRoot != predictedMapRoot`), the temple collapses: the node halts immediately with a fatal panic, freezing disk state before an unprovable or equivocal state can be served.
+
+#### PublishBatch Locking & Concurrency:
+The publisher lock protects the in-memory trie commit and the serving state update. Concurrent batch publications are not supported without an external coordinator lock; the Coordinator serializes batch execution.
 
 | Step | Phase | Operations | Lock State | Reader Impact |
 | :--- | :--- | :--- | :--- | :--- |
 | **1** | **Lock-Free Prediction & Witnessing** | 1. `predictedMapRoot = mpt.Predict(modifiedSubRoots)`<br>2. `outputLog.Append(predictedMapRoot, inputLogCP)`<br>3. `witness.Witness(outputLogCheckpoint)` | No tree lock held | **Zero blocking**; concurrent queries run unimpeded. |
-| **2** | **The Atomic Swap** | 1. `treeMu.Lock()`<br>2. `actualRoot = mpt.CommitWithVersionLocked(...)`<br>3. `assert(actualRoot == predictedMapRoot)`<br>4. Ratchet `ServingState`<br>5. `treeMu.Unlock()` | `treeMu.Lock()` held | **< 5ms** critical section duration. |
-| **3** | **Background Durability** | 1. `mptMgr.Sync()` (flushes dirty mmap pages to disk)<br>2. Advance `MPT_Durable_Size` | `writeMu.Lock()` held; `treeMu` released | **Zero blocking**; disk fsync runs outside reader lock. |
+| **2** | **The Atomic Swap** | 1. Acquire publisher lock<br>2. Commit mutations to in-memory trie<br>3. Assert `actualRoot == predictedMapRoot`<br>4. Ratchet `ServingState`<br>5. Release publisher lock | Publisher lock held | **< 5ms** critical section duration. |
+| **3** | **Background Durability** | 1. Flush dirty mmap pages to disk<br>2. Advance `MPT_Durable_Size` | Disk persistence lock held; publisher lock released | **Zero blocking**; disk fsync runs outside reader lock. |
 
 #### Step Details:
 1. **Lock-Free Prediction & Witnessing**:
-   - The publisher calls `mptMgr.Predict(modifiedSubRoots)`. This computes candidate trie hashes on cloned branch nodes without acquiring `treeMu.Lock()`.
+   - The publisher computes candidate trie hashes on cloned branch nodes without acquiring the exclusive publisher lock.
    - The commitment string (`hex(predictedMapRoot) + "\n" + rawInputLogCP`) is appended to the Tessera Output Log.
    - The new Output Log checkpoint is submitted to external witnesses to gather threshold cosignatures.
    - **Throughout this entire phase, concurrent readers execute lookups without blocking.**
 2. **The Split-Second Swap**:
-   - The publisher acquires `treeMu.Lock()`.
-   - Mutates in-memory MPT nodes in place via `CommitWithVersionLocked`.
+   - The publisher acquires the exclusive publisher lock.
+   - Mutates in-memory MPT nodes in place.
    - Asserts `actualRoot == predictedMapRoot`. If mismatched, panics immediately.
-   - Ratchets `ServingState` pointer to the new witnessed Output Log checkpoint.
-   - Releases `treeMu.Lock()`.
+   - Ratchets serving state pointer to the new witnessed Output Log checkpoint.
+   - Releases the publisher lock.
    - **Total critical section duration: < 5 milliseconds.**
 3. **Background Durability**:
-   - Under an independent `writeMu` lock, the publisher calls `mptMgr.Sync()`, issuing an `msync`/`fsync` to flush modified mmap pages to disk.
+   - Under an independent persistence lock, the publisher flushes modified mmap pages to disk via msync/fsync.
    - Once durable, `MPT_Durable_Size` is advanced, unblocking `TileReaper` in the ingestion layer.
 
 ### 2.3 Concurrency Architecture & Split-Locking
-The subsystem enforces strict isolation between read serving and background disk persistence using two distinct locks:
+The subsystem enforces strict isolation between read serving and background disk persistence using two distinct conceptual locks:
 
-| Lock Name | Primitive | Scope & Protected State | Typical Duration |
+| Conceptual Lock | Synchronization Model | Scope & Protected State | Typical Duration |
 | :--- | :--- | :--- | :--- |
-| **`treeMu`** | `sync.RWMutex` | In-memory MPT nodes, `torchmpt.Tree` instance, and active `ServingState` pointer. Read-locked by HTTP readers (`ProveLocked`); write-locked during in-memory ratchets. | **< 5ms** (write)<br>**< 50µs** (read) |
-| **`writeMu`** | `sync.Mutex` | Disk fsync operations (`mptMgr.Sync()`), Output Log appends, and witness network calls. | **5ms – 200ms** |
+| **Publisher Serving Lock** | Read-write lock | In-memory MPT nodes, active trie instance, and active serving state pointer. Acquired in shared mode by HTTP readers; acquired exclusively during in-memory ratchets. | **< 5ms** (exclusive)<br>**< 50µs** (shared) |
+| **Disk Persistence Lock** | Exclusive mutex | Disk fsync operations, Output Log appends, and witness network calls. | **5ms – 200ms** |
 
-Because `writeMu` is completely decoupled from `treeMu`, slow disk syncs and network calls never block readers.
+Because the disk persistence lock is completely decoupled from the publisher serving lock, slow disk syncs and network calls never block readers.
 
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
@@ -108,55 +111,27 @@ Because `writeMu` is completely decoupled from `treeMu`, slow disk syncs and net
   - *Consequence ("Or Else")*: Readers would observe uncommitted, un-witnessed entries that are ahead of the latest published checkpoint, breaking client-side Merkle proof verification.
 
 - **[Performance Optimization] Lock-Free MPT Prediction**:
-  - *Mechanism*: Computes candidate trie roots without holding `treeMu.Lock()`, allowing Output Log writes and witness network roundtrips to complete outside the critical section.
+  - *Mechanism*: Computes candidate trie roots without holding the publisher lock, allowing Output Log writes and witness network roundtrips to complete outside the critical section.
   - *Impact*: Reduces the writer lock duration from ~250ms to < 5ms per commit cycle.
 
 - **[Performance Optimization] Split-Locking Concurrency Engine**:
-  - *Mechanism*: Isolates background disk fsyncs (`writeMu`) from in-memory trie reads (`treeMu.RLock()`).
+  - *Mechanism*: Isolates background disk fsyncs from in-memory trie reads.
   - *Impact*: Sustains 678,000 read queries/sec during active disk commits, compared to 53,000 reads/sec under coarse global locking (12.8x throughput improvement).
 
-### 2.5 Go Interfaces & Public Types
+### 2.5 State Trie & Commitment Contract
 
-```go
-package tree
+The state commitment subsystem provides authenticated indexing over search keys and coordinates public log commitments:
 
-import (
-	"context"
-	"crypto/sha256"
-
-	"github.com/transparency-dev/formats/log"
-)
-
-// MPTManager manages the lifecycle and proofs for the Sparse Merkle Patricia Trie.
-type MPTManager interface {
-	Predict(modifiedSubRoots map[[sha256.Size]byte][]byte) ([sha256.Size]byte, error)
-	CommitWithVersionLocked(modifiedSubRoots map[[sha256.Size]byte][]byte, version int64) ([sha256.Size]byte, error)
-	Prove(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error)
-	ProveLocked(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error)
-	Lock()
-	Unlock()
-	RLock()
-	RUnlock()
-	Sync() error
-	PersistedSize() uint64
-}
-
-// Publisher coordinates atomic commitment between the MPT, Output Log, and witnesses.
-type Publisher interface {
-	PublishBatch(ctx context.Context, inputLogCP *log.Checkpoint, modifiedSubRoots map[[sha256.Size]byte][]byte) (*ServingState, error)
-	SetServingState(state *ServingState)
-	GetServingState() *ServingState
-}
-
-// ServingState captures an immutable snapshot of committed, witnessed serving state.
-type ServingState struct {
-	MapRoot          [sha256.Size]byte
-	OutputLogSize    uint64
-	OutputCheckpoint []byte
-	InputLogSize     uint64
-	InputCheckpoint  []byte
-}
-```
+- **Inputs**:
+  - Batch of modified key-to-subroot mappings.
+  - Input Log checkpoint note.
+- **Outputs**:
+  - Signed Output Log leaf commitment.
+  - Verified inclusion proof.
+  - Atomically updated serving state.
+- **Concurrency Contract**:
+  - Readers are wait-free and never block on disk fsync or network calls.
+  - Publisher commits are strictly serialized (single-writer); state ratcheting promotes the new serving state atomically.
 
 ---
 
@@ -165,7 +140,7 @@ type ServingState struct {
 ### 3.1 Coarse Global Locking vs. Split-Locking with Prediction
 - **Proposed**: Holding a single global lock across the entire commitment cycle (prediction, Output Log append, witness network calls, in-memory trie mutation, and disk fsync).
 - **Empirical Rejection**: Benchmark profiling under heavy concurrent read traffic showed that coarse locking dropped HTTP read throughput to **53,000 queries/sec**, with P99 read latency ballooning past 250ms due to writer lock starvation.
-- **Chosen Design**: Split-locking with lock-free prediction holds `treeMu.Lock()` for < 5ms, sustaining **678,000 queries/sec** (a 12.8x speedup) with sub-millisecond P50 read latency.
+- **Chosen Design**: Split-locking with lock-free prediction holds the exclusive publisher lock for < 5ms, sustaining **678,000 queries/sec** (a 12.8x speedup) with sub-millisecond P50 read latency.
 
 ### 3.2 Sparse Merkle Trees (SMT) vs. Binary Sparse Merkle Patricia Trie
 - **Proposed**: Using a standard Sparse Merkle Tree (SMT) with fixed 256-level depth.

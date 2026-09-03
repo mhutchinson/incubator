@@ -43,65 +43,92 @@ The serving engine mirrors the inverted storage structure established in the KV 
 ## 2. Detailed Design
 
 ### 2.1 C2SP HTTP REST Endpoints
-The server exposes three primary HTTP endpoints:
+The server exposes the following HTTP endpoints:
 
 | Endpoint | Method | Purpose & Parameters |
 | :--- | :--- | :--- |
-| `/vindex/lookup/{keyhash}` | `GET` | Look up occurrences for a 32-byte hex-encoded key hash.<br>Query params: `before` (optional `uint64`), `limit` (optional `int`, default 1000, max 10000). Evaluated against `Serving_CP`. On upstream divergence, defaults to serving pinned `Serving_CP`; returns HTTP 503 only if `--fail_closed=true`. |
-| `/checkpoint` | `GET` | Returns the latest signed, witnessed Output Log checkpoint note (`Serving_CP`). |
-| `/healthz` | `GET` | Liveness probe. Returns **HTTP 200 OK** as long as the process is alive and serving authentic verified state (including during sync halt), preventing load balancers and orchestrators from killing the replica. |
-| `/readyz` / `/syncz` | `GET` | Readiness & sync probe. Returns HTTP 200 during normal operation, or **HTTP 503** (with diagnostic JSON) if the background auditor detects a root mismatch or sync halt. |
+| `/vindex/v1/lookup/{keyhash}` | `GET` | Look up occurrences for a 32-byte hex-encoded key hash.<br>Query params: `before` (optional `uint64`), `limit` (optional `uint64`, default 100, max 1000). Evaluated against `ServingState`. Supported backward compatibility aliases: `/vindex/lookup/{keyhash}` and `/lookup/{keyhash}`. |
+| `/vindex/v1/checkpoint` | `GET` | Returns the latest signed, witnessed Output Log checkpoint note (`ServingState.RawCheckpoint`). Supported backward compatibility alias: `/checkpoint`. |
+| `/vindex/v1/inputlog_checkpoint` | `GET` | Returns the raw signed Input Log checkpoint note (`ServingState.RawInputLogCP`). Supported backward compatibility alias: `/inputlog_checkpoint`. |
+| `/healthz` | `GET` | Liveness probe. Returns **HTTP 200 OK** (`ok\n`) as long as the process is alive. |
+| `/readyz` | `GET` | Readiness probe. Returns **HTTP 200 OK** (`ok\n`) when serving state is initialized, or **HTTP 503** if serving state is not yet ready. |
+| `/metrics` | `GET` | Exposes standard Prometheus metrics via `promhttp.Handler()`. |
 
 ### 2.2 Multi-Section Plaintext Response Wire Format
-Responses use the C2SP multi-section plaintext format, where sections are delimited by blank lines (`\n\n`) and identified by headers:
+Responses use the C2SP multi-section plaintext format (`format.go`), where sections are delimited by blank lines (`\n\n`) and framed by section headers `— <section-name>[ <args>] —`:
 
 ```text
-— checkpoint —
+— vindex/v1 —
 origin example.com/vindex
 123456
 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+— example.com/witness-1 p7c...
 
-— mpt-proof-v1 —
-0102a3b4...
+— output-log-leaf-v1 42 —
+0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+origin example.com/inputlog
+98765
+k2g...
 
-— prefix-compact-range-v1 —
-c8a3f120...
+— output-log-proof-v1 —
+MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=
 
-— entries —
+— mpt-proof-v1 inclusion —
+AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+
+— prefix-compact-range-v1 65536 —
+MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+
+— indices-v1 1042 —
 1042
 1089
 1150
 ```
 
 #### Section Breakdown:
-1. **Checkpoint**: The latest signed Output Log checkpoint note, containing tree size, root hash, and witness signatures.
-2. **`mpt-proof-v1`**: A binary Merkle Patricia Trie proof:
-   - If the key exists: an inclusion proof authenticating the key's 32-byte `SubRoot` against `MapRoot`.
-   - If the key does not exist: a non-inclusion proof proving the absence of the key in the trie.
-3. **`prefix-compact-range-v1`**: The RFC 6962 compact range root committing to all historical occurrences preceding the earliest index returned in the current page.
-4. **`entries`**: Newline-delimited list of decimal `uint64` leaf indices matching the search key in the Input Log.
+1. `— vindex/v1 —`: Raw signed Output Log checkpoint note (`ServingState.RawCheckpoint`), containing tree size, root hash, and witness cosignatures.
+2. `— output-log-leaf-v1 <leaf_index> —`: Output Log leaf data at `<leaf_index>`:
+   - Line 1: Hexadecimal-encoded 32-byte `MapRoot` (64 characters).
+   - Line 2+: Raw signed Input Log checkpoint note (`ServingState.RawInputLogCP`).
+3. `— output-log-proof-v1 —`: Output Log Merkle inclusion proof hashes, one base64-encoded SHA-256 hash per line.
+4. `— mpt-proof-v1 <inclusion|non-inclusion> —`: Base64-encoded binary Sparse Merkle Patricia Trie proof:
+   - `inclusion`: Proves that `SubRoot` exists at `KeyHash` within `MapRoot`.
+   - `non-inclusion`: Proves that `KeyHash` does not exist in the trie.
+5. `— prefix-compact-range-v1 <covered_size> —`: Base64-encoded compact hashes committing to the prior `<covered_size>` occurrences, one per line. Omitted entirely if `covered_size == 0`.
+6. `— indices-v1 [<next_before>] —`: Decimal ASCII occurrence indices matching the search key in the Input Log, one per line. If older occurrences remain, `<next_before>` indicates the continuation cursor.
+
+For non-inclusion responses, sections 4 and 6 are formatted as:
+```text
+— mpt-proof-v1 non-inclusion —
+AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+
+— indices-v1 —
+```
 
 ### 2.3 The Inductive Backward Verification Protocol
 To prove completeness across paginated responses without expensive consistency proofs, pagination proceeds backwards:
 
-#### Step 1: Initial Query (Page 1)
-1. The client queries `GET /vindex/lookup/{KeyHash}?limit=1000` (no `before` cursor).
-2. The server pulls the front folder from the inverted drawer:
-   - Evaluates `mpt.Prove(keyHash)` under reader snapshot isolation.
-   - Reads the latest chunk's entries from Pebble DB.
+#### Step 1: Initial Query (Tip / Page 1)
+1. The client queries `GET /vindex/v1/lookup/{KeyHash}?limit=100` (default limit 100, max 1000, no `before` cursor).
+2. The server acquires reader snapshot isolation under `ServingState`:
+   - Evaluates `mptMgr.ProveLocked(keyHash)`.
+   - Reads matching occurrence indices from Pebble DB up to `ServingState.InputLogSize`.
 3. The client receives Page 1 and verifies:
-   - Verifies the Output Log checkpoint note against trusted witness keys.
-   - Verifies `mpt-proof-v1` against `MapRoot`, proving `SubRoot`.
-   - Hashes the returned indices and `prefix-compact-range-v1` according to RFC 6962 rules to reconstruct the candidate mini-log root, asserting equality with `SubRoot`.
+   - Verifies the Output Log checkpoint note (`— vindex/v1 —`) against trusted witness keys.
+   - Verifies the Output Log leaf (`— output-log-leaf-v1 <leaf_index> —`) inclusion proof (`— output-log-proof-v1 —`) against the Output Log checkpoint root.
+   - Verifies the raw Input Log checkpoint note signature from the leaf data.
+   - Verifies `— mpt-proof-v1 inclusion —` against `MapRoot`.
+   - Reconstructs the mini-log compact range from `— prefix-compact-range-v1 <covered_size> —` (if present) and `— indices-v1 —` decimal indices (each encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00), asserting equality with `SubRoot`.
    - **Page 1 is now cryptographically authenticated.**
 
 #### Step 2: Continuation Queries (Page 2..N)
-1. If `prefix-compact-range-v1` is non-empty, historical occurrences remain unread.
-2. The client sets `before = min(seen_indices)` and queries `GET /vindex/lookup/{KeyHash}?before=1042&limit=1000`.
-3. The server reaches for the folder immediately behind the active chunk, returning older entries and an updated `prefix-compact-range-v1`.
+1. If `indices-v1` contains `<next_before>` (or if `prefix-compact-range-v1` indicates unread historical occurrences):
+2. The client queries `GET /vindex/v1/lookup/{KeyHash}?before=<next_before>&limit=100`.
+3. The server queries earlier entries from Pebble DB strictly before `before` and generates an updated `prefix-compact-range-v1`.
 4. The client verifies:
-   - Hashes the new entries against the new `prefix-compact-range-v1`.
-   - Asserts that the computed root matches the **`prefix-compact-range-v1` root from Page 1**.
+   - Reconstructs the compact range for the page using the updated prefix range and page indices.
+   - Asserts inductive backward continuity: each page's indices and prefix range strictly precede the next page.
 5. This process repeats inductively until `prefix-compact-range-v1` is empty, proving that every historical leaf has been retrieved without gaps or omissions.
 
 ### 2.4 Reader Snapshot Isolation
@@ -141,43 +168,12 @@ Serving_CP.InputSize <= Output_CP.InputSize
   - *Mechanism*: Serializes C2SP multi-section responses directly into the `http.ResponseWriter` using buffered I/O, avoiding JSON reflection and heap marshalling.
   - *Impact*: Delivers sub-millisecond P50 read latency (< 1ms) and sustains high lookup throughput under concurrent ingestion.
 
-### 2.6 Go Interfaces & Public Types
+### 2.6 Serving Contract
 
-```go
-package server
+The read serving subsystem exposes point lookups and checkpoint retrieval over HTTP:
 
-import (
-	"context"
-	"crypto/sha256"
-	"net/http"
-
-	"github.com/transparency-dev/formats/log"
-	"github.com/transparency-dev/merkle/compact"
-)
-
-// Server coordinates HTTP endpoints for VIndex lookups and checkpoints.
-type Server struct {
-	httpServer *http.Server
-	store      IndexStore
-	mptMgr     MPTManager
-	publisher  Publisher
-}
-
-// LookupResponse captures the multi-section verifiable response.
-type LookupResponse struct {
-	Checkpoint   *log.Checkpoint
-	MPTProof     []byte
-	SubRoot      [sha256.Size]byte
-	Exists       bool
-	CompactRange *compact.Range
-	Indices      []uint64
-}
-
-// IndexStore defines the storage query subset required by the server.
-type IndexStore interface {
-	Lookup(keyHash [sha256.Size]byte, before uint64, limit int) (indices []uint64, compactRange *compact.Range, err error)
-}
-```
+- **Non-Blocking Read Path**: The read path is completely non-blocking with respect to ingestion and Output Log fsync. Requests acquire immutable serving state snapshots without holding locks or contending with storage writes.
+- **Request Validation & Limits**: Requests strictly validate key hash format (requiring a 64-character lowercase hexadecimal string representing the 32-byte hash) and clamp query limits (default 100, maximum 1000).
 
 ---
 

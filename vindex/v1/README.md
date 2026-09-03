@@ -119,7 +119,30 @@ The VIndex topology bounds search indexing between two append-only logs—a stru
 
 ---
 
-## 8. Spec-Driven Development Workflow
+## 8. Repository Structure & Development Workflow
+
+### Repository Structure
+The `vindex/v1/` repository layout reflects the decoupled modular architecture:
+
+- [`client/`](./client/README.md): Public, stateless client verification SDK and cryptographic proof validation pipeline.
+- [`cmd/`](./cmd/): Command-line developer utilities and operational binaries.
+  - [`vindex-wasm/`](./cmd/vindex-wasm/): CLI tooling for inspecting, testing, and benchmarking WASM mapping plugins.
+- [`docs/`](./docs/): Authoritative specifications, system architecture designs, application profiles, and empirical benchmarks.
+- [`hammer/`](./hammer/README.md): Synthetic Zipfian load generator, drip-feed proxy scheduler, and closed-loop verification harness.
+- [`internal/`](./internal/): Private core engine subsystems:
+  - [`auditor/`](./internal/auditor/README.md): Full-log independent auditor, root mismatch detection, and verified mirror engine.
+  - [`coordinator/`](./internal/coordinator/README.md): Batch loop orchestration, watermark synchronization, and Zero-WAL crash recovery.
+  - [`ingest/`](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, and concurrent WASM worker pool.
+  - [`kvstore/`](./internal/kvstore/README.md): Embedded Pebble LSM inverted chunk storage engine with bitwise chunk inversion.
+  - [`metrics/`](./internal/metrics/): Prometheus metrics registration, latency histograms, and engine telemetry instrumentation.
+  - [`server/`](./internal/server/README.md): C2SP HTTP read server and multi-section plaintext response serialization.
+  - [`tree/`](./internal/tree/README.md): Sparse Merkle Patricia Trie (MPT), mmap allocation, and Output Log publisher.
+- [`mapfn/`](./mapfn/README.md): WebAssembly guest SDK, memory arena runtime, and example mapping plugins:
+  - [`sdk/`](./mapfn/sdk/): In-guest runtime harness, pack-and-wipe memory slabs, and low-level ABI bindings.
+  - [`examples/`](./mapfn/examples/): Example mapping plugins for transparency ecosystems (SumDB, Certificate Transparency, starter).
+- [`vindex.go`](./vindex.go): Top-level engine lifecycle orchestrator (`Engine`) and public Go API entrypoint.
+
+### Spec-Driven Development Workflow
 
 The VIndex codebase is organized into a stacked development hierarchy:
 

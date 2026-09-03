@@ -99,6 +99,11 @@ func main() {
 
 The `sdk.Register` harness automatically binds the user's pure function to the low-level `map_bundle` FFI export, handling the memory slab unpacking and serialization loops transparently.
 
+#### WASM Guest ABI Contract:
+To exchange data across the FFI boundary while eliminating per-leaf allocation overhead:
+- **Memory Lifecycle**: The guest provides a linear memory arena for input tile bundles. The host passes the bundle into guest linear memory, invokes the entrypoint, and parses the resulting key-offset entries. The host resets the arena between invocations.
+- **Statelessness Invariant**: Guest code must maintain zero mutable state across invocations. All mapping logic must be deterministic and pure; execution depends strictly on the bytes of each individual leaf.
+
 ---
 
 ### 2.2 Low-Level WASM ABI & The Pack-and-Wipe Memory Slab
@@ -185,7 +190,7 @@ vindex-map inspect --wasm=map.wasm
 
 ### 3.1 Per-Leaf Mapping (`map_leaf`) vs. Bundled Mapping (`map_bundle`)
 - **Proposed**: Invoking an exported `map_leaf(ptr, len)` guest function individually for every leaf.
-- **Empirical Rejection**: Generated 768 FFI calls per 256-leaf tile (`alloc` + `map_leaf` + `reset` x 256). Profiling revealed that ~23% of total host CPU time was spent purely on boundary-crossing overhead.
+- **Empirical Rejection**: Generated 768 FFI calls per 256-leaf tile (memory allocation, leaf mapping, and arena reset transitions x 256). Profiling revealed that ~23% of total host CPU time was spent purely on boundary-crossing overhead.
 - **Chosen Design**: Bundled mapping (`map_bundle`) processes all 256 leaves in a single invocation via shared memory slabs, reducing FFI overhead to < 1%.
 
 ### 3.2 In-Guest Software Cryptography vs. Host SIMD Preimage Hashing

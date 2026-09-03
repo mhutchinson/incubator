@@ -12,7 +12,7 @@ VIndex operates as a **Map Sandwich** bounded between an **Input Log** (the immu
 This document specifies the technical system architecture: the 5-stage pipeline, checkpoint promotion and ratcheting invariants, crash consistency guarantees, operational sizing, and retired design branches.
 
 ### 0.1 Primary Pipeline Flow & Subsystem Map
-Data progresses sequentially through 5 modular stages, coordinated by the lifecycle engine:
+Data progresses sequentially through 5 modular stages, coordinated by the coordinator:
 
 | # | Pipeline Stage | Subsystem Directory | Physical Responsibility & Transition |
 | :- | :--- | :--- | :--- |
@@ -20,8 +20,8 @@ Data progresses sequentially through 5 modular stages, coordinated by the lifecy
 | **2** | **Sandboxed Mapping** | [`mapfn/`](../mapfn/README.md) & [`internal/ingest/`](../internal/ingest/README.md) | Ingestion host worker pool executes guest WASM plugins built with the Guest SDK (`mapfn/`), extracts canonical preimages via `map_bundle`, and executes host SIMD SHA-256 hashing. |
 | **3** | **Inverted Storage** | [`internal/kvstore/`](../internal/kvstore/README.md) | Batches updates into Pebble LSM inverted chunks (`'c'`), applies 16-bit relative index encoding, and executes blocking `pebble.Sync`. |
 | **4** | **State Commitment** | [`internal/tree/`](../internal/tree/README.md) | Predicts future `MapRoot` lock-free (`mpt.Predict`), appends state commitment to the Tessera Output Log, collects witness cosignatures, and ratchets the in-memory trie pointer. |
-| **5** | **Read Serving** | [`internal/server/`](../internal/server/README.md) | Serves multi-section C2SP HTTP lookups, RFC 6962 prefix compact ranges, and inductive backward pagination (`before=X`), strictly isolated to witnessed checkpoints. |
-| *(Orch)* | **Coordinator** | [`internal/coordinator/`](../internal/coordinator/README.md) | Drives the batch loop across stages 1–4, freezes `m_target_checkpoint`, tracks watermarks, and executes Zero-WAL startup recovery. |
+| **5** | **Read Serving** | [`internal/server/`](../internal/server/README.md) | Serves multi-section C2SP HTTP lookups (`/vindex/v1/lookup/{keyhash}`), RFC 6962 prefix compact ranges, and inductive backward pagination (`before=X`), strictly isolated to witnessed checkpoints. |
+| *(Orch)* | **Coordinator** | [`internal/coordinator/`](../internal/coordinator/README.md) | Drives the batch loop across stages 1–4, freezes target input checkpoint, tracks watermarks, and executes Zero-WAL startup recovery. |
 | *(Client)* | **Client SDK** | [`client/`](../client/README.md) | Stateless public Go client for querying nodes and cryptographically verifying lookup responses against witnessed checkpoints. |
 | *(Audit)* | **Auditor & Mirror** | [`internal/auditor/`](../internal/auditor/README.md) | Audits published Output Log roots from leaf 0, alerts on root mismatches, triggers state-preserving halts, and optionally serves verified mirror lookups. |
 
@@ -38,18 +38,18 @@ Progress is governed by two complementary rules: **promoting checkpoints forward
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`Target_CP`** | Input Log | `Target_CP.Size` | Durable (`pebble.Sync` in Pebble metadata) | Upstream poll & origin note verification | Upper goalpost for current sync cycle; prevents moving-goalpost starvation. |
 | **`KV_CP`** | Input Log | `KV_CP.Size` | Durable (`pebble.Sync` in Pebble LSM) | Atomic flush of `'c'` chunk records | Durably binds indexed `'c'` chunk records to the verified Input Log state they cover. |
-| **`Output_CP`** | Output Log | `Output_CP.InputSize` (committed in leaf) | Durable (Tessera Output Log storage) | Append commitment leaf & witness cosigning | Cryptographically commits to index root (`MapRoot` + covered Input Log checkpoint). |
-| **`Serving_CP`** | Output Log Leaf | `Serving_CP.InputSize` | Volatile (In-memory atomic pointer) | Pointer swap under exclusive writer lock (< 5ms) | Active state exposed to client HTTP readers. |
+| **`Output_CP`** | Output Log | Output Log tree size (`Output_CP.Size`) committing Input Log size (`InputLogSize` in leaf) | Durable (Tessera Output Log storage) | Append commitment leaf & witness cosigning | Cryptographically commits to index root (`MapRoot` + covered Input Log checkpoint). **Size Distinction**: `Output_CP.Size` represents the tree size (number of commitment leaves) of the Output Log itself, whereas the committed Input Log size covered by the index is stored inside the Output Log leaf payload (`InputLogSize`). |
+| **`Serving_CP`** | Output Log Leaf | `Serving_CP.InputLogSize` | Volatile (In-memory atomic pointer) | Pointer swap under exclusive writer lock (< 5ms) | Active state exposed to client HTTP readers. |
 
 **The Checkpoint Monotonic Progression Invariant**:
 ```text
-Target_CP.Size >= KV_CP.Size >= Output_CP.InputSize >= Serving_CP.InputSize
+Target_CP.Size >= KV_CP.Size >= Output_CP.Leaf.InputLogSize >= Serving_CP.InputLogSize
 ```
 Every relation in the chain is `>=`:
 - `Target_CP.Size >= KV_CP.Size`: Batches accumulate and commit in discrete chunks toward the target goalpost.
-- `KV_CP.Size >= Output_CP.InputSize`: Inverted chunk storage writes must complete `pebble.Sync` before Output Log append begins.
-- `Output_CP.InputSize >= Serving_CP.InputSize`: Appending to the Output Log and collecting witness signatures occur outside reader locking; `Output_CP` is naturally ahead until the writer acquires the exclusive writer lock to swap the serving pointer.
-Because storage persistence strictly precedes Output Log publication (`KV_CP.Size >= Output_CP.InputSize`), startup recovery is mathematically guaranteed never to encounter an Output Log commitment referencing uncommitted or missing KV chunks.
+- `KV_CP.Size >= Output_CP.Leaf.InputLogSize`: Inverted chunk storage writes must complete `pebble.Sync` before Output Log append begins.
+- `Output_CP.Leaf.InputLogSize >= Serving_CP.InputLogSize`: Appending to the Output Log and collecting witness signatures occur outside reader locking; `Output_CP` is naturally ahead until the writer acquires the exclusive writer lock to swap the serving pointer.
+Because storage persistence strictly precedes Output Log publication (`KV_CP.Size >= Output_CP.Leaf.InputLogSize`), startup recovery is mathematically guaranteed never to encounter an Output Log commitment referencing uncommitted or missing KV chunks.
 
 ---
 
@@ -131,11 +131,13 @@ The KV storage engine persists search keys and their occurrence lists into an em
   - *Impact*: Eliminates >90% of Pebble block cache read I/O during high-throughput ingestion.
 
 ### 1.4 Stage 4: State Commitment ([`internal/tree/`](../internal/tree/README.md))
-The commitment plane anchors the updated search index in an append-only Output Log using a 3-step atomic commitment sequence.
+The commitment plane anchors the updated search index in an append-only Output Log. As data preparation, each search key's occurrences in the Input Log form an append-only mini-log where each absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00, producing a mini-log sub-root committing to the complete historical sequence of occurrences.
 
-1. **Lock-Free Prediction**: The publisher pre-computes the future `MapRoot` in memory without acquiring reader locks or blocking concurrent HTTP lookups.
-2. **Output Log Append & Witnessing**: The state commitment binding the predicted `MapRoot` to the Input Log checkpoint is appended to the append-only Output Log and submitted to external witnesses to collect cryptographic cosignatures.
-3. **In-Memory Atomic Swap**: The publisher briefly acquires the exclusive writer lock, confirms that the actual computed root matches the prediction, swaps the active `ServingState` pointer, and releases the lock (< 5ms critical section).
+Following data preparation, the commitment plane executes a 3-step atomic commitment sequence (Prediction -> Immutable Output Log Append -> Atomic State Ratchet):
+
+1. **Prediction (Lock-Free Prediction)**: The publisher pre-computes the future `MapRoot` in memory across modified mini-log sub-roots without acquiring reader locks or blocking concurrent HTTP lookups.
+2. **Immutable Output Log Append & Witnessing**: The state commitment binding the predicted `MapRoot` to the Input Log checkpoint is appended to the append-only Output Log (advancing the Output Log's own tree size `Output_CP.Size`, while committing the Input Log size `InputLogSize` inside the leaf payload) and submitted to external witnesses to collect cryptographic cosignatures.
+3. **Atomic State Ratchet**: The publisher briefly acquires the exclusive publisher lock, confirms that the actual computed root matches the prediction, swaps the active serving state pointer, and releases the lock (< 5ms critical section).
 
 - **[Correctness Invariant] Fatal Halt on Root Prediction Divergence**:
   - *Rule*: When the writer lock is acquired to commit in-memory mutations, the actual computed tree root must strictly match the predicted root previously committed to the Output Log. If any divergence is detected, the daemon halts immediately with a fatal panic.
@@ -154,11 +156,11 @@ The commitment plane anchors the updated search index in an append-only Output L
 ### 1.5 Stage 5: Read Serving ([`internal/server/`](../internal/server/README.md))
 The HTTP read server exposes verifiable point lookups adhering to Community Cryptography Specification Project ([C2SP](https://c2sp.org/)) conventions.
 
-1. **Lookup Routing**: Serves point queries by key hash and publishes current index checkpoints.
+1. **Lookup Routing**: Serves point queries by key hash (`GET /vindex/v1/lookup/{keyhash}`) and publishes current index checkpoints (`GET /vindex/v1/checkpoint`).
 2. **Cryptographic Proof Packaging**: Packages an authenticated Merkle non-inclusion or inclusion proof against the active `MapRoot`, reads matching leaf indices from storage, and includes prefix compact ranges for client verification.
 
 - **[Correctness Invariant] Serving Isolation Invariant**:
-  - *Rule*: Client queries are strictly isolated to data committed by the active serving checkpoint (`Serving_CP.InputSize <= Output_CP.InputSize`). Any in-flight storage writes ahead of `Serving_CP` must be invisible to readers.
+  - *Rule*: Client queries are strictly isolated to data committed by the active serving checkpoint (`Serving_CP.InputLogSize <= Output_CP.Leaf.InputLogSize`). Any in-flight storage writes ahead of `Serving_CP` must be invisible to readers.
   - *Rationale*: Ensures that every response returned by the server can be mathematically proven against the currently witnessed checkpoint.
   - *Consequence ("Or Else")*: Readers would observe un-witnessed or uncommitted future entries, causing client-side Merkle proof verification to fail.
 
@@ -178,27 +180,29 @@ The HTTP read server exposes verifiable point lookups adhering to Community Cryp
 ### 2.1 The Universal Crash Invariant
 Because storage persistence strictly precedes Output Log publication:
 ```text
-KV_CP.Size >= Output_CP.InputSize   (m_kv_size >= Output_Size)
+KV_CP.Size >= Output_CP.Leaf.InputLogSize   (persisted KV storage watermark >= Output_Leaf.InputLogSize)
 ```
-This invariant holds under all crash, kill, and power loss scenarios. Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted or missing KV store chunks. If a crash occurs after storage sync but before Output Log publishing, `KV_CP.Size > Output_CP.InputSize`; startup recovery safely ignores chunks beyond `Output_CP.InputSize` via point-in-time `store.GetSubRoot(keyHash, Output_CP.InputSize)` queries.
+This invariant holds under all crash, kill, and power loss scenarios. Note the distinction between the Output Log's own Merkle tree size (`Output_CP.Size`) and the committed Input Log size inside each Output Log leaf payload (`Output_CP.Leaf.InputLogSize`). Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted or missing KV store chunks. If a crash occurs after storage sync but before Output Log publishing, `KV_CP.Size > Output_CP.Leaf.InputLogSize`; startup recovery safely ignores chunks beyond `Output_CP.Leaf.InputLogSize` via point-in-time `store.GetSubRoot(keyHash, Output_CP.Leaf.InputLogSize)` queries.
 
 ### 2.2 Zero-WAL Startup Recovery Sequence
 On daemon launch, the coordinator executes a 3-phase Zero-WAL recovery sequence before opening read and write interfaces:
 
 1. **Phase 1: Instant Warm Start (< 5ms)**:
-   - Evaluates whether the persisted MPT size equals the latest committed Output Log state (`Output_CP.InputSize`) and the trie root matches the published leaf commitment.
+   - Evaluates whether the persisted MPT size equals the latest committed Output Log state (`Output_CP.Leaf.InputLogSize`) and the trie root matches the published leaf commitment (`MapRoot`).
    - If true, clean shutdown is verified. Activates the latest published checkpoint as `Serving_CP`, and **opens the HTTP Read Server immediately (< 5ms)**.
 2. **Phase 2: Fast-Forward Tile Replay (< 500ms)**:
    - If the persisted MPT lags behind the latest Output Log commitment (dirty crash recovery):
      - Streams missing historical tiles across the lag window directly from the local disk cache.
      - Maps replayed tiles identify modified search keys.
-     - Reconstructs mini-log sub-roots for modified keys up to `Output_CP.InputSize` with **zero database writes**.
+     - Reconstructs mini-log sub-roots for modified keys up to `Output_CP.Leaf.InputLogSize` (where each occurrence leaf is an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00) with **zero database writes**.
      - Updates in-memory trie nodes, asserts that the resulting root strictly matches the Output Log commitment, flushes trie persistence to disk, activates `Serving_CP`, and **opens the Read Server (< 500ms)**.
 3. **Phase 3: Background Catchup**:
    - Resumes forward ingestion from `KV_CP` toward `Target_CP`.
 
-### 2.3 Moving-Goalpost Prevention
+### 2.3 Moving-Goalpost Prevention & Mini-Log Determinism
 When indexing high-velocity logs, the upstream log head advances continuously. Polling unverified checkpoints on every batch risks synchronization starvation. The coordinator freezes verified target sync checkpoints into durable database metadata prior to batch processing, ensuring that the ingestion pipeline processes fixed ranges to completion before advancing to a new target.
+
+Mini-log sub-roots within the target boundary are computed deterministically by encoding each occurrence index as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00. This deterministic leaf hashing guarantees that independent indexer replicas and client verifiers compute identical mini-log roots for any given Input Log prefix.
 
 ---
 
@@ -310,7 +314,7 @@ The daemon exports Prometheus metrics covering the entire lifecycle:
 ### 5.4 In-Guest Software Cryptographic Hashing
 - **Proposed**: Compiling SHA-256 cryptographic hashing into guest WebAssembly bytecode.
 - **Empirical Rejection**: Consumed ~55% of all CPU cycles during mapping due to lack of SIMD vector instructions inside WASM.
-- **Resolution**: Delegated hashing to the Go host (`crypto/sha256`), leveraging hardware vector instructions (SHA-NI / ARMv8 Crypto).
+- **Resolution**: Delegated hashing to the host, leveraging hardware vector instructions (SHA-NI / ARMv8 Crypto).
 
 ### 5.5 Sparse Merkle Trees (SMT) & Verkle Trees
 - **SMT**: Rejected due to prohibitive memory and disk I/O across 256-level tree depths.

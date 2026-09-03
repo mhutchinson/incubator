@@ -21,7 +21,7 @@ The client SDK functions like a bank customer verifying an itemized transaction 
 ### 1.3 Goals & Non-Goals
 - **Goals**:
   - Provide a lightweight, zero-dependency public Go package (`vindex/v1/client`) usable by external applications, CLIs, and monitoring services.
-  - Implement strict cryptographic verification for all query responses (`/vindex/lookup/{keyhash}` and `/checkpoint`).
+  - Implement strict cryptographic verification for all query responses (`/vindex/v1/lookup/{keyhash}` and `/vindex/v1/checkpoint`).
   - Verify Output Log checkpoint note signatures against configured witness public keys.
   - Verify Output Log Merkle inclusion proofs for the committed `MapRoot`.
   - Verify MPT inclusion and non-inclusion proofs for requested 32-byte key hashes.
@@ -46,7 +46,7 @@ The client library is completely decoupled from the indexing and audit subsystem
 
 | Component | Responsibility | External Dependencies |
 | :--- | :--- | :--- |
-| `client.Client` | HTTP communication with VIndex nodes (`GET /vindex/lookup/{keyhash}`, `GET /checkpoint`). | Go standard library (`net/http`, `context`). |
+| `client.Client` | HTTP communication with VIndex nodes (`GET /vindex/v1/lookup/{keyhash}`, `GET /vindex/v1/checkpoint`). | Go standard library (`net/http`, `context`). |
 | `client.Parser` | Parses C2SP multi-section plaintext wire format into structured proof objects. | Go standard library (`bufio`, `bytes`, `strconv`). |
 | `client.Verifier` | Executes pure cryptographic assertions on parsed proof structures. | Standard `crypto/sha256`, `github.com/transparency-dev/formats/log`. |
 
@@ -59,7 +59,7 @@ For every lookup request, the client SDK executes the following deterministic 5-
 | **1** | **Checkpoint Authentication** | Verifies note format and cryptographic signatures on the Output Log checkpoint. | Number of valid witness cosignatures >= configured threshold `MinWitnessSignatures`. |
 | **2** | **Output Log Merkle Proof** | Verifies the Merkle inclusion proof committing `MapRoot` into the Output Log. | `proof.VerifyInclusion(OutputTreeSize, LeafIndex, MapRootCommitment) == OutputTreeRoot`. |
 | **3** | **MPT Proof Verification** | Evaluates the bitwise Sparse Merkle Tree path traversal against `MapRoot`. | **Inclusion**: Proves `SubRoot` exists at `KeyHash`.<br>**Non-Inclusion**: Proves path terminates in empty node or mismatched prefix. |
-| **4** | **Mini-Log Compact Range** | Reconstructs RFC 6962 compact range from returned leaf indices and previous chunk hashes. | `ReconstructCompactRange(LeafIndices, PrevChunkHash) == SubRoot`. |
+| **4** | **Mini-Log Compact Range** | Reconstructs RFC 6962 compact range from returned leaf indices and prefix compact range. | `CompactRange.GetRootHash() == SubRoot`. |
 | **5** | **Monotonic History Check** | When evaluating consecutive queries on key K where S_new >= S_old: | `I_new[:len(I_old)] == I_old` (historical indices cannot mutate or disappear). |
 
 #### Step Details:
@@ -68,21 +68,27 @@ For every lookup request, the client SDK executes the following deterministic 5-
 3. **Sparse Merkle Tree Verification**: Evaluates the 256-bit path for the 32-byte key hash:
    - For an **inclusion proof**, asserts that hashing up the provided sibling nodes reproduces the committed `MapRoot`, proving that the returned `SubRoot` is authentically bound to the key.
    - For a **non-inclusion proof**, asserts that the trie path terminates at a nil leaf or a conflicting prefix node, mathematically proving that no records exist for the key hash at this checkpoint.
-4. **Mini-Log Compact Range Reconstruction**: Parses the returned occurrence indices `[i_0, i_1, ..., i_k]` and the preceding chunk hash. Recomputes the compact range root using RFC 6962 rules and asserts that it matches the authenticated `SubRoot`.
+4. **Mini-Log Compact Range Reconstruction**: Reconstructs the mini-log root using RFC 6962 tree hashing:
+   - Mini-log leaf hashing: each absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00.
+   - The client uses `compact.RangeFactory` (or `Range.Append`) to incrementally accumulate leaf hashes over the returned `IndexValue` occurrence indices.
+   - If paginating, it initializes the range from the `prefix-compact-range-v1` compact hashes committing to all preceding historical occurrences (`prefixCoveredSize`), then appends the page's indices.
+   - The resulting compact range root is asserted to match the authenticated MPT `SubRoot`.
 5. **Monotonic History Assertion**: If the client maintains historical query cache for key K, it asserts that subsequent queries at larger checkpoints contain the previous indices as an exact prefix.
 
 ### 2.3 Backward Pagination Protocol
 
 When a key has more occurrence records than fit in a single response (or when paginating using `?before={cursor}`):
-1. **Initial Query**: The client queries `GET /vindex/lookup/{keyhash}` without a cursor.
-   - Response contains the latest chunk of occurrences, the MPT proof, and a `prev_chunk_hash` / `before` cursor.
-2. **Intermediate Page Query**: The client queries `GET /vindex/lookup/{keyhash}?before={cursor}`.
-   - Response contains earlier occurrences and the next `prev_chunk_hash`.
-3. **Inductive Verification Chain**: The client verifies that each page's occurrences and previous chunk hash hash up to the `prev_chunk_hash` asserted in the newer page:
-   ```text
-   Page N (SubRoot) -> Page N-1 (PrevChunkHash) -> Page N-2 -> ... -> Genesis Chunk
-   ```
-4. **Integrity Guarantee**: This inductive linkage guarantees that historical pages cannot be altered, reordered, or truncated by the server, even across multiple HTTP requests.
+1. **Initial Tip Query**: The client queries `GET /vindex/v1/lookup/{keyhash}` without a cursor.
+   - Response contains the latest page of occurrence indices, the MPT proof against `MapRoot`, and an optional `prefix-compact-range-v1` section if older entries exist.
+   - If more historical occurrences exist, the response includes a `next_before` cursor argument on `indices-v1`.
+2. **Backward Continuation Query**: The client queries `GET /vindex/v1/lookup/{keyhash}?before={cursor}`.
+   - Response contains earlier occurrences and an updated `prefix-compact-range-v1` committing to records preceding this page.
+3. **Incremental Compact Range Accumulation**:
+   - Rather than relying on a separate hash chain, verification uses incremental RFC 6962 compact range accumulation.
+   - The client constructs a compact range from `prefix-compact-range-v1` (covering `prefixCoveredSize`) via `compact.RangeFactory`, then appends the returned `IndexValue` indices (each encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00).
+   - For tip queries (`before == nil`), the accumulated compact range root is directly asserted against the authenticated MPT `SubRoot`.
+   - For backward pagination, continuity is verified inductively by ensuring each page's indices and prefix range strictly precede the next page.
+4. **Integrity Guarantee**: Inductive compact range accumulation guarantees that historical pages cannot be altered, reordered, or truncated by the server across multiple HTTP requests.
 
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
@@ -114,55 +120,22 @@ When a key has more occurrence records than fit in a single response (or when pa
 | `ErrHistoryRegression` | Returned occurrences omit or mutate indices present in earlier queries. | Security alert; abort query (server executed an index rollback). |
 | `ErrServerDegraded` | Server returned HTTP 503 (mirror in fail-closed mode or syncing). | Retry with exponential backoff or query an alternative mirror. |
 
-### 2.6 Public Go Interfaces & Types
+### 2.6 Client Contract & API Requirements
 
-```go
-package client
+The client library provides a stateless query interface implementing strict zero-trust verification:
 
-import (
-	"context"
-	"crypto/sha256"
-	"net/http"
-	"time"
-
-	"github.com/transparency-dev/formats/log"
-	"golang.org/x/mod/sumdb/note"
-)
-
-// Client executes verified lookups against VIndex servers.
-type Client struct {
-	cfg        *Config
-	httpClient *http.Client
-}
-
-// Config specifies client connection and verification parameters.
-type Config struct {
-	ServerURL            string
-	OutputLogOrigin      string
-	WitnessVerifiers     []note.Verifier
-	MinWitnessSignatures int
-	Timeout              time.Duration
-}
-
-// LookupResult contains cryptographically verified search occurrences.
-type LookupResult struct {
-	KeyHash          [sha256.Size]byte
-	Occurrences      []uint64
-	OutputTreeSize   uint64
-	MapRoot          [sha256.Size]byte
-	HasMore          bool
-	NextBeforeCursor uint64
-}
-
-// New creates a new verified VIndex client.
-func New(cfg *Config) (*Client, error)
-
-// Lookup queries the server and cryptographically verifies the response.
-func (c *Client) Lookup(ctx context.Context, keyHash [sha256.Size]byte, opts ...LookupOption) (*LookupResult, error)
-
-// VerifyResponse parses and cryptographically verifies a raw HTTP response.
-func VerifyResponse(rawBody []byte, cfg *Config, keyHash [sha256.Size]byte) (*LookupResult, error)
-```
+- **Inputs**:
+  - VIndex service URL.
+  - 32-byte search key hash (`KeyHash = SHA256(ClaimSubject)`).
+  - Input Log verifier.
+  - Output Log verifier.
+  - Optional `before` pagination cursor.
+  - Optional `limit`.
+- **Outputs**:
+  - Ordered list of uint64 Input Log occurrence indices.
+  - Raw signed Input Log checkpoint.
+- **Guarantees**:
+  - Client unconditionally rejects unverified or cryptographically inconsistent responses. Any invalid checkpoint signature, Merkle inclusion proof failure, trie path defect, or compact range mismatch triggers an immediate verification error.
 
 ---
 
