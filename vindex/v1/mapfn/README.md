@@ -26,7 +26,7 @@ Relying on in-process native Go plugins or shared libraries introduces three sev
   - Provide a zero-allocation guest runtime SDK (`mapfn/sdk`) that binds the developer's function to the high-performance `map_bundle` ABI.
   - Freeze compiler and standard library bytecode inside a hermetic `.wasm` binary, guaranteeing bit-for-bit identical execution across all host architectures, operating systems, and toolchain versions.
   - Amortize boundary-crossing overhead by processing full 256-leaf crates in a single FFI call using contiguous shared-memory slabs.
-  - Provide an offline verification CLI (`vindex-map`) to validate determinism, memory bounds, and throughput prior to deployment.
+  - Provide an offline verification CLI (`vindex-wasm`) to validate determinism, memory bounds, and throughput prior to deployment.
 - **Non-Goals**:
   - **No Host Execution in this Package**: The host-side Wazero runtime pool and SIMD hashing pipeline are housed in the Ingest subsystem (`internal/ingest`).
   - **No In-Place Dynamic Upgrades**: Once a compiled plugin binary is published for an Input Log, its bytecode is immutable. Fixing a parsing bug requires deploying a new index instance from leaf 0.
@@ -167,21 +167,21 @@ func map_bundle(inputPtr uint32, inputLen uint32) uint64
 
 ---
 
-### 2.4 Offline Developer Verification Tooling (`vindex-map`)
-The mapping subsystem provides a standalone CLI tool (`vindex/v1/cmd/vindex-map`) to allow plugin authors to test and qualify their mapping binaries before production deployment:
+### 2.4 Offline Developer Verification Tooling (`vindex-wasm`)
+The mapping subsystem provides a standalone CLI tool (`vindex/v1/cmd/vindex-wasm`) to allow plugin authors to test and qualify their mapping binaries before production deployment:
 
 ```bash
 # Test mapping output against a sample tile or leaf
-vindex-map test --wasm=map.wasm --input=tile.bin
+vindex-wasm test --wasm=map.wasm --input=tile.bin
 
 # Run performance and throughput benchmarks (leaves/sec)
-vindex-map bench --wasm=map.wasm --input=tile.bin --iterations=1000
+vindex-wasm bench --wasm=map.wasm --input=tile.bin --iterations=1000
 
 # Assert bit-for-bit determinism across repeated executions
-vindex-map determinism --wasm=map.wasm --input=tile.bin
+vindex-wasm determinism --wasm=map.wasm --input=tile.bin
 
 # Inspect exported memory slabs and ABI metadata
-vindex-map inspect --wasm=map.wasm
+vindex-wasm inspect --wasm=map.wasm
 ```
 
 ---
