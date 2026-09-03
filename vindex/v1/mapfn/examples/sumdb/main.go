@@ -29,6 +29,8 @@ func init() {
 	sdk.RegisterRaw(MapSumDBLeaf)
 }
 
+var goModSuffix = []byte("/go.mod")
+
 // MapSumDBLeaf parses a Go SumDB log leaf, filtering pseudo-versions and returning canonical module path preimages.
 func MapSumDBLeaf(data []byte) [][]byte {
 	var results [8][]byte
@@ -66,7 +68,7 @@ func MapSumDBLeaf(data []byte) [][]byte {
 		} else {
 			verBytes = line[verStart : verStart+verLen]
 		}
-		verBytes = bytes.TrimSuffix(verBytes, []byte("/go.mod"))
+		verBytes = bytes.TrimSuffix(verBytes, goModSuffix)
 
 		// Fast zero-allocation pseudo-version filter
 		if isPseudoVersion(verBytes) {

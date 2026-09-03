@@ -72,6 +72,7 @@ type wasmInstance struct {
 	resetFn     api.Function
 	mem         api.Memory
 	packedBuf   []byte
+	staticInPtr uint32
 }
 
 // NewWASMHost compiles the guest bytecode and initializes a pool of instantiated WASM modules.
@@ -154,6 +155,22 @@ func (h *WASMHost) instantiateInstance(ctx context.Context) (*wasmInstance, erro
 
 	resetFn := mod.ExportedFunction("reset")
 
+	var staticInPtr uint32
+	if inBufFn := mod.ExportedFunction("input_buffer"); inBufFn != nil {
+		if res, err := inBufFn.Call(ctx); err == nil && len(res) > 0 && res[0] != 0 {
+			staticInPtr = uint32(res[0])
+		}
+	} else if allocFn != nil && resetFn != nil {
+		// Probe if the guest uses a static arena allocator.
+		p1, err1 := allocFn.Call(ctx, 64)
+		_, _ = resetFn.Call(ctx)
+		p2, err2 := allocFn.Call(ctx, 64)
+		_, _ = resetFn.Call(ctx)
+		if err1 == nil && err2 == nil && len(p1) > 0 && len(p2) > 0 && p1[0] != 0 && p1[0] == p2[0] {
+			staticInPtr = uint32(p1[0])
+		}
+	}
+
 	return &wasmInstance{
 		mod:         mod,
 		mapBundleFn: mapBundleFn,
@@ -161,6 +178,7 @@ func (h *WASMHost) instantiateInstance(ctx context.Context) (*wasmInstance, erro
 		allocFn:     allocFn,
 		resetFn:     resetFn,
 		mem:         mem,
+		staticInPtr: staticInPtr,
 	}, nil
 }
 
@@ -212,17 +230,21 @@ func (inst *wasmInstance) executeBundle(ctx context.Context, leaves [][]byte) ([
 		}
 
 		packedInput := inst.packBundle(leaves)
-		if inst.allocFn == nil {
-			return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
-		}
-
-		res, err := inst.allocFn.Call(ctx, uint64(len(packedInput)))
-		if err != nil {
-			return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
-		}
-		inPtr := uint32(res[0])
-		if inPtr == 0 {
-			return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
+		var inPtr uint32
+		if inst.staticInPtr != 0 && len(packedInput) <= 4*1024*1024 {
+			inPtr = inst.staticInPtr
+		} else {
+			if inst.allocFn == nil {
+				return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
+			}
+			res, err := inst.allocFn.Call(ctx, uint64(len(packedInput)))
+			if err != nil {
+				return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
+			}
+			inPtr = uint32(res[0])
+			if inPtr == 0 {
+				return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
+			}
 		}
 
 		if !inst.mem.Write(inPtr, packedInput) {
@@ -284,13 +306,28 @@ func decodeBundleOutput(outBuf []byte, expectedCount int) ([][]MappedEntry, erro
 
 	keyCountsOffset := 4
 	preimagesOffset := 4 + expectedCount*4
+
+	var totalKeys int
+	for i := 0; i < expectedCount; i++ {
+		totalKeys += int(binary.LittleEndian.Uint32(outBuf[keyCountsOffset+i*4 : keyCountsOffset+(i+1)*4]))
+	}
+
 	results := make([][]MappedEntry, expectedCount)
+	if totalKeys == 0 {
+		return results, nil
+	}
+
+	allEntries := make([]MappedEntry, totalKeys)
+	var curEntryIdx int
 
 	for i := 0; i < expectedCount; i++ {
-		kCount := binary.LittleEndian.Uint32(outBuf[keyCountsOffset+i*4 : keyCountsOffset+(i+1)*4])
-		entries := make([]MappedEntry, 0, kCount)
+		kCount := int(binary.LittleEndian.Uint32(outBuf[keyCountsOffset+i*4 : keyCountsOffset+(i+1)*4]))
+		if kCount == 0 {
+			continue
+		}
 
-		for j := uint32(0); j < kCount; j++ {
+		startEntryIdx := curEntryIdx
+		for j := 0; j < kCount; j++ {
 			if preimagesOffset+4 > len(outBuf) {
 				return nil, fmt.Errorf("%w: truncated key length header", ErrMalformedOutput)
 			}
@@ -303,16 +340,19 @@ func decodeBundleOutput(outBuf []byte, expectedCount int) ([][]MappedEntry, erro
 			keyBytes := outBuf[preimagesOffset : preimagesOffset+int(keyLen)]
 			preimagesOffset += int(keyLen)
 
-			h := sha256.Sum256(keyBytes)
-			entries = append(entries, MappedEntry{KeyHash: h})
+			allEntries[curEntryIdx] = MappedEntry{KeyHash: sha256.Sum256(keyBytes)}
+			curEntryIdx++
 		}
 
-		slices.SortFunc(entries, func(a, b MappedEntry) int {
-			return bytes.Compare(a.KeyHash[:], b.KeyHash[:])
-		})
-		entries = slices.CompactFunc(entries, func(a, b MappedEntry) bool {
-			return a.KeyHash == b.KeyHash
-		})
+		entries := allEntries[startEntryIdx:curEntryIdx]
+		if len(entries) > 1 {
+			slices.SortFunc(entries, func(a, b MappedEntry) int {
+				return bytes.Compare(a.KeyHash[:], b.KeyHash[:])
+			})
+			entries = slices.CompactFunc(entries, func(a, b MappedEntry) bool {
+				return a.KeyHash == b.KeyHash
+			})
+		}
 		results[i] = entries
 	}
 
@@ -334,16 +374,20 @@ func (inst *wasmInstance) executeLeaf(ctx context.Context, leaf []byte) ([]Mappe
 	var inputPtr uint32
 	leafLen := uint32(len(leaf))
 	if leafLen > 0 {
-		if inst.allocFn == nil {
-			return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
-		}
-		res, err := inst.allocFn.Call(ctx, uint64(leafLen))
-		if err != nil {
-			return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
-		}
-		inputPtr = uint32(res[0])
-		if inputPtr == 0 {
-			return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
+		if inst.staticInPtr != 0 && leafLen <= 4*1024*1024 {
+			inputPtr = inst.staticInPtr
+		} else {
+			if inst.allocFn == nil {
+				return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
+			}
+			res, err := inst.allocFn.Call(ctx, uint64(leafLen))
+			if err != nil {
+				return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
+			}
+			inputPtr = uint32(res[0])
+			if inputPtr == 0 {
+				return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
+			}
 		}
 		if !inst.mem.Write(inputPtr, leaf) {
 			return nil, fmt.Errorf("%w: failed to write leaf to guest memory at ptr %d len %d (mem size %d)",
@@ -378,16 +422,18 @@ func (inst *wasmInstance) executeLeaf(ctx context.Context, leaf []byte) ([]Mappe
 	}
 
 	// Post-processing: Sort by KeyHash and deduplicate
-	slices.SortFunc(entries, func(a, b MappedEntry) int {
-		if cmp := bytes.Compare(a.KeyHash[:], b.KeyHash[:]); cmp != 0 {
-			return cmp
-		}
-		return bytes.Compare(a.Value, b.Value)
-	})
+	if len(entries) > 1 {
+		slices.SortFunc(entries, func(a, b MappedEntry) int {
+			if cmp := bytes.Compare(a.KeyHash[:], b.KeyHash[:]); cmp != 0 {
+				return cmp
+			}
+			return bytes.Compare(a.Value, b.Value)
+		})
 
-	entries = slices.CompactFunc(entries, func(a, b MappedEntry) bool {
-		return a.KeyHash == b.KeyHash && bytes.Equal(a.Value, b.Value)
-	})
+		entries = slices.CompactFunc(entries, func(a, b MappedEntry) bool {
+			return a.KeyHash == b.KeyHash && bytes.Equal(a.Value, b.Value)
+		})
+	}
 
 	return entries, nil
 }
@@ -437,7 +483,7 @@ func (h *WASMHost) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, err
 		}
 
 		var resetErr error
-		if inst.resetFn != nil {
+		if inst.resetFn != nil && inst.staticInPtr == 0 {
 			_, resetErr = inst.resetFn.Call(context.Background())
 		}
 
@@ -516,7 +562,7 @@ func (h *WASMHost) MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEn
 		}
 
 		var resetErr error
-		if inst.resetFn != nil {
+		if inst.resetFn != nil && inst.staticInPtr == 0 {
 			_, resetErr = inst.resetFn.Call(context.Background())
 		}
 
@@ -683,7 +729,7 @@ func (r *WASMRunner) MapBundle(ctx context.Context, leaves [][]byte) ([][]Mapped
 		return nil, err
 	}
 
-	if r.inst.resetFn != nil {
+	if r.inst.resetFn != nil && r.inst.staticInPtr == 0 {
 		if _, err := r.inst.resetFn.Call(context.Background()); err != nil {
 			r.hadErr = true
 			return nil, fmt.Errorf("%w: reset failed: %v", ErrWasmHalt, err)
@@ -705,7 +751,7 @@ func (r *WASMRunner) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, e
 		return nil, err
 	}
 
-	if r.inst.resetFn != nil {
+	if r.inst.resetFn != nil && r.inst.staticInPtr == 0 {
 		if _, err := r.inst.resetFn.Call(context.Background()); err != nil {
 			r.hadErr = true
 			return nil, fmt.Errorf("%w: reset failed: %v", ErrWasmHalt, err)

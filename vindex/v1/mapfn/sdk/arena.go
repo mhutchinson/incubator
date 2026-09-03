@@ -65,6 +65,11 @@ func Reset() {
 	allocOffset = 0
 }
 
+// InputBuffer returns the fixed WASM memory address of the static input arena buffer.
+func InputBuffer() uint32 {
+	return uint32(uintptr(unsafe.Pointer(&inputBuf[0])))
+}
+
 // PackBundleInput serializes a slice of up to 256 leaves into the standard input buffer layout.
 // Framing: [leaf_count (4B uint32 LE)][offsets ([N+1]uint32 LE)][contiguous payload bytes]
 func PackBundleInput(leaves [][]byte) []byte {
@@ -99,6 +104,7 @@ func PackBundleInput(leaves [][]byte) []byte {
 
 // ExecuteBundle processes a framed bundle of leaves in inputBuf and writes framed preimages to outputBuf.
 func ExecuteBundle(inPtr, inLen uint32) (uint32, uint32) {
+	allocOffset = 0
 	if inLen < 8 {
 		return 0, 0
 	}

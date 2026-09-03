@@ -58,9 +58,15 @@ func reset() {
 	Reset()
 }
 
+//go:wasmexport input_buffer
+func inputBuffer() uint32 {
+	return InputBuffer()
+}
+
 // Suppress unused warnings when compiled on non-WASM architectures.
 var (
 	_ = allocate
 	_ = mapBundle
 	_ = reset
+	_ = inputBuffer
 )
