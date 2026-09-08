@@ -46,6 +46,22 @@ The VIndex topology bounds search indexing between two append-only logs—a stru
 - **Omission Resistance**: Every query response delivers cryptographic inclusion proofs (for matching keys) or non-inclusion proofs (for absent keys) against witnessed checkpoints.
 - **Decoupled Security**: VIndex operates as a secondary search overlay. If an indexer halts, corrupts, or falls behind, the underlying Input Log's consensus and security remain completely unaffected.
 
+### Input Log Checkpoint Verification Schemes
+
+When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_pubkey`) accepts either an inlined key string or a file path, supporting two verification schemes:
+
+1. **Standard RFC 6962 / SumDB Note format**:
+   ```text
+   <name>+<hash>+<base64Key>
+   ```
+2. **Merkle Tree Certificates (MTC) format**:
+   ```text
+   mtc+<name>+<cosignerID>+<logID>+<ed25519_base64_pubkey>
+   ```
+
+> [!NOTE]
+> Multiplexing multiple verifier schemes under `--input_log_pubkey` via string prefixes is an interim mechanism and will be refactored before production.
+
 ---
 
 ## 4. Non-Negotiable System Scope

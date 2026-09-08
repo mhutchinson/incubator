@@ -39,6 +39,7 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/server"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/verifier"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
 )
@@ -47,7 +48,7 @@ var (
 	mode               = flag.String("mode", "publisher", "Daemon operation mode: 'publisher' (default), 'auditor', or 'verifier'.")
 	inputLogURL        = flag.String("input_log_url", "", "Base URL of the Input Log.")
 	inputLogOrigin     = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
-	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key for Input Log checkpoint verification.")
+	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key or key file for Input Log checkpoint verification (standard note or mtc+<name>+<cosignerID>+<logID>+<pubKeyBase64>).")
 	outputLogDir       = flag.String("output_log_dir", "", "Path for local Output Log storage.")
 	outputLogOrigin    = flag.String("output_log_origin", "", "Origin string for Output Log. If unset, defaults to signer name.")
 	outputLogSignerKey = flag.String("output_log_signer_key", "", "Note signer string or path to private key for signing Output Log checkpoints.")
@@ -65,6 +66,7 @@ var (
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
 	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
+	wasmWorkers        = flag.Int("wasm_workers", 0, "Number of concurrent WASM worker instances (0 defaults to GOMAXPROCS - 1).")
 )
 
 func main() {
@@ -169,16 +171,16 @@ func runPublisher(ctx context.Context) error {
 			return fmt.Errorf("invalid input log URL %q: %w", *inputLogURL, err)
 		}
 
-		var verifier note.Verifier
+		var inVerifier note.Verifier
 		if *inputLogPubKey != "" {
-			v, err := note.NewVerifier(*inputLogPubKey)
+			v, err := verifier.ParseVerifier(*inputLogPubKey)
 			if err != nil {
 				return fmt.Errorf("failed to create input log verifier: %w", err)
 			}
-			verifier = v
+			inVerifier = v
 		}
 
-		tf, err := ingest.NewTiledFetcher(u, verifier, *inputLogOrigin, nil)
+		tf, err := ingest.NewTiledFetcher(u, inVerifier, *inputLogOrigin, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create input log fetcher: %w", err)
 		}
@@ -359,7 +361,7 @@ func initMapper(ctx context.Context, wasm string) (ingest.LeafMapper, func(), er
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read WASM binary %q: %w", wasm, err)
 	}
-	host, err := ingest.NewWASMHost(ctx, wasmBytes, 4)
+	host, err := ingest.NewWASMHost(ctx, wasmBytes, *wasmWorkers)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize WASM host: %w", err)
 	}

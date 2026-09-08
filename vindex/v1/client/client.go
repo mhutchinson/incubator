@@ -35,6 +35,7 @@ import (
 
 	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/verifier"
 	"github.com/transparency-dev/merkle/compact"
 	"github.com/transparency-dev/merkle/proof"
 	"github.com/transparency-dev/merkle/rfc6962"
@@ -99,6 +100,13 @@ type Verifier struct {
 // NewVerifier creates a new Verifier instance.
 func NewVerifier(cfg VerifierConfig) *Verifier {
 	return &Verifier{cfg: cfg}
+}
+
+// ParseVerifier parses a verifier string or file path into a note.Verifier.
+// It supports standard note format ("<name>+<hash>+<key>") and MTC format
+// ("mtc+<name>+<cosignerID>+<logID>+<ed25519_base64_pubkey>").
+func ParseVerifier(keyOrPath string) (note.Verifier, error) {
+	return verifier.ParseVerifier(keyOrPath)
 }
 
 type section struct {

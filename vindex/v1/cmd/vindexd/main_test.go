@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -309,3 +310,46 @@ func getFreePort() (int, error) {
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
+
+func TestVindexd_MTCVerifier_FlagAndInit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	mtcKey := "mtc+oid/1.3.6.1.4.1.44363.47.1.44363.48.8+44363.48.9+44363.48.8+teYkXkxVoKhT1PxKODAyZFqUk8KZ4tUjzS6yAvvZ8hU="
+	outOrigin := "vindex.test.output"
+	skey, _ := newTestSignerKey(t, outOrigin)
+
+	port, err := getFreePort()
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+
+	*mode = "publisher"
+	*dbPath = filepath.Join(tmpDir, "db")
+	*mptDir = filepath.Join(tmpDir, "mpt")
+	*outputLogDir = filepath.Join(tmpDir, "outputlog")
+	*outputLogSignerKey = skey
+	*outputLogOrigin = outOrigin
+	*wasmPath = getTestWasm(t)
+	*listenAddr = fmt.Sprintf("localhost:%d", port)
+	*metricsAddr = ""
+	*inputLogURL = "https://bootstrap-mtca-shard3.cloudflareresearch.com"
+	*inputLogOrigin = "bootstrap-mtca.cloudflareresearch.com/logs/shard3"
+
+	// 1. Invalid MTC pubkey returns error
+	*inputLogPubKey = "mtc+invalid+key"
+	err = run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "invalid MTC verifier") {
+		t.Fatalf("expected invalid MTC verifier error, got: %v", err)
+	}
+
+	// 2. Valid MTC pubkey initializes without error
+	*inputLogPubKey = mtcKey
+	cancel() // Cancel context so coordinator/run exits cleanly after initialization
+	err = run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected clean run/exit on context cancel, got: %v", err)
+	}
+}
+
