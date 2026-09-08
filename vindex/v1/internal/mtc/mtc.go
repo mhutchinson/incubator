@@ -16,6 +16,7 @@
 package mtc
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -245,25 +246,130 @@ func encodeBase128(v uint32) []byte {
 	return encoded
 }
 
-// MTCLeafMapper implements ingest.LeafMapper for MTC log entries.
-type MTCLeafMapper struct{}
+var sanOIDBytes = []byte{0x55, 0x1d, 0x11} // id-ce-subjectAltName (2.5.29.17)
 
-// MapLeaf parses an MTC log leaf and returns mapped entries for all extracted domain names.
-func (m *MTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
+func readTagLen(b []byte) (tag byte, content []byte, rest []byte, ok bool) {
+	if len(b) < 2 {
+		return 0, nil, nil, false
+	}
+	tag = b[0]
+	if b[1] < 0x80 {
+		l := int(b[1])
+		if len(b) < 2+l {
+			return 0, nil, nil, false
+		}
+		return tag, b[2 : 2+l], b[2+l:], true
+	}
+	numBytes := int(b[1] & 0x7f)
+	if numBytes == 0 || numBytes > 4 || len(b) < 2+numBytes {
+		return 0, nil, nil, false
+	}
+	var l int
+	for i := 0; i < numBytes; i++ {
+		l = (l << 8) | int(b[2+i])
+	}
+	if l < 0 || len(b) < 2+numBytes+l {
+		return 0, nil, nil, false
+	}
+	return tag, b[2+numBytes : 2+numBytes+l], b[2+numBytes+l:], true
+}
+
+func extractDNSNamesFromDER(der []byte, emit func(dns string)) {
+	tag, tbsContent, _, ok := readTagLen(der)
+	if !ok || tag != 0x30 {
+		return
+	}
+
+	for len(tbsContent) > 0 {
+		var field []byte
+		tag, field, tbsContent, ok = readTagLen(tbsContent)
+		if !ok {
+			return
+		}
+		if tag == 0xa3 { // [3] EXPLICIT Extensions
+			tag, extSeq, _, ok := readTagLen(field)
+			if !ok || tag != 0x30 {
+				return
+			}
+			for len(extSeq) > 0 {
+				var ext []byte
+				tag, ext, extSeq, ok = readTagLen(extSeq)
+				if !ok || tag != 0x30 {
+					return
+				}
+				tag, oid, ext, ok := readTagLen(ext)
+				if !ok || tag != 0x06 {
+					continue
+				}
+				if !bytes.Equal(oid, sanOIDBytes) {
+					continue
+				}
+				tag, val, ext, ok := readTagLen(ext)
+				if !ok {
+					return
+				}
+				if tag == 0x01 { // critical BOOLEAN
+					tag, val, _, ok = readTagLen(ext)
+					if !ok {
+						return
+					}
+				}
+				if tag != 0x04 { // extnValue OCTET STRING
+					return
+				}
+				tag, sanSeq, _, ok := readTagLen(val)
+				if !ok || tag != 0x30 {
+					return
+				}
+				for len(sanSeq) > 0 {
+					var item []byte
+					tag, item, sanSeq, ok = readTagLen(sanSeq)
+					if !ok {
+						return
+					}
+					if tag == 0x82 { // [2] IMPLICIT dNSName
+						emit(string(item))
+					}
+				}
+				return
+			}
+		}
+	}
+}
+
+func hasUpper(b []byte) bool {
+	for _, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// ExtractDomainNames parses an MTC log leaf and invokes emit for each unique canonical domain name
+// and hierarchical sub-root down to eTLD+1.
+func ExtractDomainNames(leaf []byte, emit func(domain string)) {
 	if len(leaf) < 2 {
-		return nil, nil
+		return
 	}
 	entryType := binary.BigEndian.Uint16(leaf[:2])
 	if entryType != 1 {
-		return nil, nil
+		return
 	}
-	entry, err := ParseTBSCertificateLogEntry(leaf[2:])
-	if err != nil {
-		return nil, nil
+
+	var namesBuf [16]string
+	names := namesBuf[:0]
+
+	addName := func(s string) {
+		for _, existing := range names {
+			if existing == s {
+				return
+			}
+		}
+		names = append(names, s)
 	}
-	dnsNames := ExtractDNSNames(entry)
-	uniqueNames := make(map[string]bool)
-	for _, cn := range dnsNames {
+
+	extractDNSNamesFromDER(leaf[2:], func(cn string) {
 		cn = strings.ToLower(cn)
 		if strings.HasPrefix(cn, "*.") {
 			cn = cn[2:]
@@ -271,16 +377,16 @@ func (m *MTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.Mapped
 			cn = cn[1:]
 		}
 		if cn == "" {
-			continue
+			return
 		}
-		uniqueNames[cn] = true
+		addName(cn)
 
 		etld1, err := publicsuffix.EffectiveTLDPlusOne(cn)
 		if err != nil {
-			continue
+			return
 		}
 		if cn == etld1 {
-			continue
+			return
 		}
 		curr := cn
 		for {
@@ -292,19 +398,29 @@ func (m *MTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.Mapped
 			if len(curr) < len(etld1) {
 				break
 			}
-			uniqueNames[curr] = true
+			addName(curr)
 			if curr == etld1 {
 				break
 			}
 		}
-	}
+	})
 
-	entries := make([]ingest.MappedEntry, 0, len(uniqueNames))
-	for name := range uniqueNames {
+	for _, name := range names {
+		emit(name)
+	}
+}
+
+// MTCLeafMapper implements ingest.LeafMapper for MTC log entries.
+type MTCLeafMapper struct{}
+
+// MapLeaf parses an MTC log leaf and returns mapped entries for all extracted domain names.
+func (m *MTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
+	var entries []ingest.MappedEntry
+	ExtractDomainNames(leaf, func(name string) {
 		entries = append(entries, ingest.MappedEntry{
 			KeyHash: sha256.Sum256([]byte(name)),
 		})
-	}
+	})
 	return entries, nil
 }
 
