@@ -36,6 +36,21 @@ type IngestionPipeline struct {
 	numWorkers    int
 	bundleSize    uint64
 	bundleTimeout time.Duration
+	chanCap       int
+}
+
+// DefaultPipelineChannelCapacity calculates the recommended buffer capacity for ingestion channels.
+// Performance optimization: sizing channels to min(16, max(4, GOMAXPROCS/2)) prevents memory bloat
+// and triggers swift backpressure to park idle WASM workers when the storage engine is busy.
+func DefaultPipelineChannelCapacity() int {
+	c := runtime.GOMAXPROCS(0) / 2
+	if c > 16 {
+		c = 16
+	}
+	if c < 4 {
+		c = 4
+	}
+	return c
 }
 
 // NewPipeline creates a new IngestionPipeline instance.
@@ -53,6 +68,7 @@ func NewPipeline(fetcher TileFetcher, cache TileCache, mapper LeafMapper, numWor
 		numWorkers:    numWorkers,
 		bundleSize:    uint64(layout.EntryBundleWidth),
 		bundleTimeout: 30 * time.Second,
+		chanCap:       DefaultPipelineChannelCapacity(),
 	}
 }
 
@@ -61,11 +77,27 @@ func (p *IngestionPipeline) SetBundleTimeout(d time.Duration) {
 	p.bundleTimeout = d
 }
 
+// SetChannelCapacity sets the buffer capacity of internal pipeline channels.
+// Performance optimization: tuning channel capacity modulates the queueing latency and backpressure threshold.
+func (p *IngestionPipeline) SetChannelCapacity(c int) {
+	if c < 1 {
+		c = 1
+	}
+	p.chanCap = c
+}
+
+// ChannelCapacity returns the configured buffer capacity of internal pipeline channels.
+func (p *IngestionPipeline) ChannelCapacity() int {
+	if p.chanCap <= 0 {
+		return DefaultPipelineChannelCapacity()
+	}
+	return p.chanCap
+}
+
 // NewIngestionPipeline creates a new IngestionPipeline instance (alias for NewPipeline).
 func NewIngestionPipeline(fetcher TileFetcher, cache TileCache, mapper LeafMapper, numWorkers int) *IngestionPipeline {
 	return NewPipeline(fetcher, cache, mapper, numWorkers)
 }
-
 
 // BundleSize returns the configured bundle capacity.
 func (p *IngestionPipeline) BundleSize() uint64 {
@@ -74,7 +106,8 @@ func (p *IngestionPipeline) BundleSize() uint64 {
 
 // StreamBatches streams ordered MappedBatch items in range [fromLeafIdx, targetSize) with zero Pebble WAL writes.
 func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targetSize uint64) (<-chan *MappedBatch, <-chan error) {
-	outBatches := make(chan *MappedBatch, 64)
+	chanCap := p.ChannelCapacity()
+	outBatches := make(chan *MappedBatch, chanCap)
 	errChan := make(chan error, 1)
 
 	if fromLeafIdx >= targetSize {
@@ -101,8 +134,8 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 		cancelPipe()
 	}
 
-	leafBundleChan := make(chan *LeafBundle, 64)
-	unorderedBatchChan := make(chan *MappedBatch, 64)
+	leafBundleChan := make(chan *LeafBundle, chanCap)
+	unorderedBatchChan := make(chan *MappedBatch, chanCap)
 
 	var (
 		fetchWg sync.WaitGroup

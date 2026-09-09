@@ -760,6 +760,26 @@ func TestKVIndexer_AlreadyPersistedBatch(t *testing.T) {
 	}
 }
 
+func TestKVIndexer_WorkerConfiguration(t *testing.T) {
+	db := openTestDB(t)
+	idx := NewKVIndexer(db, ChunkSize)
+
+	wantDefault := DefaultKVIndexerWorkers()
+	if idx.NumWorkers() != wantDefault {
+		t.Fatalf("NewKVIndexer NumWorkers = %d, want default %d", idx.NumWorkers(), wantDefault)
+	}
+
+	idx.SetNumWorkers(4)
+	if idx.NumWorkers() != 4 {
+		t.Fatalf("NumWorkers after SetNumWorkers(4) = %d, want 4", idx.NumWorkers())
+	}
+
+	idx.SetNumWorkers(0)
+	if idx.NumWorkers() != 1 {
+		t.Fatalf("NumWorkers after SetNumWorkers(0) = %d, want minimum 1", idx.NumWorkers())
+	}
+}
+
 func BenchmarkKVIndexer_IncrementalIndex(b *testing.B) {
 	ctx := context.Background()
 	const numKeys = 200

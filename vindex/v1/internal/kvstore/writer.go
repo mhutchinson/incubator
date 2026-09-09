@@ -71,7 +71,21 @@ type KVIndexer struct {
 	previousCache map[[sha256.Size]byte]activeChunkEntry
 	marshalBuf    []byte          // Reusable serialization buffer to eliminate heap churn during chunk writes.
 	writesBuf     []chunkMutation // Reusable chunk mutation buffer for sequential batch path.
-	numWorkers    int             // Number of worker goroutines for parallel key indexing (defaults to GOMAXPROCS).
+	numWorkers    int             // Number of worker goroutines for parallel key indexing (defaults to min(8, max(1, GOMAXPROCS/2))).
+}
+
+// DefaultKVIndexerWorkers calculates the recommended worker count for parallel key indexing.
+// Performance optimization: caps workers to min(8, max(1, GOMAXPROCS/2)) to capture >80% of
+// parallel Merkle speedup while preserving cores for WASM mapping, Pebble compactions, and read RPCs.
+func DefaultKVIndexerWorkers() int {
+	w := runtime.GOMAXPROCS(0) / 2
+	if w > 8 {
+		w = 8
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
 }
 
 // NewKVIndexer creates a new KVIndexer with the given DB and chunk size.
@@ -84,7 +98,7 @@ func NewKVIndexer(db *DB, chunkSize uint64) *KVIndexer {
 		db:           db,
 		chunkSize:    chunkSize,
 		currentCache: make(map[[sha256.Size]byte]activeChunkEntry, 1024),
-		numWorkers:   runtime.GOMAXPROCS(0),
+		numWorkers:   DefaultKVIndexerWorkers(),
 	}
 }
 
@@ -95,6 +109,11 @@ func (idx *KVIndexer) SetNumWorkers(n int) {
 		n = 1
 	}
 	idx.numWorkers = n
+}
+
+// NumWorkers returns the configured number of worker goroutines.
+func (idx *KVIndexer) NumWorkers() int {
+	return idx.numWorkers
 }
 
 // ClearCache evicts all cached active chunk descriptors.

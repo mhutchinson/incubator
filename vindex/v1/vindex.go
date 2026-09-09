@@ -173,6 +173,9 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 
 	// 4. Initialize KV Indexer
 	indexer := kvstore.NewKVIndexer(db, cfg.ChunkSize)
+	if cfg.Workers == 1 {
+		indexer.SetNumWorkers(1)
+	}
 
 	// 5. Initialize Output Log
 	var outLog coordinator.OutputLogReader

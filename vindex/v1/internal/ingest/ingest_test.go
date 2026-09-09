@@ -1018,6 +1018,25 @@ func TestIngestionPipeline_ConcurrentWorkerFailures_NoPanic(t *testing.T) {
 	}
 }
 
+func TestIngestionPipeline_ChannelCapacityConfiguration(t *testing.T) {
+	pipeline := NewPipeline(nil, nil, nil, 1)
+
+	wantDefault := DefaultPipelineChannelCapacity()
+	if pipeline.ChannelCapacity() != wantDefault {
+		t.Fatalf("NewPipeline ChannelCapacity = %d, want default %d", pipeline.ChannelCapacity(), wantDefault)
+	}
+
+	pipeline.SetChannelCapacity(8)
+	if pipeline.ChannelCapacity() != 8 {
+		t.Fatalf("ChannelCapacity after SetChannelCapacity(8) = %d, want 8", pipeline.ChannelCapacity())
+	}
+
+	pipeline.SetChannelCapacity(0)
+	if pipeline.ChannelCapacity() != 1 {
+		t.Fatalf("ChannelCapacity after SetChannelCapacity(0) = %d, want minimum 1", pipeline.ChannelCapacity())
+	}
+}
+
 func BenchmarkVerifyBundleWithTile(b *testing.B) {
 	const numLeaves = 256
 	bundle := api.EntryBundle{
