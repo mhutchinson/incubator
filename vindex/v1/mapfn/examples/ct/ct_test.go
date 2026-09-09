@@ -15,13 +15,18 @@
 package main
 
 import (
+	_ "embed"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"math/big"
+	"os"
 	"testing"
 	"time"
 )
@@ -169,4 +174,129 @@ func TestMapCTLeaf_Empty(t *testing.T) {
 		t.Fatalf("expected 0 results for whitespace input, got %d", count)
 	}
 }
+
+func splitStaticCTTile(data []byte) ([][]byte, error) {
+	var leaves [][]byte
+	offset := 0
+	for offset < len(data) {
+		start := offset
+		if offset+10 > len(data) {
+			return nil, fmt.Errorf("truncated at offset %d", offset)
+		}
+		entryType := binary.BigEndian.Uint16(data[offset+8 : offset+10])
+		offset += 10
+
+		if entryType == 0 { // x509_entry
+			if offset+3 > len(data) {
+				return nil, fmt.Errorf("truncated cert len at %d", offset)
+			}
+			certLen := int(data[offset])<<16 | int(data[offset+1])<<8 | int(data[offset+2])
+			offset += 3 + certLen
+		} else if entryType == 1 { // precert_entry
+			if offset+32+3 > len(data) {
+				return nil, fmt.Errorf("truncated precert header at %d", offset)
+			}
+			offset += 32
+			tbsLen := int(data[offset])<<16 | int(data[offset+1])<<8 | int(data[offset+2])
+			offset += 3 + tbsLen
+		} else {
+			return nil, fmt.Errorf("unknown entry type %d at offset %d", entryType, offset-10)
+		}
+
+		if offset+2 > len(data) {
+			return nil, fmt.Errorf("truncated ext len at %d", offset)
+		}
+		extLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2 + extLen
+
+		if entryType == 1 {
+			if offset+3 > len(data) {
+				return nil, fmt.Errorf("truncated precert len at %d", offset)
+			}
+			pLen := int(data[offset])<<16 | int(data[offset+1])<<8 | int(data[offset+2])
+			offset += 3 + pLen
+		}
+
+		if offset+2 > len(data) {
+			return nil, fmt.Errorf("truncated chain len at %d", offset)
+		}
+		chainLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2 + chainLen
+
+		if offset > len(data) {
+			return nil, fmt.Errorf("tile overflow: offset %d > len %d", offset, len(data))
+		}
+		leaves = append(leaves, data[start:offset])
+	}
+	return leaves, nil
+}
+
+func TestMapCTLeaf_RealStaticCTTile(t *testing.T) {
+	data, err := os.ReadFile("/tmp/sycamore_tile_000.bin")
+	if err != nil {
+		t.Skipf("skipping: /tmp/sycamore_tile_000.bin not found: %v", err)
+	}
+	leaves, err := splitStaticCTTile(data)
+	if err != nil {
+		t.Fatalf("failed to split static-ct tile: %v", err)
+	}
+	if len(leaves) != 256 {
+		t.Fatalf("expected 256 entries in tile, got %d", len(leaves))
+	}
+
+	totalKeys := 0
+	for i, leaf := range leaves {
+		emittedCount := 0
+		MapCTLeaf(leaf, func(key []byte) {
+			emittedCount++
+			totalKeys++
+		})
+		if emittedCount == 0 {
+			t.Errorf("leaf %d emitted 0 search keys", i)
+		}
+	}
+	t.Logf("Successfully mapped 256 real static-CT leaves into %d search keys", totalKeys)
+}
+
+//go:embed testdata/golden_leaves.json
+var goldenLeavesJSON []byte
+
+type goldenCase struct {
+	Index      int    `json:"index"`
+	EntryType  string `json:"entry_type"`
+	Category   string `json:"category"`
+	LeafHex    string `json:"leaf_hex"`
+	ByteLength int    `json:"byte_length"`
+}
+
+func TestMapCTLeaf_GoldenDataset(t *testing.T) {
+	var cases []goldenCase
+	if err := json.Unmarshal(goldenLeavesJSON, &cases); err != nil {
+		t.Fatalf("failed to unmarshal golden_leaves.json: %v", err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("empty golden dataset")
+	}
+
+	for _, tc := range cases {
+		leafBytes, err := hex.DecodeString(tc.LeafHex)
+		if err != nil {
+			t.Fatalf("case %d: failed to decode hex: %v", tc.Index, err)
+		}
+		if len(leafBytes) != tc.ByteLength {
+			t.Fatalf("case %d: byte length mismatch: got %d, want %d", tc.Index, len(leafBytes), tc.ByteLength)
+		}
+
+		var domains []string
+		MapCTLeaf(leafBytes, func(key []byte) {
+			domains = append(domains, string(key))
+		})
+
+		if len(domains) == 0 {
+			t.Errorf("case %d [%s/%s]: emitted 0 search keys", tc.Index, tc.EntryType, tc.Category)
+		}
+		t.Logf("Case %d [%s]: %d domains emitted: %v", tc.Index, tc.EntryType, len(domains), domains)
+	}
+}
+
 

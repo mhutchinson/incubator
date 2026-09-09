@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -65,13 +66,24 @@ var (
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
-	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
-	wasmWorkers        = flag.Int("wasm_workers", 0, "Number of concurrent WASM worker instances (0 defaults to GOMAXPROCS - 1).")
+	enableUI             = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
+	wasmWorkers          = flag.Int("wasm_workers", 0, "Number of concurrent WASM worker instances (0 defaults to GOMAXPROCS - 1).")
+	fetchWorkers         = flag.Int("fetch_workers", 4, "Number of concurrent tile fetch workers (defaults to 4, 1 disables parallel fetching).")
+	fetchBatchBundles    = flag.Int("fetch_batch_bundles", 50, "Number of leaf bundles fetched per worker batch in Stage 1 (defaults to 50, ~12,800 leaves).")
+	mutexProfileFraction = flag.Int("mutex_profile_fraction", 0, "If > 0, enable mutex contention profiling sampling 1/N events.")
+	blockProfileRate     = flag.Int("block_profile_rate", 0, "If > 0, enable goroutine blocking profiling with nanosecond rate.")
 )
 
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if *mutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(*mutexProfileFraction)
+	}
+	if *blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(*blockProfileRate)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -231,6 +243,12 @@ func runPublisher(ctx context.Context) error {
 
 	// 7. Run 3-Phase Crash Recovery
 	coord := coordinator.NewCoordinator(db, mptMgr, outputLog, pub, idxer, fetcher, tileCache, leafMapper)
+	if *fetchWorkers > 0 {
+		coord.SetFetchWorkers(*fetchWorkers)
+	}
+	if *fetchBatchBundles > 0 {
+		coord.SetFetchBatchBundles(*fetchBatchBundles)
+	}
 	klog.Info("Running 3-phase startup recovery...")
 	if err := coord.Recover(ctx); err != nil {
 		return fmt.Errorf("startup recovery failed: %w", err)

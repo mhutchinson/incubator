@@ -62,7 +62,7 @@ The following matrix defines the standard suite of benchmarks, their component s
 | **Tier 1: Subsystem Microbenchmarks** | Raw KV Inverted Storage | [`internal/kvstore`](../internal/kvstore/README.md) | Direct batch writes to Pebble inverted chunks (`'c' + KeyHash + ^chunkNum`); 64K-entry chunk roll-overs; 16-bit relative index encoding; `pebble.Sync` barrier. | >= 150,000 index entries/s sustained; zero compaction stalls exceeding 100 ms. | `TODO (Pending Reimplementation)` |
 | **Tier 1: Subsystem Microbenchmarks** | WASM Mapping Overhead | [`mapfn`](../mapfn/README.md) | 256-leaf tile batch execution (`map_bundle`); linear memory pack-and-wipe; host SIMD SHA-256 preimage extraction; Wazero compilation mode. | Boundary crossing CPU overhead < 1% total CPU; >= 50,000 leaves/s per CPU core. | `TODO (Pending Reimplementation)` |
 | **Tier 1: Subsystem Microbenchmarks** | MPT Commit Duration | [`internal/tree`](../internal/tree/README.md) | Binary Sparse Merkle Patricia Trie path mutation; lock-free root prediction (`mpt.Predict`); 4,096-leaf mutation batch commit. | Root prediction < 10 ms for 4K leaves; exclusive lock duration (`treeMu.Lock()`) < 5 ms. | `TODO (Pending Reimplementation)` |
-| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | **Pure Go**: **295,241.2 leaves/s** (54,364,768 leaves in 3m 04.34s; total 3m 30.79s)<br>**WASM**: **257,985.4 leaves/s** (54,364,768 leaves in 3m 33.58s; total 3m 58.87s)<br>**MVP**: **172,193.3 leaves/s** (54,364,768 leaves in 5m 15.72s; total 6m 36.01s) |
+| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | **Pure Go**: **295,241.2 leaves/s** (54,364,768 leaves in 3m 04.34s; total 3m 30.79s)<br>**WASM (Parallel Fetch)**: **275,274.8 leaves/s** (54,364,768 leaves in 3m 17.50s; total 3m 50.80s)<br>**WASM (Single Fetch)**: **257,985.4 leaves/s** (54,364,768 leaves in 3m 33.58s; total 3m 58.87s)<br>**MVP**: **172,193.3 leaves/s** (54,364,768 leaves in 5m 15.72s; total 6m 36.01s) |
 | **Tier 2: End-to-End Ingestion Pipelines** | Merkle Tree Certificates / CT (High-Fanout 1-to-N) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream Cloudflare MTC Shard 3 log (257.8M+ leaves, ~74 GB); ASN.1 DER X.509 certificate parsing; 1-to-N mapping (SAN domains down to eTLD+1); heavy chunk roll-overs. | >= 40,000 certs/s; 33-byte prefix Bloom filter seek efficiency >= 99%; Peak RSS < 4 GB. | **WASM (`mtc.wasm`)**: **146,214.2 leaves/s** (257,823,832 leaves in 29m 23.33s; Peak RSS 3.08 GB; Pebble DB 1.7 GB) |
 | **Tier 3: Query Serving Under Active Load** | Point Lookup Latency (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Single-chunk lookup (`GET /vindex/v1/lookup/{keyhash}`) under 100% active ingestion write load; client verifies checkpoint, MPT proof, and mini-log. | Median (P50) < 1.0 ms; Tail (P99) < 15.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
 | **Tier 3: Query Serving Under Active Load** | High-Fanout Paged Lookup (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Backward pagination (`before=X`) across multi-chunk historical records (> 65,536 entries per key) under concurrent ingestion compaction load. | Median (P50) < 5.0 ms; Tail (P99) < 75.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
@@ -215,18 +215,18 @@ In addition to synthetic workloads, the benchmark suite evaluates complete mirro
 
 - **Comparative Telemetry (54,364,768 Leaves)**:
 
-  | Pipeline Phase | MVP (`cmd/sumdbindex`) | v1 Streaming WASM (`sumdb.wasm`) | v1 Pure Go (`--mapper=sumdb`) | v1 Pure Go vs MVP Delta |
+  | Pipeline Phase | MVP (`cmd/sumdbindex`) | v1 Streaming WASM (Single Fetch) | v1 Streaming WASM (Parallel Fetch) | v1 Pure Go (`--mapper=sumdb`) |
   | :--- | :--- | :--- | :--- | :--- |
-  | **Log Ingestion & Leaf Mapping** | 5m 15.72s (315.72s) | 3m 33.58s (213.58s) | **3m 04.34s** (184.34s) | **-2m 11.38s (-41.6%)** |
-  | **Sustained Mapping Rate** | 172,193.3 leaves/s | 257,985.4 leaves/s | **295,241.2 leaves/s** | **+123,047.9 leaves/s (+71.5%)** |
-  | **MPT Commitment & Output Publish** | 1m 20.27s (80.27s) | 26.04s | **26.37s** | **-53.90s (-67.1%)** |
-  | **Time-to-First-Serve (Total)** | 6m 36.01s (396.01s) | 3m 58.87s (238.87s) | **3m 30.79s** (210.79s) | **-3m 05.22s (-46.8%)** |
-  | **Overall Ingestion Throughput** | 137,280.0 leaves/s | 227,572.2 leaves/s | **257,909.6 leaves/s** | **+120,629.6 leaves/s (+87.9%)** |
-  | **Peak Resident Set Size (RSS)** | 964.3 MB (987,396 KB) | 1,227.4 MB (1,256,840 KB) | **573.5 MB** (587,328 KB) | **-390.8 MB (-40.5%)** |
-  | **CPU Utilization** | 130% | 771% | 297% | Multi-core pipeline |
-  | **MapRoot Value Scheme** | Flat SHA-256 concatenation | RFC 6962 mini-log Merkle sub-roots | RFC 6962 mini-log Merkle sub-roots | v1 implementations match |
-  | **MapRoot Determinism** | `ca457ef353b030ffe655818d0fdb71aea5d10cb8593123ad4cbc557701721c86` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | Identical across v1 |
-  | **Serving Point Lookup Latency** | < 1.0 ms | < 1.0 ms | < 1.0 ms | Inclusion proofs verified |
+  | **Log Ingestion & Leaf Mapping** | 5m 15.72s (315.72s) | 3m 33.58s (213.58s) | **3m 17.50s** (197.50s) | **3m 04.34s** (184.34s) |
+  | **Sustained Mapping Rate** | 172,193.3 leaves/s | 257,985.4 leaves/s | **275,274.8 leaves/s** | **295,241.2 leaves/s** |
+  | **MPT Commitment & Output Publish** | 1m 20.27s (80.27s) | 26.04s | 31.54s | **26.37s** |
+  | **Time-to-First-Serve (Total)** | 6m 36.01s (396.01s) | 3m 58.87s (238.87s) | **3m 50.80s** (230.80s) | **3m 30.79s** (210.79s) |
+  | **Overall Ingestion Throughput** | 137,280.0 leaves/s | 227,572.2 leaves/s | **235,549.2 leaves/s** | **257,909.6 leaves/s** |
+  | **Peak Resident Set Size (RSS)** | 964.3 MB (987,396 KB) | 1,227.4 MB (1,256,840 KB) | 1,226.9 MB (1,256,368 KB) | **573.5 MB** (587,328 KB) |
+  | **CPU Utilization** | 130% | 771% | 849% | 297% |
+  | **MapRoot Value Scheme** | Flat SHA-256 concatenation | RFC 6962 mini-log Merkle sub-roots | RFC 6962 mini-log Merkle sub-roots | RFC 6962 mini-log Merkle sub-roots |
+  | **MapRoot Determinism** | `ca457ef353b030ffe655818d0fdb71aea5d10cb8593123ad4cbc557701721c86` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` |
+  | **Serving Point Lookup Latency** | < 1.0 ms | < 1.0 ms | < 1.0 ms | < 1.0 ms |
 
 #### B. Merkle Tree Certificates (MTC) / Certificate Transparency Mirror Dataset
 - **Workload Type**: High-fanout 1-to-N mapping (X.509 certificate to SAN domain names and hierarchical sub-roots down to eTLD+1).
