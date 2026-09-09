@@ -333,14 +333,24 @@ func (c *Coordinator) Phase3(ctx context.Context) error {
 		startProgressSize := kvSize
 		lastLogSize := kvSize
 		logInterval := uint64(102400)
-		batchChan, errChan := c.pipeline.StreamBatches(ctx, kvSize, targetCP.Size)
-		for batch := range batchChan {
-			res, err := c.indexer.IndexMappedBatch(ctx, batch, rawTargetCP, targetCP.Size)
+
+		batchSize := c.commitBatchSize
+		if batchSize == 0 {
+			batchSize = DefaultCommitBatchSize
+		}
+
+		var pendingBatch *ingest.MappedBatch
+
+		flushCatchup := func() error {
+			if pendingBatch == nil || pendingBatch.EndLeafIdx <= pendingBatch.StartLeafIdx {
+				return nil
+			}
+			res, err := c.indexer.IndexMappedBatch(ctx, pendingBatch, rawTargetCP, targetCP.Size)
 			if err != nil {
 				return fmt.Errorf("phase 3 indexing catch-up failed: %w", err)
 			}
 			metrics.KVCommittedSize.Set(float64(res.NewKVSize))
-			metrics.LeavesIndexedTotal.Add(float64(batch.Count))
+			metrics.LeavesIndexedTotal.Add(float64(pendingBatch.Count))
 			if res.NewKVSize-lastLogSize >= logInterval || res.NewKVSize == targetCP.Size {
 				elapsed := time.Since(startTime).Seconds()
 				rate := 0.0
@@ -350,9 +360,41 @@ func (c *Coordinator) Phase3(ctx context.Context) error {
 				klog.Infof("Catch-up indexing progress: %d / %d leaves (%.1f leaves/sec)", res.NewKVSize, targetCP.Size, rate)
 				lastLogSize = res.NewKVSize
 			}
+			pendingBatch = nil
+			return nil
+		}
+
+		batchChan, errChan := c.pipeline.StreamBatches(ctx, kvSize, targetCP.Size)
+		for batch := range batchChan {
+			if batch.EndLeafIdx == 0 && batch.Count > 0 {
+				batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
+			}
+			if pendingBatch == nil {
+				pendingBatch = &ingest.MappedBatch{
+					BundleIdx:    batch.BundleIdx,
+					StartLeafIdx: batch.StartLeafIdx,
+					EndLeafIdx:   batch.EndLeafIdx,
+					Count:        batch.Count,
+					KeyMap:       make(map[[32]byte][]uint64),
+				}
+				for k, v := range batch.KeyMap {
+					pendingBatch.KeyMap[k] = append([]uint64(nil), v...)
+				}
+			} else {
+				pendingBatch.Merge(batch)
+			}
+
+			if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= batchSize {
+				if err := flushCatchup(); err != nil {
+					return err
+				}
+			}
 		}
 		if err := <-errChan; err != nil {
 			return fmt.Errorf("phase 3 streaming catch-up failed: %w", err)
+		}
+		if err := flushCatchup(); err != nil {
+			return err
 		}
 	}
 
