@@ -186,7 +186,7 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 		newKVSize = targetSize
 	}
 
-	const parallelThreshold = 64
+	const parallelThreshold = 4
 	if idx.numWorkers <= 1 || len(keys) < parallelThreshold {
 		iter, err := idx.db.NewIter(nil)
 		if err != nil {
@@ -229,9 +229,8 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 		// Performance optimization: partition keys across worker goroutines to compute
 		// CompactRange.Append, runningRange.Root(), and chunk serialization in parallel.
 		workers := idx.numWorkers
-		const minKeysPerWorker = 32
-		if maxW := len(keys) / minKeysPerWorker; workers > maxW {
-			workers = maxW
+		if workers > len(keys) {
+			workers = len(keys)
 		}
 		if workers < 1 {
 			workers = 1

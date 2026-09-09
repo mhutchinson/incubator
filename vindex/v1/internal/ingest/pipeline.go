@@ -40,15 +40,15 @@ type IngestionPipeline struct {
 }
 
 // DefaultPipelineChannelCapacity calculates the recommended buffer capacity for ingestion channels.
-// Performance optimization: sizing channels to min(16, max(4, GOMAXPROCS/2)) prevents memory bloat
-// and triggers swift backpressure to park idle WASM workers when the storage engine is busy.
+// Performance optimization: sizing channels to min(64, max(16, GOMAXPROCS*2)) provides ample
+// buffer slack for WASM mapping workers to stay active during batch commit flushes.
 func DefaultPipelineChannelCapacity() int {
-	c := runtime.GOMAXPROCS(0) / 2
-	if c > 16 {
-		c = 16
+	c := runtime.GOMAXPROCS(0) * 2
+	if c > 64 {
+		c = 64
 	}
-	if c < 4 {
-		c = 4
+	if c < 16 {
+		c = 16
 	}
 	return c
 }
