@@ -48,6 +48,7 @@ var (
 	progressInterval    = flag.Duration("progress_interval", 5*time.Second, "Interval for logging periodic progress")
 	tileLevel           = flag.Int("tile_level", -1, "Tile level to clone (0..63 for tree tiles, -1 for entry bundles)")
 	useLocalCheckpoint  = flag.Bool("use_local_checkpoint", false, "Use existing local checkpoint file to determine tree size without overwriting it")
+	logType             = flag.String("log_type", "auto", "Log layout type: 'auto', 'tessera', or 'static-ct'")
 )
 
 type cloneStats struct {
@@ -360,11 +361,29 @@ func downloadBundle(ctx context.Context, client *http.Client, baseURL *url.URL, 
 	var p uint8
 	var relPath, fullRelPath string
 	certsInBundle := uint64(1)
+
+	isStaticCT := false
+	switch strings.ToLower(*logType) {
+	case "static-ct", "ct":
+		isStaticCT = true
+	case "auto":
+		if strings.Contains(baseURL.Host, "certificate.transparency") || strings.Contains(baseURL.Path, "static-ct") {
+			isStaticCT = true
+		}
+	}
+
 	if *tileLevel >= 0 {
 		lvl := uint64(*tileLevel)
 		p = layout.PartialTileSize(lvl, bIdx, treeSize)
 		relPath = layout.TilePath(lvl, bIdx, p)
 		fullRelPath = layout.TilePath(lvl, bIdx, 0)
+	} else if isStaticCT {
+		p = layout.PartialTileSize(0, bIdx, treeSize)
+		tileRel := layout.TilePath(0, bIdx, p)
+		relPath = fmt.Sprintf("tile/data/%s", tileRel[7:])
+		fullRel := layout.TilePath(0, bIdx, 0)
+		fullRelPath = fmt.Sprintf("tile/data/%s", fullRel[7:])
+		certsInBundle = bundleCertsCount(bIdx, treeSize)
 	} else {
 		p = layout.PartialTileSize(0, bIdx, treeSize)
 		relPath = layout.EntriesPath(bIdx, p)

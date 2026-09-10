@@ -70,6 +70,8 @@ var (
 	wasmWorkers          = flag.Int("wasm_workers", 0, "Number of concurrent WASM worker instances (0 defaults to GOMAXPROCS - 1).")
 	fetchWorkers         = flag.Int("fetch_workers", 4, "Number of concurrent tile fetch workers (defaults to 4, 1 disables parallel fetching).")
 	fetchBatchBundles    = flag.Int("fetch_batch_bundles", 50, "Number of leaf bundles fetched per worker batch in Stage 1 (defaults to 50, ~12,800 leaves).")
+	disableReaper        = flag.Bool("disable_reaper", false, "Disable background tile cache reaper to keep tiles cached indefinitely.")
+	inputLogType         = flag.String("input_log_type", "auto", "Input log layout type: 'auto', 'tessera', or 'static-ct'.")
 	mutexProfileFraction = flag.Int("mutex_profile_fraction", 0, "If > 0, enable mutex contention profiling sampling 1/N events.")
 	blockProfileRate     = flag.Int("block_profile_rate", 0, "If > 0, enable goroutine blocking profiling with nanosecond rate.")
 )
@@ -196,6 +198,16 @@ func runPublisher(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to create input log fetcher: %w", err)
 		}
+		switch strings.ToLower(*inputLogType) {
+		case "static-ct", "ct":
+			tf.SetStaticCT(true)
+		case "tessera":
+			tf.SetStaticCT(false)
+		case "auto", "":
+			// retain auto-detected value
+		default:
+			return fmt.Errorf("unknown input_log_type %q: expected 'auto', 'tessera', or 'static-ct'", *inputLogType)
+		}
 		fetcher = tf
 	}
 
@@ -256,10 +268,14 @@ func runPublisher(ctx context.Context) error {
 	klog.Info("Startup recovery completed successfully.")
 
 	// 8. Start Background Tile Reaper
-	tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
-	go func() {
-		_ = tileReaper.Run(ctx, 60*time.Second)
-	}()
+	if !*disableReaper {
+		tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
+		go func() {
+			_ = tileReaper.Run(ctx, 60*time.Second)
+		}()
+	} else {
+		klog.Info("Tile cache reaper disabled via --disable_reaper; cached tiles will be retained indefinitely.")
+	}
 
 	// 9. Start Ingestion & Commit Pipeline Loop
 	if fetcher != nil {

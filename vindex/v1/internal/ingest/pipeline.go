@@ -216,6 +216,9 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 					}
 
 					currIdx := startB * p.bundleSize
+					if currIdx < fromLeafIdx {
+						currIdx = fromLeafIdx
+					}
 					taskEndIdx := endB * p.bundleSize
 					if taskEndIdx > targetSize {
 						taskEndIdx = targetSize
