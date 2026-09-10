@@ -26,6 +26,7 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/klog/v2"
 )
 
@@ -385,18 +386,13 @@ func (c *Coordinator) Phase3(ctx context.Context) error {
 			batchSize = DefaultCommitBatchSize
 		}
 
-		var pendingBatch *ingest.MappedBatch
-
-		flushCatchup := func() error {
-			if pendingBatch == nil || pendingBatch.EndLeafIdx <= pendingBatch.StartLeafIdx {
-				return nil
-			}
-			res, err := c.indexer.IndexMappedBatch(ctx, pendingBatch, rawTargetCP, targetCP.Size)
+		err := c.streamAndIndex(ctx, kvSize, targetCP.Size, batchSize, func(drainCtx context.Context, batch *ingest.MappedBatch) error {
+			res, err := c.indexer.IndexMappedBatch(drainCtx, batch, rawTargetCP, targetCP.Size)
 			if err != nil {
 				return fmt.Errorf("phase 3 indexing catch-up failed: %w", err)
 			}
 			metrics.KVCommittedSize.Set(float64(res.NewKVSize))
-			metrics.LeavesIndexedTotal.Add(float64(pendingBatch.Count))
+			metrics.LeavesIndexedTotal.Add(float64(batch.Count))
 			if res.NewKVSize-lastLogSize >= logInterval || res.NewKVSize == targetCP.Size {
 				elapsed := time.Since(startTime).Seconds()
 				rate := 0.0
@@ -406,40 +402,9 @@ func (c *Coordinator) Phase3(ctx context.Context) error {
 				klog.Infof("Catch-up indexing progress: %d / %d leaves (%.1f leaves/sec)", res.NewKVSize, targetCP.Size, rate)
 				lastLogSize = res.NewKVSize
 			}
-			pendingBatch = nil
 			return nil
-		}
-
-		batchChan, errChan := c.pipeline.StreamBatches(ctx, kvSize, targetCP.Size)
-		for batch := range batchChan {
-			if batch.EndLeafIdx == 0 && batch.Count > 0 {
-				batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
-			}
-			if pendingBatch == nil {
-				pendingBatch = &ingest.MappedBatch{
-					BundleIdx:    batch.BundleIdx,
-					StartLeafIdx: batch.StartLeafIdx,
-					EndLeafIdx:   batch.EndLeafIdx,
-					Count:        batch.Count,
-					KeyMap:       make(map[[32]byte][]uint64),
-				}
-				for k, v := range batch.KeyMap {
-					pendingBatch.KeyMap[k] = append([]uint64(nil), v...)
-				}
-			} else {
-				pendingBatch.Merge(batch)
-			}
-
-			if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= batchSize {
-				if err := flushCatchup(); err != nil {
-					return err
-				}
-			}
-		}
-		if err := <-errChan; err != nil {
-			return fmt.Errorf("phase 3 streaming catch-up failed: %w", err)
-		}
-		if err := flushCatchup(); err != nil {
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -501,18 +466,13 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		batchSize = DefaultCommitBatchSize
 	}
 
-	var pendingBatch *ingest.MappedBatch
-
-	flush := func() error {
-		if pendingBatch == nil || pendingBatch.EndLeafIdx <= pendingBatch.StartLeafIdx {
-			return nil
-		}
-		res, err := c.indexer.IndexBatch(ctx, pendingBatch, targetCP)
+	err = c.streamAndIndex(ctx, startLogSize, targetCP.Size, batchSize, func(drainCtx context.Context, batch *ingest.MappedBatch) error {
+		res, err := c.indexer.IndexBatch(drainCtx, batch, targetCP)
 		if err != nil {
 			return fmt.Errorf("indexing error: %w", err)
 		}
 		metrics.KVCommittedSize.Set(float64(res.NewKVSize))
-		metrics.LeavesIndexedTotal.Add(float64(pendingBatch.Count))
+		metrics.LeavesIndexedTotal.Add(float64(batch.Count))
 		for k, v := range res.ModifiedSubRoots {
 			allModifiedSubRoots[k] = v
 		}
@@ -526,41 +486,9 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 			klog.Infof("Indexing progress: %d / %d leaves (%.1f leaves/sec)", res.NewKVSize, targetCP.Size, rate)
 			lastLogSize = res.NewKVSize
 		}
-		pendingBatch = nil
 		return nil
-	}
-
-	batchChan, errChan := c.pipeline.StreamBatches(ctx, startLogSize, targetCP.Size)
-	for batch := range batchChan {
-		if batch.EndLeafIdx == 0 && batch.Count > 0 {
-			batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
-		}
-		if pendingBatch == nil {
-			pendingBatch = &ingest.MappedBatch{
-				BundleIdx:    batch.BundleIdx,
-				StartLeafIdx: batch.StartLeafIdx,
-				EndLeafIdx:   batch.EndLeafIdx,
-				Count:        batch.Count,
-				KeyMap:       make(map[[32]byte][]uint64),
-			}
-			for k, v := range batch.KeyMap {
-				pendingBatch.KeyMap[k] = append([]uint64(nil), v...)
-			}
-		} else {
-			pendingBatch.Merge(batch)
-		}
-
-		if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= batchSize {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-	}
-	if err := <-errChan; err != nil {
-		return fmt.Errorf("stream batches error: %w", err)
-	}
-
-	if err := flush(); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 
@@ -574,6 +502,103 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 	}
 	metrics.IndexingLag.Set(0)
 	return nil
+}
+
+// streamAndIndex coordinates pipelined double-buffered batch consumption and indexing.
+// The reader goroutine streams and aggregates bundles into MappedBatch slabs of batchSize.
+// Slabs are dispatched via a bounded channel (capacity 1) to a dedicated committer goroutine,
+// overlapping WASM mapping and fetch I/O with Pebble KV indexing and disk commits.
+func (c *Coordinator) streamAndIndex(
+	ctx context.Context,
+	fromLeaf, toLeaf uint64,
+	batchSize uint64,
+	indexFn func(ctx context.Context, batch *ingest.MappedBatch) error,
+) error {
+	if fromLeaf >= toLeaf {
+		return nil
+	}
+	if c.pipeline == nil {
+		return errors.New("cannot stream and index: pipeline not initialized")
+	}
+	if batchSize == 0 {
+		batchSize = DefaultCommitBatchSize
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+	// Capacity 1 provides double-buffering: 1 slab draining in committer while 1 slab is actively accumulating in reader.
+	slabChan := make(chan *ingest.MappedBatch, 1)
+
+	// Committer goroutine: drains slabs sequentially in strict monotonic order.
+	g.Go(func() error {
+		for slab := range slabChan {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+			}
+			if err := indexFn(gCtx, slab); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Reader goroutine: streams bundles and aggregates into slabs.
+	g.Go(func() error {
+		defer close(slabChan)
+		batchChan, errChan := c.pipeline.StreamBatches(gCtx, fromLeaf, toLeaf)
+		var pendingBatch *ingest.MappedBatch
+
+		for batch := range batchChan {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+			}
+
+			if batch.EndLeafIdx == 0 && batch.Count > 0 {
+				batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
+			}
+			if pendingBatch == nil {
+				pendingBatch = &ingest.MappedBatch{
+					BundleIdx:    batch.BundleIdx,
+					StartLeafIdx: batch.StartLeafIdx,
+					EndLeafIdx:   batch.EndLeafIdx,
+					Count:        batch.Count,
+					KeyMap:       make(map[[32]byte][]uint64),
+				}
+				for k, v := range batch.KeyMap {
+					pendingBatch.KeyMap[k] = append([]uint64(nil), v...)
+				}
+			} else {
+				pendingBatch.Merge(batch)
+			}
+
+			if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= batchSize {
+				select {
+				case slabChan <- pendingBatch:
+					pendingBatch = nil
+				case <-gCtx.Done():
+					return gCtx.Err()
+				}
+			}
+		}
+
+		if err, ok := <-errChan; ok && err != nil {
+			return fmt.Errorf("stream batches failed: %w", err)
+		}
+
+		if pendingBatch != nil && pendingBatch.EndLeafIdx > pendingBatch.StartLeafIdx {
+			select {
+			case slabChan <- pendingBatch:
+			case <-gCtx.Done():
+				return gCtx.Err()
+			}
+		}
+		return nil
+	})
+
+	return g.Wait()
 }
 
 // Run executes startup recovery and enters the periodic ingestion polling loop until ctx is canceled.
