@@ -46,7 +46,9 @@ type Coordinator struct {
 	cache           ingest.TileCache
 	mapper          ingest.LeafMapper
 	pipeline        *ingest.IngestionPipeline
-	commitBatchSize uint64
+	commitBatchSize   uint64
+	fetchWorkers      int
+	fetchBatchBundles int
 }
 
 // NewCoordinator creates a new recovery Coordinator.
@@ -92,6 +94,44 @@ func (c *Coordinator) CommitBatchSize() uint64 {
 		return DefaultCommitBatchSize
 	}
 	return c.commitBatchSize
+}
+
+// SetFetchWorkers sets the number of concurrent tile fetch workers for the pipeline.
+func (c *Coordinator) SetFetchWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	c.fetchWorkers = n
+	if c.pipeline != nil {
+		c.pipeline.SetFetchWorkers(n)
+	}
+}
+
+// FetchWorkers returns the configured number of tile fetch workers.
+func (c *Coordinator) FetchWorkers() int {
+	if c.fetchWorkers <= 0 {
+		return ingest.DefaultFetchWorkers()
+	}
+	return c.fetchWorkers
+}
+
+// SetFetchBatchBundles sets the number of bundles fetched per worker batch in Stage 1.
+func (c *Coordinator) SetFetchBatchBundles(n int) {
+	if n < 1 {
+		n = 1
+	}
+	c.fetchBatchBundles = n
+	if c.pipeline != nil {
+		c.pipeline.SetFetchBatchBundles(n)
+	}
+}
+
+// FetchBatchBundles returns the configured number of bundles fetched per worker batch.
+func (c *Coordinator) FetchBatchBundles() int {
+	if c.fetchBatchBundles <= 0 {
+		return ingest.DefaultFetchBatchBundles()
+	}
+	return c.fetchBatchBundles
 }
 
 // Recover runs the recovery sequence:
@@ -235,6 +275,12 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 		}
 		if c.pipeline == nil && c.fetcher != nil && c.mapper != nil {
 			c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, 0)
+			if c.fetchWorkers > 0 {
+				c.pipeline.SetFetchWorkers(c.fetchWorkers)
+			}
+			if c.fetchBatchBundles > 0 {
+				c.pipeline.SetFetchBatchBundles(c.fetchBatchBundles)
+			}
 		}
 
 		modifiedKeys := make(map[[sha256.Size]byte]struct{})
@@ -436,6 +482,12 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 			return errors.New("cannot initialize pipeline without leaf mapper")
 		}
 		c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, 0)
+		if c.fetchWorkers > 0 {
+			c.pipeline.SetFetchWorkers(c.fetchWorkers)
+		}
+		if c.fetchBatchBundles > 0 {
+			c.pipeline.SetFetchBatchBundles(c.fetchBatchBundles)
+		}
 	}
 
 	allModifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)

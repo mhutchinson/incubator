@@ -30,7 +30,6 @@ type ManagedTileCache struct {
 	cacheDir      string
 	memory        map[uint64]*LeafBundle
 	bundleSz      uint64
-	writeBuf      []byte
 	lastShardPath string
 }
 
@@ -100,19 +99,23 @@ func (c *ManagedTileCache) PutBundle(bundle *LeafBundle) error {
 		return nil
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.writeBuf = marshalBundleInto(c.writeBuf, bundle)
+	buf := marshalBundle(bundle)
 	bundlePath := c.bundlePath(bundle.BundleIdx)
 	shardDir := filepath.Dir(bundlePath)
-	if shardDir != c.lastShardPath {
+
+	c.mu.Lock()
+	needMkdir := shardDir != c.lastShardPath
+	if needMkdir {
+		c.lastShardPath = shardDir
+	}
+	c.mu.Unlock()
+
+	if needMkdir {
 		if err := os.MkdirAll(shardDir, 0o755); err != nil {
 			return fmt.Errorf("failed to create shard dir %q: %w", shardDir, err)
 		}
-		c.lastShardPath = shardDir
 	}
-	return os.WriteFile(bundlePath, c.writeBuf, 0o644)
+	return os.WriteFile(bundlePath, buf, 0o644)
 }
 
 // DirSize calculates the total size in bytes of files stored in the cacheDir.

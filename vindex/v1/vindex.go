@@ -52,6 +52,8 @@ type Config struct {
 	ChunkSize          uint64
 	BundleSize         uint64
 	Workers            int
+	FetchWorkers       int
+	FetchBatchBundles  int
 	PollInterval       time.Duration
 	InputLogURL        string
 	InputLogOrigin     string
@@ -70,10 +72,12 @@ func DefaultConfig() Config {
 		workers = 1
 	}
 	return Config{
-		ChunkSize:    kvstore.ChunkSize,
-		BundleSize:   ingest.DefaultBundleSize,
-		Workers:      workers,
-		PollInterval: 10 * time.Second,
+		ChunkSize:         kvstore.ChunkSize,
+		BundleSize:        ingest.DefaultBundleSize,
+		Workers:           workers,
+		FetchWorkers:      ingest.DefaultFetchWorkers(),
+		FetchBatchBundles: ingest.DefaultFetchBatchBundles(),
+		PollInterval:      10 * time.Second,
 	}
 }
 
@@ -236,10 +240,22 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 	var pipeline *ingest.IngestionPipeline
 	if fetcher != nil && mapper != nil {
 		pipeline = ingest.NewPipeline(fetcher, cache, mapper, cfg.Workers)
+		if cfg.FetchWorkers > 0 {
+			pipeline.SetFetchWorkers(cfg.FetchWorkers)
+		}
+		if cfg.FetchBatchBundles > 0 {
+			pipeline.SetFetchBatchBundles(cfg.FetchBatchBundles)
+		}
 	}
 
 	// 9. Initialize Coordinator
 	coord := coordinator.NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, cache, mapper)
+	if cfg.FetchWorkers > 0 {
+		coord.SetFetchWorkers(cfg.FetchWorkers)
+	}
+	if cfg.FetchBatchBundles > 0 {
+		coord.SetFetchBatchBundles(cfg.FetchBatchBundles)
+	}
 
 	// 10. Initialize HTTP Read Server
 	srv := server.NewReadServer(db, mptMgr, pub, cfg.ChunkSize)

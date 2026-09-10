@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
@@ -30,13 +31,15 @@ import (
 
 // IngestionPipeline manages the 3-stage asynchronous leaf fetch, parallel mapping, and resequencing pipeline.
 type IngestionPipeline struct {
-	fetcher       TileFetcher
-	cache         TileCache
-	mapper        LeafMapper
-	numWorkers    int
-	bundleSize    uint64
-	bundleTimeout time.Duration
-	chanCap       int
+	fetcher           TileFetcher
+	cache             TileCache
+	mapper            LeafMapper
+	numWorkers        int
+	numFetchWorkers   int
+	fetchBatchBundles uint64
+	bundleSize        uint64
+	bundleTimeout     time.Duration
+	chanCap           int
 }
 
 // DefaultPipelineChannelCapacity calculates the recommended buffer capacity for ingestion channels.
@@ -53,6 +56,19 @@ func DefaultPipelineChannelCapacity() int {
 	return c
 }
 
+// DefaultFetchWorkers returns the recommended default number of concurrent tile fetch workers.
+// Performance optimization: 4 parallel fetch workers prevent input starvation in the mapping pool.
+func DefaultFetchWorkers() int {
+	return 4
+}
+
+// DefaultFetchBatchBundles returns the default number of bundles fetched per worker batch in Stage 1.
+// Performance optimization: batching 25 bundles per FetchTiles call amortizes syscalls,
+// errorgroup allocation, and atomic loop overhead while maintaining streaming throughput.
+func DefaultFetchBatchBundles() int {
+	return 50
+}
+
 // NewPipeline creates a new IngestionPipeline instance.
 func NewPipeline(fetcher TileFetcher, cache TileCache, mapper LeafMapper, numWorkers int) *IngestionPipeline {
 	if numWorkers <= 0 {
@@ -62,13 +78,15 @@ func NewPipeline(fetcher TileFetcher, cache TileCache, mapper LeafMapper, numWor
 		}
 	}
 	return &IngestionPipeline{
-		fetcher:       fetcher,
-		cache:         cache,
-		mapper:        mapper,
-		numWorkers:    numWorkers,
-		bundleSize:    uint64(layout.EntryBundleWidth),
-		bundleTimeout: 30 * time.Second,
-		chanCap:       DefaultPipelineChannelCapacity(),
+		fetcher:           fetcher,
+		cache:             cache,
+		mapper:            mapper,
+		numWorkers:        numWorkers,
+		numFetchWorkers:   DefaultFetchWorkers(),
+		fetchBatchBundles: uint64(DefaultFetchBatchBundles()),
+		bundleSize:        uint64(layout.EntryBundleWidth),
+		bundleTimeout:     30 * time.Second,
+		chanCap:           DefaultPipelineChannelCapacity(),
 	}
 }
 
@@ -92,6 +110,39 @@ func (p *IngestionPipeline) ChannelCapacity() int {
 		return DefaultPipelineChannelCapacity()
 	}
 	return p.chanCap
+}
+
+// SetFetchWorkers sets the number of concurrent tile fetch worker goroutines.
+// Performance optimization: parallelizing tile readers prevents input starvation in the mapping pool.
+func (p *IngestionPipeline) SetFetchWorkers(n int) {
+	if n < 1 {
+		n = 1
+	}
+	p.numFetchWorkers = n
+}
+
+// FetchWorkers returns the configured number of concurrent tile fetch worker goroutines.
+func (p *IngestionPipeline) FetchWorkers() int {
+	if p.numFetchWorkers <= 0 {
+		return 1
+	}
+	return p.numFetchWorkers
+}
+
+// SetFetchBatchBundles sets the number of bundles fetched per worker batch in Stage 1.
+func (p *IngestionPipeline) SetFetchBatchBundles(n int) {
+	if n < 1 {
+		n = 1
+	}
+	p.fetchBatchBundles = uint64(n)
+}
+
+// FetchBatchBundles returns the configured number of bundles fetched per worker batch in Stage 1.
+func (p *IngestionPipeline) FetchBatchBundles() int {
+	if p.fetchBatchBundles == 0 {
+		return DefaultFetchBatchBundles()
+	}
+	return int(p.fetchBatchBundles)
 }
 
 // NewIngestionPipeline creates a new IngestionPipeline instance (alias for NewPipeline).
@@ -144,72 +195,165 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 	)
 
 	// Stage 1: TileFetcher & Cache
-	fetchWg.Add(1)
-	go func() {
-		defer fetchWg.Done()
-		defer close(leafBundleChan)
-		currIdx := fromLeafIdx
-		for currIdx < targetSize {
-			select {
-			case <-pipeCtx.Done():
-				return
-			default:
-			}
+	if p.numFetchWorkers > 1 {
+		startBundle := fromLeafIdx / p.bundleSize
+		endBundle := (targetSize + p.bundleSize - 1) / p.bundleSize
+		var nextBundleIdx uint64 = startBundle
+		batchBundles := uint64(p.FetchBatchBundles())
 
-			bundleIdx := currIdx / p.bundleSize
-			var bundle *LeafBundle
-			if p.cache != nil {
-				if b, err := p.cache.GetBundle(bundleIdx); err == nil && b != nil {
-					bEnd := b.StartLeafIdx + uint64(len(b.Leaves))
-					if currIdx < bEnd && (uint64(len(b.Leaves)) == p.bundleSize || bEnd >= targetSize) {
-						bundle = b
-					}
-				}
-			}
-
-			if bundle == nil {
-				count := p.bundleSize * 50
-				if currIdx+count > targetSize {
-					count = targetSize - currIdx
-				}
-				bundles, err := p.fetcher.FetchTiles(pipeCtx, currIdx, count)
-				if err != nil {
-					recordError(fmt.Errorf("fetch tiles [%d, %d) failed: %w", currIdx, currIdx+count, err))
-					return
-				}
-				if len(bundles) == 0 {
-					recordError(fmt.Errorf("fetch tiles [%d, %d) returned 0 bundles", currIdx, currIdx+count))
-					return
-				}
-				for _, b := range bundles {
-					if p.cache != nil {
-						_ = p.cache.PutBundle(b)
-					}
-					select {
-					case <-pipeCtx.Done():
+		for w := 0; w < p.numFetchWorkers; w++ {
+			fetchWg.Add(1)
+			go func() {
+				defer fetchWg.Done()
+				for {
+					startB := atomic.AddUint64(&nextBundleIdx, batchBundles) - batchBundles
+					if startB >= endBundle {
 						return
-					case leafBundleChan <- b:
 					}
-					nextIdx := b.StartLeafIdx + uint64(len(b.Leaves))
-					if nextIdx <= currIdx {
-						nextIdx = (b.BundleIdx + 1) * p.bundleSize
+					endB := startB + batchBundles
+					if endB > endBundle {
+						endB = endBundle
 					}
-					currIdx = nextIdx
+
+					currIdx := startB * p.bundleSize
+					taskEndIdx := endB * p.bundleSize
+					if taskEndIdx > targetSize {
+						taskEndIdx = targetSize
+					}
+
+					for currIdx < taskEndIdx {
+						select {
+						case <-pipeCtx.Done():
+							return
+						default:
+						}
+
+						bundleIdx := currIdx / p.bundleSize
+						var bundle *LeafBundle
+						if p.cache != nil {
+							if b, err := p.cache.GetBundle(bundleIdx); err == nil && b != nil {
+								bEnd := b.StartLeafIdx + uint64(len(b.Leaves))
+								if currIdx < bEnd && (uint64(len(b.Leaves)) == p.bundleSize || bEnd >= targetSize) {
+									bundle = b
+								}
+							}
+						}
+
+						if bundle == nil {
+							count := taskEndIdx - currIdx
+							bundles, err := p.fetcher.FetchTiles(pipeCtx, currIdx, count)
+							if err != nil {
+								recordError(fmt.Errorf("fetch tiles [%d, %d) failed: %w", currIdx, currIdx+count, err))
+								return
+							}
+							if len(bundles) == 0 {
+								recordError(fmt.Errorf("fetch tiles [%d, %d) returned 0 bundles", currIdx, currIdx+count))
+								return
+							}
+							for _, b := range bundles {
+								if p.cache != nil {
+									_ = p.cache.PutBundle(b)
+								}
+								select {
+								case <-pipeCtx.Done():
+									return
+								case leafBundleChan <- b:
+								}
+								nextIdx := b.StartLeafIdx + uint64(len(b.Leaves))
+								if nextIdx <= currIdx {
+									nextIdx = (b.BundleIdx + 1) * p.bundleSize
+								}
+								currIdx = nextIdx
+							}
+						} else {
+							select {
+							case <-pipeCtx.Done():
+								return
+							case leafBundleChan <- bundle:
+							}
+							nextIdx := bundle.StartLeafIdx + uint64(len(bundle.Leaves))
+							if nextIdx <= currIdx {
+								nextIdx = (bundle.BundleIdx + 1) * p.bundleSize
+							}
+							currIdx = nextIdx
+						}
+					}
 				}
-			} else {
+			}()
+		}
+
+		go func() {
+			fetchWg.Wait()
+			close(leafBundleChan)
+		}()
+	} else {
+		fetchWg.Add(1)
+		go func() {
+			defer fetchWg.Done()
+			defer close(leafBundleChan)
+			currIdx := fromLeafIdx
+			for currIdx < targetSize {
 				select {
 				case <-pipeCtx.Done():
 					return
-				case leafBundleChan <- bundle:
+				default:
 				}
-				nextIdx := bundle.StartLeafIdx + uint64(len(bundle.Leaves))
-				if nextIdx <= currIdx {
-					nextIdx = (bundle.BundleIdx + 1) * p.bundleSize
+
+				bundleIdx := currIdx / p.bundleSize
+				var bundle *LeafBundle
+				if p.cache != nil {
+					if b, err := p.cache.GetBundle(bundleIdx); err == nil && b != nil {
+						bEnd := b.StartLeafIdx + uint64(len(b.Leaves))
+						if currIdx < bEnd && (uint64(len(b.Leaves)) == p.bundleSize || bEnd >= targetSize) {
+							bundle = b
+						}
+					}
 				}
-				currIdx = nextIdx
+
+				if bundle == nil {
+					count := p.bundleSize * 50
+					if currIdx+count > targetSize {
+						count = targetSize - currIdx
+					}
+					bundles, err := p.fetcher.FetchTiles(pipeCtx, currIdx, count)
+					if err != nil {
+						recordError(fmt.Errorf("fetch tiles [%d, %d) failed: %w", currIdx, currIdx+count, err))
+						return
+					}
+					if len(bundles) == 0 {
+						recordError(fmt.Errorf("fetch tiles [%d, %d) returned 0 bundles", currIdx, currIdx+count))
+						return
+					}
+					for _, b := range bundles {
+						if p.cache != nil {
+							_ = p.cache.PutBundle(b)
+						}
+						select {
+						case <-pipeCtx.Done():
+							return
+						case leafBundleChan <- b:
+						}
+						nextIdx := b.StartLeafIdx + uint64(len(b.Leaves))
+						if nextIdx <= currIdx {
+							nextIdx = (b.BundleIdx + 1) * p.bundleSize
+						}
+						currIdx = nextIdx
+					}
+				} else {
+					select {
+					case <-pipeCtx.Done():
+						return
+					case leafBundleChan <- bundle:
+					}
+					nextIdx := bundle.StartLeafIdx + uint64(len(bundle.Leaves))
+					if nextIdx <= currIdx {
+						nextIdx = (bundle.BundleIdx + 1) * p.bundleSize
+					}
+					currIdx = nextIdx
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Stage 2: MapWorkerPool
 	for i := 0; i < p.numWorkers; i++ {
