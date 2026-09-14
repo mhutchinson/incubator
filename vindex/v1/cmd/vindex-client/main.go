@@ -35,9 +35,9 @@ var (
 	key          = flag.String("key", "", "Key string to search.")
 	keyHashHex   = flag.String("key_hash", "", "32-byte hex encoded key hash to search.")
 	outLogOrigin = flag.String("out_log_origin", "", "Expected origin for Output Log.")
-	outLogPubKey = flag.String("out_log_pubkey", "", "Public key note verifier string for Output Log.")
+	outLogPubKey = flag.String("out_log_pubkey", "", "Public key or key file for Output Log checkpoint verification.")
 	inLogOrigin  = flag.String("in_log_origin", "", "Expected origin for Input Log.")
-	inLogPubKey  = flag.String("in_log_pubkey", "", "Public key note verifier string for Input Log.")
+	inLogPubKey  = flag.String("in_log_pubkey", "", "Public key or key file for Input Log checkpoint verification (standard note or mtc+...).")
 	before       = flag.Uint64("before", 0, "Upper bound Input Log index (exclusive) for lookup.")
 	limitCount   = flag.Uint64("limit", 10000, "Maximum number of indices to return per page.")
 	fetchAll     = flag.Bool("all", false, "Fetch all matching indices across pages.")
@@ -71,7 +71,7 @@ func run(ctx context.Context) error {
 
 	var outVerifier note.Verifier
 	if *outLogPubKey != "" {
-		v, err := note.NewVerifier(*outLogPubKey)
+		v, err := client.ParseVerifier(*outLogPubKey)
 		if err != nil {
 			return fmt.Errorf("failed to create output log verifier: %w", err)
 		}
@@ -80,7 +80,7 @@ func run(ctx context.Context) error {
 
 	var inVerifier note.Verifier
 	if *inLogPubKey != "" {
-		v, err := note.NewVerifier(*inLogPubKey)
+		v, err := client.ParseVerifier(*inLogPubKey)
 		if err != nil {
 			return fmt.Errorf("failed to create input log verifier: %w", err)
 		}

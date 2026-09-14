@@ -20,6 +20,12 @@ These examples demonstrate how external developers can implement and compile cus
    - Generates hierarchical domain sub-roots down to eTLD+1 using `publicsuffix`.
    - Emits sorted, deterministic 32-byte SHA-256 hashes.
 
+3. **`mtc`** (`mapfn/examples/mtc`):
+   - Parses Merkle Tree Certificates (MTC) Type 1 `TBSCertificateLogEntry` ASN.1 DER leaves.
+   - Extracts Subject Alternative Names (SANs).
+   - Generates hierarchical domain sub-roots down to eTLD+1 using `publicsuffix`.
+   - Emits canonical preimages to host runtime.
+
 ---
 
 ## Building the Examples

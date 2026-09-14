@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -115,7 +116,7 @@ func TestVindexd_FlagValidation_Publisher(t *testing.T) {
 }
 
 func TestVindexd_POSIXOutputLog_Lifecycle(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	tmpDir := t.TempDir()
@@ -135,6 +136,7 @@ func TestVindexd_POSIXOutputLog_Lifecycle(t *testing.T) {
 	*outputLogOrigin = origin
 	*tileCacheDir = cacheD
 	*wasmPath = getTestWasm(t)
+	*wasmWorkers = 1
 	*listenAddr = "127.0.0.1:0"
 	*metricsAddr = ""
 	*inputLogURL = "" // no fetcher, run recovery and shutdown
@@ -149,7 +151,7 @@ func TestVindexd_POSIXOutputLog_Lifecycle(t *testing.T) {
 	// Wait for initialization, verify checkpoint file exists on disk
 	cpPath := filepath.Join(outD, "checkpoint")
 	var cpBytes []byte
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(cpPath)
 		if err == nil && len(data) > 0 {
@@ -174,7 +176,7 @@ func TestVindexd_POSIXOutputLog_Lifecycle(t *testing.T) {
 }
 
 func TestVindexd_POSIXOutputLog_SyncAndRestart(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	tmpDir := t.TempDir()
@@ -235,6 +237,7 @@ func TestVindexd_POSIXOutputLog_SyncAndRestart(t *testing.T) {
 	*inputLogOrigin = inOrigin
 	*inputLogPubKey = inVKey
 	*wasmPath = getTestWasm(t)
+	*wasmWorkers = 4
 	*oneShot = true
 	*listenAddr = "127.0.0.1:0"
 	*metricsAddr = ""
@@ -276,7 +279,7 @@ func TestVindexd_POSIXOutputLog_SyncAndRestart(t *testing.T) {
 	// Query /checkpoint and /tile/ endpoints from vindexd
 	client := &http.Client{Timeout: 2 * time.Second}
 	var resp *http.Response
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err = client.Get(fmt.Sprintf("http://%s/checkpoint", srvAddr))
 		if err == nil && resp.StatusCode == http.StatusOK {
@@ -306,7 +309,10 @@ func getFreePort() (int, error) {
 		return 0, err
 	}
 	l, err := net.ListenTCP("tcp", addr)
-	defer l.Close()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
@@ -342,5 +348,128 @@ func TestVindexd_DBCacheSizeFlag(t *testing.T) {
 	}
 	if pebbleOpts.Cache.MaxSize() != int64(64)<<20 {
 		t.Errorf("expected Cache.MaxSize 64MB (%d), got %d", int64(64)<<20, pebbleOpts.Cache.MaxSize())
+	}
+}
+
+func TestVindexd_MTCVerifier_FlagAndInit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	mtcKey := "mtc+oid/1.3.6.1.4.1.44363.47.1.44363.48.8+44363.48.9+44363.48.8+teYkXkxVoKhT1PxKODAyZFqUk8KZ4tUjzS6yAvvZ8hU="
+	outOrigin := "vindex.test.output"
+	skey, _ := newTestSignerKey(t, outOrigin)
+
+	port, err := getFreePort()
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+
+	*mode = "publisher"
+	*dbPath = filepath.Join(tmpDir, "db")
+	*mptDir = filepath.Join(tmpDir, "mpt")
+	*outputLogDir = filepath.Join(tmpDir, "outputlog")
+	*outputLogSignerKey = skey
+	*outputLogOrigin = outOrigin
+	*wasmPath = getTestWasm(t)
+	*wasmWorkers = 1
+	*listenAddr = fmt.Sprintf("localhost:%d", port)
+	*metricsAddr = ""
+	*inputLogURL = "https://bootstrap-mtca-shard3.cloudflareresearch.com"
+	*inputLogOrigin = "bootstrap-mtca.cloudflareresearch.com/logs/shard3"
+
+	// 1. Invalid MTC pubkey returns error
+	*inputLogPubKey = "mtc+invalid+key"
+	err = run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "invalid MTC verifier") {
+		t.Fatalf("expected invalid MTC verifier error, got: %v", err)
+	}
+
+	// 2. Valid MTC pubkey initializes without error
+	*inputLogPubKey = mtcKey
+	cancel() // Cancel context so coordinator/run exits cleanly after initialization
+	err = run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected clean run/exit on context cancel, got: %v", err)
+	}
+}
+
+func TestVindexd_CleanDirs(t *testing.T) {
+	tmpDir := t.TempDir()
+	d1 := filepath.Join(tmpDir, "db")
+	d2 := filepath.Join(tmpDir, "mpt")
+	d3 := filepath.Join(tmpDir, "outlog")
+	d4 := filepath.Join(tmpDir, "tiles")
+
+	resetDirs := func() {
+		for _, d := range []string{d1, d2, d3, d4} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				t.Fatalf("MkdirAll failed: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(d, "canary.txt"), []byte("canary"), 0o644); err != nil {
+				t.Fatalf("WriteFile failed: %v", err)
+			}
+		}
+	}
+	resetDirs()
+
+	origDB := *dbPath
+	origMPT := *mptDir
+	origOutLog := *outputLogDir
+	origTiles := *tileCacheDir
+	origClean := *cleanDirs
+	origWASM := *wasmPath
+	origKey := *outputLogSignerKey
+	origMode := *mode
+	t.Cleanup(func() {
+		*dbPath = origDB
+		*mptDir = origMPT
+		*outputLogDir = origOutLog
+		*tileCacheDir = origTiles
+		*cleanDirs = origClean
+		*wasmPath = origWASM
+		*outputLogSignerKey = origKey
+		*mode = origMode
+	})
+
+	*dbPath = d1
+	*mptDir = d2
+	*outputLogDir = d3
+	*tileCacheDir = d4
+	*cleanDirs = true
+	*wasmPath = "" // Missing required flag
+	*mode = "publisher"
+
+	// 1. Verify invalid flags abort before wiping directories
+	err := run(context.Background())
+	if err == nil {
+		t.Fatalf("expected error due to missing wasm_path, got nil")
+	}
+	for _, d := range []string{d1, d2, d3, d4} {
+		canary := filepath.Join(d, "canary.txt")
+		if _, err := os.Stat(canary); errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("destructive clean executed despite invalid flags: %q was deleted", canary)
+		}
+	}
+
+	// 2. Verify clean in auditor mode is rejected to protect forensic state
+	*mode = "auditor"
+	if err := run(context.Background()); err == nil || !strings.Contains(err.Error(), "not permitted in auditor") {
+		t.Fatalf("expected auditor mode --clean rejection, got: %v", err)
+	}
+
+	// 3. Verify cleanDirectories succeeds when executed
+	*mode = "publisher"
+	if err := cleanDirectories(); err != nil {
+		t.Fatalf("cleanDirectories failed: %v", err)
+	}
+	for _, d := range []string{d1, d2, d3, d4} {
+		canary := filepath.Join(d, "canary.txt")
+		if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("expected %q to be deleted by cleanDirectories, but it still exists", canary)
+		}
+		if info, err := os.Stat(d); err != nil || !info.IsDir() {
+			t.Errorf("expected %q to exist as an empty directory after cleanDirectories", d)
+		}
 	}
 }

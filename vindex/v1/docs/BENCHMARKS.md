@@ -51,6 +51,21 @@ VIndex divides processing across discrete pipeline stages, allocating goroutines
 | **Stage 4** | [`internal/tree`](../internal/tree/README.md) | Single publisher goroutine | Predicts `MapRoot` lock-free, appends to Output Log, and ratchets trie under short write lock (< 5 ms). |
 | **Stage 5** | [`internal/server`](../internal/server/README.md) | Concurrent HTTP worker pool | Serves C2SP read queries under shared read lock (`treeMu.RLock()`). |
 
+### 1.4 Standard Milestone Taxonomy (One-Shot Catch-Up Mode)
+
+To eliminate methodological conflation during one-shot bulk indexing evaluations, benchmarks decompose end-to-end execution into five deterministic milestones corresponding to subsystem completion:
+
+- **Milestone 1 (M1): Tile Ingestion & Mapping 100% Complete (`internal/ingest` + `mapfn`)**:
+  All 256-leaf tiles are fetched from upstream, executed through `map_bundle` in Wazero, and re-sequenced into strict monotonic order. Observable when `pipeline.StreamBatches` finishes streaming all bundles and closes the reader channel (`vindex_leaves_mapped_total == Target_Size`).
+- **Milestone 2 (M2): KV Store Synced & Durable (`internal/kvstore`)**:
+  The dedicated committer goroutine drains all batches, updates inverted chunk records (`'c' + KeyHash + ^chunkNum`), commits atomic SSTable batches to Pebble, and executes `pebble.Sync` to persist `m_kv_size = Target_Size`. Marks the completion of the ingestion phase (`vindex_kv_committed_size == Target_Size`).
+- **Milestone 3 (M3): State Commitment Predicted (`internal/tree` - Pass 1)**:
+  Radix sorting of dirty key hashes completes (`SortKeyVals`), followed by speculative lock-free calculation of the Patricia Trie root hash across all accumulated mutations (`mptMgr.PredictKeyVals`, tracked by `vindex_mpt_predict_duration_seconds`).
+- **Milestone 4 (M4): Output Log Appended & Witnessed (`internal/tree` + `witness`)**:
+  The state commitment leaf (`MapRoot` + `InputLogCP`) is formatted, appended to POSIX storage (`outputLog.Append`), signed by remote witnesses if configured, and inclusion proof is fetched (`vindex_output_log_append_duration_seconds`).
+- **Milestone 5 (M5): MPT Ratcheted & State Promoted / Time-to-Serve (`internal/tree` - Pass 2 + `server`)**:
+  Under write lock (`treeMu.Lock()`), changes are applied to the trie (`CommitKeyValsLocked`), `tree.Snap` writes mmap files to disk, root hash equality is asserted, and the active serving state is ratcheted (`pub.SetServingState`). The read server is now live and serving cryptographic inclusion proofs (`vindex_serving_tree_size == Target_Size`). Wall clock from process launch to M5 defines total **Time-to-First-Serve**.
+
 ---
 
 ## 2. Standard Benchmark Matrix
@@ -62,7 +77,7 @@ The following matrix defines the standard suite of benchmarks, their component s
 | **Tier 1: Subsystem Microbenchmarks** | Raw KV Inverted Storage | [`internal/kvstore`](../internal/kvstore/README.md) | Direct batch writes to Pebble inverted chunks (`'c' + KeyHash + ^chunkNum`); 64K-entry chunk roll-overs; 16-bit relative index encoding; `pebble.Sync` barrier. | >= 150,000 index entries/s sustained; zero compaction stalls exceeding 100 ms. | `TODO (Pending Reimplementation)` |
 | **Tier 1: Subsystem Microbenchmarks** | WASM Mapping Overhead | [`mapfn`](../mapfn/README.md) | 256-leaf tile batch execution (`map_bundle`); linear memory pack-and-wipe; host SIMD SHA-256 preimage extraction; Wazero compilation mode. | Boundary crossing CPU overhead < 1% total CPU; >= 50,000 leaves/s per CPU core. | `TODO (Pending Reimplementation)` |
 | **Tier 1: Subsystem Microbenchmarks** | MPT Commit Duration | [`internal/tree`](../internal/tree/README.md) | Binary Sparse Merkle Patricia Trie path mutation; lock-free root prediction (`mpt.Predict`); 4,096-leaf mutation batch commit. | Root prediction < 10 ms for 4K leaves; exclusive lock duration (`treeMu.Lock()`) < 5 ms. | `TODO (Pending Reimplementation)` |
-| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | **Pure Go**: **295,241.2 leaves/s** (54,364,768 leaves in 3m 04.34s; total 3m 30.79s)<br>**WASM**: **257,985.4 leaves/s** (54,364,768 leaves in 3m 33.58s; total 3m 58.87s)<br>**MVP**: **172,193.3 leaves/s** (54,364,768 leaves in 5m 15.72s; total 6m 36.01s) |
+| **Tier 2: End-to-End Ingestion Pipelines** | Go SumDB (Low-Fanout 1-to-1) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream public Go Checksum Database mirror (54M+ leaves); 1-to-1 key-to-leaf mapping; continuous tile fetch, map, commit, and witness publishing. | Local Mirror: >= 200,000 leaves/s; Remote Loopback: >= 100,000 leaves/s; Peak RSS < 512 MB. | **Pure Go**: **295,241.2 leaves/s** (54,364,768 leaves in 3m 04.34s; total 3m 30.79s)<br>**WASM (Parallel Fetch)**: **288,589.5 leaves/s** (54,364,768 leaves in 3m 08.38s; total 4m 00.66s)<br>**WASM (Single Fetch)**: **257,985.4 leaves/s** (54,364,768 leaves in 3m 33.58s; total 3m 58.87s)<br>**MVP**: **172,193.3 leaves/s** (54,364,768 leaves in 5m 15.72s; total 6m 36.01s) |
 | **Tier 2: End-to-End Ingestion Pipelines** | Merkle Tree Certificates / CT (High-Fanout 1-to-N) | Full Engine (`ingest`, `mapfn`, `kvstore`, `tree`, `coordinator`) | Stream Cloudflare MTC Shard 3 log (257.8M+ leaves, ~74 GB); ASN.1 DER X.509 certificate parsing; 1-to-N mapping (SAN domains down to eTLD+1); heavy chunk roll-overs. | >= 40,000 certs/s; 33-byte prefix Bloom filter seek efficiency >= 99%; Peak RSS < 4 GB. | **WASM (`mtc.wasm`)**: **146,214.2 leaves/s** (257,823,832 leaves in 29m 23.33s; Peak RSS 3.08 GB; Pebble DB 1.7 GB) |
 | **Tier 3: Query Serving Under Active Load** | Point Lookup Latency (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Single-chunk lookup (`GET /vindex/v1/lookup/{keyhash}`) under 100% active ingestion write load; client verifies checkpoint, MPT proof, and mini-log. | Median (P50) < 1.0 ms; Tail (P99) < 15.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
 | **Tier 3: Query Serving Under Active Load** | High-Fanout Paged Lookup (P50/P99) | [`internal/server`](../internal/server/README.md) & [`client`](../client/README.md) | Backward pagination (`before=X`) across multi-chunk historical records (> 65,536 entries per key) under concurrent ingestion compaction load. | Median (P50) < 5.0 ms; Tail (P99) < 75.0 ms; 0 cryptographic or monotonicity failures. | `TODO (Pending Reimplementation)` |
@@ -96,11 +111,10 @@ Measures the pure execution latency and memory allocation overhead of guest WASM
 
 ```bash
 # Benchmark WASM plugin bundle execution and memory arena reset
-vindex-wasm bench \
-  --plugin=./vindex/v1/mapfn/examples/sumdb/plugin.wasm \
-  --bundle_size=256 \
+go run ./vindex/v1/cmd/vindex-wasm bench \
+  --wasm=./vindex/v1/mapfn/examples/sumdb/sumdb.wasm \
   --iterations=10000 \
-  --simd=true
+  --workers=4
 ```
 
 Parameters evaluated:
@@ -188,45 +202,48 @@ In addition to synthetic workloads, the benchmark suite evaluates complete mirro
 - **Dataset Size**: Full mirror of `sum.golang.org` (> 54 million leaves, ~15 GB tile mirror).
 - **Execution Commands**:
   ```bash
-  # Option 1: Native Pure Go MapFn
-  vindexd \
-    --input_log_url=file:///path/to/sumdb/mirror \
-    --input_log_origin="go.sum database tree" \
-    --input_log_pubkey="sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8" \
-    --mapper=sumdb \
-    --db_path=/tmp/vindex-sumdb/db \
-    --mpt_dir=/tmp/vindex-sumdb/mpt \
-    --output_log_dir=/tmp/vindex-sumdb/outlog \
-    --tile_cache_dir=/tmp/vindex-sumdb/tiles \
-    --listen_addr=127.0.0.1:8088
+  # Option 1: Native Pure Go MapFn (cmd/sumdbindex)
+  /usr/bin/time -v go run ./vindex/v1/cmd/sumdbindex \
+    --input_override_url="file:///path/to/sumdb/mirror" \
+    --storage_dir=/tmp/vindex-sumdb \
+    --oneshot
 
-  # Option 2: Isolated WASM MapFn (Wazero Host)
-  vindexd \
-    --input_log_url=file:///path/to/sumdb/mirror \
+  # Option 2: Isolated WASM MapFn (vindexd, Parallel Fetch)
+  /usr/bin/time -v go run ./vindex/v1/cmd/vindexd \
+    --mode=publisher \
+    --input_log_url="file:///path/to/sumdb/mirror" \
     --input_log_origin="go.sum database tree" \
     --input_log_pubkey="sum.golang.org+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8" \
-    --wasm_path=./vindex/v1/mapfn/examples/sumdb/sumdb.wasm \
+    --wasm_path="./vindex/v1/mapfn/examples/sumdb/sumdb.wasm" \
+    --output_log_signer_key="PRIVATE+KEY+SumDBIndex+a5ed0e81+AYT6tfHpqGaSoH0gYpM7fhj1tEkM3wwYR/IhtiYh1pnj" \
+    --output_log_dir=/tmp/vindex-sumdb/outlog \
     --db_path=/tmp/vindex-sumdb/db \
     --mpt_dir=/tmp/vindex-sumdb/mpt \
-    --output_log_dir=/tmp/vindex-sumdb/outlog \
     --tile_cache_dir=/tmp/vindex-sumdb/tiles \
-    --listen_addr=127.0.0.1:8088
+    --fetch_workers=4 \
+    --oneshot
+
+  # Option 3: Isolated WASM MapFn (vindexd, Single Fetch)
+  # (Identical to Option 2 with --fetch_workers=1)
   ```
 
 - **Comparative Telemetry (54,364,768 Leaves)**:
 
-  | Pipeline Phase | MVP (`cmd/sumdbindex`) | v1 Streaming WASM (`sumdb.wasm`) | v1 Pure Go (`--mapper=sumdb`) | v1 Pure Go vs MVP Delta |
+  | Pipeline Milestone / Phase | MVP (`cmd/sumdbindex`) | v1 Streaming WASM (Single Fetch) | v1 Streaming WASM (Parallel Fetch) | v1 Pure Go (`cmd/sumdbindex`) |
   | :--- | :--- | :--- | :--- | :--- |
-  | **Log Ingestion & Leaf Mapping** | 5m 15.72s (315.72s) | 3m 33.58s (213.58s) | **3m 04.34s** (184.34s) | **-2m 11.38s (-41.6%)** |
-  | **Sustained Mapping Rate** | 172,193.3 leaves/s | 257,985.4 leaves/s | **295,241.2 leaves/s** | **+123,047.9 leaves/s (+71.5%)** |
-  | **MPT Commitment & Output Publish** | 1m 20.27s (80.27s) | 26.04s | **26.37s** | **-53.90s (-67.1%)** |
-  | **Time-to-First-Serve (Total)** | 6m 36.01s (396.01s) | 3m 58.87s (238.87s) | **3m 30.79s** (210.79s) | **-3m 05.22s (-46.8%)** |
-  | **Overall Ingestion Throughput** | 137,280.0 leaves/s | 227,572.2 leaves/s | **257,909.6 leaves/s** | **+120,629.6 leaves/s (+87.9%)** |
-  | **Peak Resident Set Size (RSS)** | 964.3 MB (987,396 KB) | 1,227.4 MB (1,256,840 KB) | **573.5 MB** (587,328 KB) | **-390.8 MB (-40.5%)** |
-  | **CPU Utilization** | 130% | 771% | 297% | Multi-core pipeline |
-  | **MapRoot Value Scheme** | Flat SHA-256 concatenation | RFC 6962 mini-log Merkle sub-roots | RFC 6962 mini-log Merkle sub-roots | v1 implementations match |
-  | **MapRoot Determinism** | `ca457ef353b030ffe655818d0fdb71aea5d10cb8593123ad4cbc557701721c86` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | Identical across v1 |
-  | **Serving Point Lookup Latency** | < 1.0 ms | < 1.0 ms | < 1.0 ms | Inclusion proofs verified |
+  | **M1/M2: Ingestion & KV Store Synced** | 5m 15.72s (315.72s) | 3m 33.58s (213.58s) | **3m 08.38s** (188.38s) | **3m 04.34s** (184.34s) |
+  | **Sustained Mapping Rate** | 172,193.3 leaves/s | 257,985.4 leaves/s | **288,589.5 leaves/s** | **295,241.2 leaves/s** |
+  | **M3: MPT Root Prediction (Lock-Free)** | N/A (Flat SHA-256) | ~26s *(Omitted from legacy total)* | **26.10s** (`vindex_mpt_predict_duration_seconds`) | ~26s *(Omitted from legacy total)* |
+  | **M4: Output Log Append & Proof** | < 0.01s | < 0.01s | **< 0.01s** (`vindex_output_log_append_duration_seconds`) | < 0.01s |
+  | **M5: MPT Commit & Snap (Write Lock)** | 1m 20.27s (80.27s) | 26.04s (`vindex_mpt_write_duration_seconds`) | **26.18s** (`vindex_mpt_write_duration_seconds`) | **26.37s** (`vindex_mpt_write_duration_seconds`) |
+  | **State Commitment Wall Clock (M3+M4+M5)** | 1m 20.27s (80.27s) | 26.04s *(Omitted M3 pass)* | **52.28s** *(Full end-to-end publish)* | 26.37s *(Omitted M3 pass)* |
+  | **Time-to-First-Serve (Total M1..M5)** | 6m 36.01s (396.01s) | 3m 58.87s *(Legacy M1+M2+M5)* | **4m 00.66s** (240.66s) | 3m 30.79s *(Legacy M1+M2+M5)* |
+  | **Overall Ingestion Throughput** | 137,280.0 leaves/s | 227,572.2 leaves/s | **225,898.6 leaves/s** | **257,909.6 leaves/s** |
+  | **Peak Resident Set Size (RSS)** | 964.3 MB (987,396 KB) | 1,227.4 MB (1,256,840 KB) | **2,862.0 MB** (2,930,680 KB) | **573.5 MB** (587,328 KB) |
+  | **CPU Utilization** | 130% | 771% | **1017%** | 297% |
+  | **MapRoot Value Scheme** | Flat SHA-256 concatenation | RFC 6962 mini-log Merkle sub-roots | RFC 6962 mini-log Merkle sub-roots | RFC 6962 mini-log Merkle sub-roots |
+  | **MapRoot Determinism** | `ca457ef353b030ffe655818d0fdb71aea5d10cb8593123ad4cbc557701721c86` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` | `24357c2aa5d759b956559f32cbc9d37d7836606adce3362face32411dc076cfd` |
+  | **Serving Point Lookup Latency** | < 1.0 ms | < 1.0 ms | < 1.0 ms | < 1.0 ms |
 
 #### B. Merkle Tree Certificates (MTC) / Certificate Transparency Mirror Dataset
 - **Workload Type**: High-fanout 1-to-N mapping (X.509 certificate to SAN domain names and hierarchical sub-roots down to eTLD+1).

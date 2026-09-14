@@ -39,6 +39,7 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/server"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/verifier"
 	"github.com/transparency-dev/merkle/proof"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera/api/layout"
@@ -315,7 +316,7 @@ func New(cfg Config) (*Verifier, error) {
 	if cfg.OutputLogVerifier != nil {
 		v.outputLogVerifier = cfg.OutputLogVerifier
 	} else if cfg.OutputLogPubKey != "" {
-		nv, err := note.NewVerifier(cfg.OutputLogPubKey)
+		nv, err := verifier.ParseVerifier(cfg.OutputLogPubKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse output log pub key: %w", err)
 		}
@@ -325,7 +326,7 @@ func New(cfg Config) (*Verifier, error) {
 	if cfg.InputLogVerifier != nil {
 		v.inputLogVerifier = cfg.InputLogVerifier
 	} else if cfg.InputLogPubKey != "" {
-		nv, err := note.NewVerifier(cfg.InputLogPubKey)
+		nv, err := verifier.ParseVerifier(cfg.InputLogPubKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse input log pub key: %w", err)
 		}

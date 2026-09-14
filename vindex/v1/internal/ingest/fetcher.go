@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"filippo.io/sunlight"
 	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
 	"github.com/transparency-dev/tessera/api"
@@ -198,14 +200,17 @@ func (tc leafBundleCache) get(i uint64) []byte {
 	return nil
 }
 
-// TiledFetcher adapts a tlog-tiles HTTP endpoint to the TileFetcher interface.
+// TiledFetcher adapts a tlog-tiles or static-ct HTTP endpoint to the TileFetcher interface.
 type TiledFetcher struct {
-	mu       sync.Mutex
-	fetcher  tiledReader
-	verifier note.Verifier
-	origin   string
-	cache    leafBundleCache
-	treeSize uint64
+	mu         sync.Mutex
+	fetcher    tiledReader
+	verifier   note.Verifier
+	origin     string
+	cache      leafBundleCache
+	treeSize   uint64
+	baseURL    *url.URL
+	httpClient *http.Client
+	isStaticCT bool
 }
 
 // SetTreeSize sets the current tree size used for partial tile fetching.
@@ -220,6 +225,20 @@ func (f *TiledFetcher) TreeSize() uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.treeSize
+}
+
+// SetStaticCT explicitly sets whether to fetch Static-CT entry bundles (tile/data) instead of standard tiles (tile/entries).
+func (f *TiledFetcher) SetStaticCT(isStatic bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.isStaticCT = isStatic
+}
+
+// IsStaticCT reports whether the fetcher is operating in Static-CT mode.
+func (f *TiledFetcher) IsStaticCT() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isStaticCT
 }
 
 // NewTiledFetcherWithReader creates a new TiledFetcher using a custom TiledReader.
@@ -258,10 +277,16 @@ func NewTiledFetcher(baseURL *url.URL, verifier note.Verifier, origin string, ht
 		reader = httpReader
 	}
 
+	isStaticCT := (origin != "" && (strings.Contains(origin, "certificate.transparency") || strings.Contains(origin, "static-ct"))) ||
+		(baseURL != nil && (strings.Contains(baseURL.Host, "certificate.transparency") || strings.Contains(baseURL.Path, "static-ct")))
+
 	return &TiledFetcher{
-		fetcher:  reader,
-		verifier: verifier,
-		origin:   origin,
+		fetcher:    reader,
+		verifier:   verifier,
+		origin:     origin,
+		baseURL:    baseURL,
+		httpClient: httpClient,
+		isStaticCT: isStaticCT,
 	}, nil
 }
 
@@ -315,6 +340,25 @@ func (f *TiledFetcher) Leaf(ctx context.Context, idx uint64) ([]byte, error) {
 	}
 
 	bIdx := idx / layout.EntryBundleWidth
+
+	if f.isStaticCT {
+		bundle, err := f.fetchStaticCTBundle(ctx, bIdx, f.treeSize)
+		if err != nil {
+			metrics.InputFetchErrorsTotal.Inc()
+			return nil, fmt.Errorf("failed to fetch static-ct bundle for leaf %d: %w", idx, err)
+		}
+		ti := idx % layout.EntryBundleWidth
+		if int(ti) >= len(bundle.Leaves) {
+			metrics.InputFetchErrorsTotal.Inc()
+			return nil, fmt.Errorf("leaf %d out of bounds in bundle (size %d)", idx, len(bundle.Leaves))
+		}
+		f.cache = leafBundleCache{
+			start:  idx - ti,
+			leaves: bundle.Leaves,
+		}
+		return bundle.Leaves[ti], nil
+	}
+
 	bundle, err := tclient.GetEntryBundle(ctx, f.fetcher.ReadEntryBundle, bIdx, f.treeSize)
 	if err != nil {
 		metrics.InputFetchErrorsTotal.Inc()
@@ -390,6 +434,16 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 	for bIdx := startBundle; bIdx < endBundle; bIdx++ {
 		bIdx := bIdx
 		g.Go(func() error {
+			if f.isStaticCT {
+				bundle, err := f.fetchStaticCTBundle(gCtx, bIdx, treeSize)
+				if err != nil {
+					metrics.InputFetchErrorsTotal.Inc()
+					return fmt.Errorf("failed to fetch static-ct bundle %d: %w", bIdx, err)
+				}
+				bundles[bIdx-startBundle] = bundle
+				return nil
+			}
+
 			var bundle api.EntryBundle
 			var bundlePBuf *PooledBuffer
 			if pr, ok := f.fetcher.(pooledReader); ok {
@@ -474,6 +528,159 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 	metrics.LeavesDownloadedTotal.Add(float64(totalLeavesInBundles))
 
 	return bundles, nil
+}
+
+func (f *TiledFetcher) fetchStaticCTBundle(ctx context.Context, bIdx, treeSize uint64) (*LeafBundle, error) {
+	p := layout.PartialTileSize(0, bIdx, treeSize)
+	var tileData []byte
+	var tileRelease func()
+	if pr, ok := f.fetcher.(pooledReader); ok {
+		tData, tPBuf, err := pr.ReadTilePooled(ctx, 0, bIdx, p)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+		}
+		tileData = tData
+		tileRelease = tPBuf.Release
+	} else {
+		tData, err := f.fetcher.ReadTile(ctx, 0, bIdx, p)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+		}
+		tileData = tData
+	}
+	if tileRelease != nil {
+		defer tileRelease()
+	}
+
+	dataTile, dataPBuf, err := f.readStaticCTDataTilePooled(ctx, bIdx, p)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch data tile %d: %w", bIdx, err)
+	}
+
+	lb, err := parseAndVerifyStaticCTBundle(dataTile, tileData, bIdx)
+	if err != nil {
+		if dataPBuf != nil {
+			dataPBuf.Release()
+		}
+		return nil, err
+	}
+	lb.PooledBuf = dataPBuf
+	return lb, nil
+}
+
+func (f *TiledFetcher) readStaticCTDataTilePooled(ctx context.Context, bIdx uint64, p uint8) ([]byte, *PooledBuffer, error) {
+	if f.baseURL == nil {
+		return nil, nil, errors.New("cannot read static-ct data tile without baseURL")
+	}
+	tileRel := layout.TilePath(0, bIdx, p)
+	if len(tileRel) < 7 {
+		return nil, nil, fmt.Errorf("unexpected tile path %q", tileRel)
+	}
+	relPath := fmt.Sprintf("tile/data/%s", tileRel[7:])
+	if f.baseURL.Scheme == "file" {
+		filePath := filepath.Join(f.baseURL.Path, relPath)
+		data, pBuf, err := readPooledFile(filePath, globalBufferPool)
+		if err != nil && p != 0 && errors.Is(err, os.ErrNotExist) {
+			fullRel := layout.TilePath(0, bIdx, 0)
+			fullRelPath := fmt.Sprintf("tile/data/%s", fullRel[7:])
+			data, pBuf, err = readPooledFile(filepath.Join(f.baseURL.Path, fullRelPath), globalBufferPool)
+		}
+		return data, pBuf, err
+	}
+
+	data, err := f.readStaticCTDataTile(ctx, bIdx, p)
+	return data, nil, err
+}
+
+func (f *TiledFetcher) readStaticCTDataTile(ctx context.Context, bIdx uint64, p uint8) ([]byte, error) {
+	if f.baseURL == nil {
+		return nil, errors.New("cannot read static-ct data tile without baseURL")
+	}
+	tileRel := layout.TilePath(0, bIdx, p)
+	if len(tileRel) < 7 {
+		return nil, fmt.Errorf("unexpected tile path %q", tileRel)
+	}
+	relPath := fmt.Sprintf("tile/data/%s", tileRel[7:])
+	if f.baseURL.Scheme == "file" {
+		filePath := filepath.Join(f.baseURL.Path, relPath)
+		data, err := os.ReadFile(filePath)
+		if err != nil && p != 0 && errors.Is(err, os.ErrNotExist) {
+			fullRel := layout.TilePath(0, bIdx, 0)
+			fullRelPath := fmt.Sprintf("tile/data/%s", fullRel[7:])
+			data, err = os.ReadFile(filepath.Join(f.baseURL.Path, fullRelPath))
+		}
+		return data, err
+	}
+
+	client := f.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	tileURL := f.baseURL.JoinPath(relPath).String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "vindex/1.0 (CT-Monitor)")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound && p != 0 {
+		fullRel := layout.TilePath(0, bIdx, 0)
+		fullRelPath := fmt.Sprintf("tile/data/%s", fullRel[7:])
+		fullURL := f.baseURL.JoinPath(fullRelPath).String()
+		fullReq, fullErr := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		if fullErr == nil {
+			fullReq.Header.Set("User-Agent", "vindex/1.0 (CT-Monitor)")
+			fullResp, fullErr := client.Do(fullReq)
+			if fullErr == nil {
+				defer func() { _ = fullResp.Body.Close() }()
+				if fullResp.StatusCode == http.StatusOK {
+					return io.ReadAll(fullResp.Body)
+				}
+			}
+		}
+
+		return nil, fmt.Errorf("unexpected HTTP status %s for %s", resp.Status, tileURL)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %s for %s", resp.Status, tileURL)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+func parseAndVerifyStaticCTBundle(dataTile, treeTile []byte, bIdx uint64) (*LeafBundle, error) {
+	rest := dataTile
+	var leaves [][]byte
+	idx := 0
+	for len(rest) > 0 {
+		leaf, remaining, err := sunlight.ReadTileLeaf(rest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse static-ct leaf %d in bundle %d: %w", idx, bIdx, err)
+		}
+		rawLeaf := rest[:len(rest)-len(remaining)]
+		if len(treeTile) >= (idx+1)*32 {
+			mtl := leaf.MerkleTreeLeaf()
+			h := sha256.Sum256(append([]byte{0x00}, mtl...))
+			expected := treeTile[idx*32 : (idx+1)*32]
+			if !bytes.Equal(h[:], expected) {
+				return nil, fmt.Errorf("leaf %d in bundle %d hash mismatch against tree tile", idx, bIdx)
+			}
+		}
+		leaves = append(leaves, rawLeaf)
+		rest = remaining
+		idx++
+	}
+	return &LeafBundle{
+		BundleIdx:    bIdx,
+		StartLeafIdx: bIdx * uint64(layout.EntryBundleWidth),
+		Leaves:       leaves,
+	}, nil
 }
 
 var rfc6962LeafPrefix = [1]byte{0x00}
