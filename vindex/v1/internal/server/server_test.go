@@ -345,7 +345,6 @@ func TestReadServer_MetricsEndpoint(t *testing.T) {
 		}
 	}
 }
-
 func TestReadServer_CustomChunkSize(t *testing.T) {
 	const customChunkSize = 64
 	srv, db, _, pub := setupTestServer(t, customChunkSize)
@@ -395,3 +394,44 @@ func TestReadServer_CustomChunkSize(t *testing.T) {
 	}
 }
 
+func TestReadServer_UI(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t, 256)
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// GET /
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want 200", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("GET / content-type = %q, want text/html", ct)
+	}
+	if !strings.Contains(w.Body.String(), "VIndex Web") {
+		t.Fatalf("GET / body does not contain 'VIndex Web': %s", w.Body.String())
+	}
+
+	// GET /index.html
+	req2 := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET /index.html status = %d, want 200", w2.Code)
+	}
+
+	// Test disabling UI
+	srvDisabled, _, _, _ := setupTestServer(t, 256)
+	srvDisabled.SetEnableUI(false)
+	muxDisabled := http.NewServeMux()
+	srvDisabled.RegisterRoutes(muxDisabled)
+
+	req3 := httptest.NewRequest(http.MethodGet, "/", nil)
+	w3 := httptest.NewRecorder()
+	muxDisabled.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusNotFound {
+		t.Fatalf("GET / with disabled UI status = %d, want 404", w3.Code)
+	}
+}
