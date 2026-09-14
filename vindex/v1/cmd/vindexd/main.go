@@ -18,7 +18,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -33,6 +32,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/auditor"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/coordinator"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
@@ -44,26 +44,27 @@ import (
 )
 
 var (
+	mode               = flag.String("mode", "publisher", "Daemon operation mode: 'publisher' (default), 'auditor', or 'verifier'.")
 	inputLogURL        = flag.String("input_log_url", "", "Base URL of the Input Log.")
 	inputLogOrigin     = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
 	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key for Input Log checkpoint verification.")
 	outputLogDir       = flag.String("output_log_dir", "", "Path for local Output Log storage.")
 	outputLogOrigin    = flag.String("output_log_origin", "", "Origin string for Output Log. If unset, defaults to signer name.")
 	outputLogSignerKey = flag.String("output_log_signer_key", "", "Note signer string or path to private key for signing Output Log checkpoints.")
+	outputLogURL       = flag.String("output_log_url", "", "Base URL of Output Log to verify (auditor/verifier mode).")
+	outputLogPubKey    = flag.String("output_log_pubkey", "", "Public key for Output Log checkpoint verification (auditor/verifier mode).")
+	serveMirror        = flag.Bool("serve_mirror", false, "Enable verified mirror serving mode on listen_addr (auditor/verifier mode).")
+	failClosed         = flag.Bool("fail_closed", false, "Immediately revoke mirror serving on verification mismatch instead of serving last verified checkpoint (auditor/verifier mode).")
+	oneShot            = flag.Bool("oneshot", false, "Run verification once against log tip and exit (auditor/verifier mode).")
 	dbPath             = flag.String("db_path", "", "NVMe path for Pebble DB (Disk A).")
 	mptDir             = flag.String("mpt_dir", "", "Isolated NVMe path for MPT mmap files (Disk B).")
-	wasmPath           = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary.")
-	mapper             = flag.String("mapper", "identity", "Leaf mapper implementation: identity or ct.")
+	wasmPath           = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary (required).")
 	listenAddr         = flag.String("listen_addr", ":8080", "HTTP Read Server address.")
 	metricsAddr        = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
-	mode               = flag.String("mode", "publisher", "Daemon operation mode: 'publisher' (default).")
-	oneShot            = flag.Bool("oneshot", false, "Run publisher sync once against log tip and exit.")
-	disableReaper      = flag.Bool("disable_reaper", false, "Disable background tile cache reaper to keep tiles cached indefinitely.")
-	kvIndexerWorkers   = flag.Int("kv_indexer_workers", 0, "Number of worker goroutines for parallel key indexing (0 defaults to min(8, max(1, GOMAXPROCS/2))).")
-	fetchBatchBundles  = flag.Int("fetch_batch_bundles", 50, "Number of leaf bundles fetched per worker batch in Stage 1 (defaults to 50, ~12,800 leaves).")
+	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
 )
 
 func main() {
@@ -79,6 +80,17 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	switch strings.ToLower(*mode) {
+	case "publisher", "coordinator", "":
+		return runPublisher(ctx)
+	case "auditor", "verifier":
+		return runAuditor(ctx)
+	default:
+		return fmt.Errorf("unknown mode %q: expected 'publisher', 'auditor', or 'verifier'", *mode)
+	}
+}
+
+func runPublisher(ctx context.Context) error {
 	if *dbPath == "" {
 		return errors.New("--db_path flag is required")
 	}
@@ -97,28 +109,16 @@ func run(ctx context.Context) error {
 	}
 	defer func() { _ = mptMgr.Close() }()
 
-	// 3. Setup WASM Mapper
-	var leafMapper ingest.LeafMapper
-	if *wasmPath != "" {
-		wasmBytes, err := os.ReadFile(*wasmPath)
-		if err != nil {
-			return fmt.Errorf("failed to read WASM binary %q: %w", *wasmPath, err)
-		}
-		host, err := ingest.NewWASMHost(ctx, wasmBytes, 4)
-		if err != nil {
-			return fmt.Errorf("failed to initialize WASM host: %w", err)
-		}
-		defer func() { _ = host.Close(ctx) }()
-		leafMapper = host
-	} else {
-		switch *mapper {
-		case "ct":
-			leafMapper = &ctLeafMapper{}
-		case "identity", "":
-			leafMapper = &defaultIdentityMapper{}
-		default:
-			return fmt.Errorf("unknown mapper %q (expected identity, ct)", *mapper)
-		}
+	// 3. Setup Mapper
+	if *wasmPath == "" {
+		return errors.New("--wasm_path flag is required")
+	}
+	leafMapper, closeMapper, err := initMapper(ctx, *wasmPath)
+	if err != nil {
+		return err
+	}
+	if closeMapper != nil {
+		defer closeMapper()
 	}
 
 	// 4. Setup Output Log
@@ -152,9 +152,6 @@ func run(ctx context.Context) error {
 
 	pub := tree.NewOutputPublisher(db, mptMgr, outputLog, nil)
 	idxer := kvstore.NewKVIndexer(db, *chunkSize)
-	if *kvIndexerWorkers > 0 {
-		idxer.SetNumWorkers(*kvIndexerWorkers)
-	}
 
 	// Setup Tile Cache & Fetcher
 	tileCache, err := ingest.NewManagedTileCache(*tileCacheDir, 0)
@@ -212,6 +209,7 @@ func run(ctx context.Context) error {
 
 	// 6. Start Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
+	readSrv.SetEnableUI(*enableUI)
 	readMux := http.NewServeMux()
 	readSrv.RegisterRoutes(readMux)
 	readMux.Handle("/tile/", http.FileServer(http.Dir(*outputLogDir)))
@@ -238,12 +236,10 @@ func run(ctx context.Context) error {
 	klog.Info("Startup recovery completed successfully.")
 
 	// 8. Start Background Tile Reaper
-	if !*disableReaper {
-		tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
-		go func() {
-			_ = tileReaper.Run(ctx, 60*time.Second)
-		}()
-	}
+	tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
+	go func() {
+		_ = tileReaper.Run(ctx, 60*time.Second)
+	}()
 
 	// 9. Start Ingestion & Commit Pipeline Loop
 	if fetcher != nil {
@@ -267,42 +263,106 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-type defaultIdentityMapper struct{}
-
-func (m *defaultIdentityMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	kh := sha256.Sum256(leaf)
-	return []ingest.MappedEntry{{KeyHash: kh}}, nil
-}
-
-func (m *defaultIdentityMapper) Close(_ context.Context) error { return nil }
-
-type ctLeafMapper struct{}
-
-func (m *ctLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	lines := strings.Split(string(leaf), "\n")
-	seen := make(map[string]struct{})
-	var entries []ingest.MappedEntry
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.Split(line, ".")
-		var etld1 string
-		if len(parts) >= 2 {
-			etld1 = parts[len(parts)-2] + "." + parts[len(parts)-1]
-		} else {
-			etld1 = line
-		}
-		if _, exists := seen[etld1]; !exists {
-			seen[etld1] = struct{}{}
-			entries = append(entries, ingest.MappedEntry{
-				KeyHash: sha256.Sum256([]byte(etld1)),
-			})
-		}
+func runAuditor(ctx context.Context) error {
+	if *outputLogSignerKey != "" {
+		return errors.New("security invariant violation: --output_log_signer_key must not be specified in verifier mode; verifiers/auditors must never sign output logs")
 	}
-	return entries, nil
+	if *outputLogURL == "" {
+		return errors.New("--output_log_url is required in verifier mode")
+	}
+	if *inputLogURL == "" {
+		return errors.New("--input_log_url is required in verifier mode")
+	}
+	if *dbPath == "" {
+		return errors.New("--db_path flag is required")
+	}
+	if *mptDir == "" {
+		return errors.New("--mpt_dir flag is required")
+	}
+	if *serveMirror && *listenAddr == "" {
+		return errors.New("--listen_addr cannot be empty when --serve_mirror is enabled")
+	}
+
+	resolvedInPubKey, err := resolveKey(*inputLogPubKey)
+	if err != nil {
+		return fmt.Errorf("failed to resolve input log pubkey: %w", err)
+	}
+	resolvedOutPubKey, err := resolveKey(*outputLogPubKey)
+	if err != nil {
+		return fmt.Errorf("failed to resolve output log pubkey: %w", err)
+	}
+
+	if *wasmPath == "" {
+		return errors.New("--wasm_path flag is required")
+	}
+	leafMapper, closeMapper, err := initMapper(ctx, *wasmPath)
+	if err != nil {
+		return err
+	}
+	if closeMapper != nil {
+		defer closeMapper()
+	}
+
+	cfg := auditor.Config{
+		InputLogURL:     *inputLogURL,
+		InputLogPubKey:  resolvedInPubKey,
+		InputLogOrigin:  *inputLogOrigin,
+		OutputLogURL:    *outputLogURL,
+		OutputLogPubKey: resolvedOutPubKey,
+		OutputLogOrigin: *outputLogOrigin,
+		MapFn:           leafMapper,
+		DBPath:          *dbPath,
+		MPTDir:          *mptDir,
+		ServeMirror:     *serveMirror,
+		FailClosed:      *failClosed,
+		ListenAddr:      *listenAddr,
+		MetricsAddr:     *metricsAddr,
+		PollInterval:    *pollInterval,
+		CommitBatchSize: *chunkSize,
+	}
+
+	v, err := auditor.New(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to initialize auditor engine: %w", err)
+	}
+	defer func() { _ = v.Close() }()
+
+	if *oneShot {
+		klog.Info("Running oneshot verification...")
+		if err := v.VerifyOnce(ctx); err != nil {
+			return fmt.Errorf("oneshot verification failed: %w", err)
+		}
+		klog.Info("Oneshot verification succeeded.")
+		return nil
+	}
+
+	klog.Infof("Starting auditor daemon (poll interval: %v, mirror: %v)...", *pollInterval, *serveMirror)
+	return v.Run(ctx)
 }
 
-func (m *ctLeafMapper) Close(_ context.Context) error { return nil }
+func resolveKey(keyOrPath string) (string, error) {
+	keyOrPath = strings.TrimSpace(keyOrPath)
+	if keyOrPath == "" {
+		return "", nil
+	}
+	if data, err := os.ReadFile(keyOrPath); err == nil {
+		return string(bytes.TrimSpace(data)), nil
+	}
+	return keyOrPath, nil
+}
+
+func initMapper(ctx context.Context, wasm string) (ingest.LeafMapper, func(), error) {
+	if wasm == "" {
+		return nil, nil, errors.New("--wasm_path flag is required")
+	}
+	wasmBytes, err := os.ReadFile(wasm)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read WASM binary %q: %w", wasm, err)
+	}
+	host, err := ingest.NewWASMHost(ctx, wasmBytes, 4)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize WASM host: %w", err)
+	}
+	return host, func() { _ = host.Close(ctx) }, nil
+}
 
