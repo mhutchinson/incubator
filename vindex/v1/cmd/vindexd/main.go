@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -39,6 +40,7 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/server"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/verifier"
 	"golang.org/x/mod/sumdb/note"
 	"k8s.io/klog/v2"
 )
@@ -47,7 +49,7 @@ var (
 	mode               = flag.String("mode", "publisher", "Daemon operation mode: 'publisher' (default), 'auditor', or 'verifier'.")
 	inputLogURL        = flag.String("input_log_url", "", "Base URL of the Input Log.")
 	inputLogOrigin     = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
-	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key for Input Log checkpoint verification.")
+	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key or key file for Input Log checkpoint verification (standard note or mtc+<name>+<cosignerID>+<logID>+<pubKeyBase64>).")
 	outputLogDir       = flag.String("output_log_dir", "", "Path for local Output Log storage.")
 	outputLogOrigin    = flag.String("output_log_origin", "", "Origin string for Output Log. If unset, defaults to signer name.")
 	outputLogSignerKey = flag.String("output_log_signer_key", "", "Note signer string or path to private key for signing Output Log checkpoints.")
@@ -55,7 +57,7 @@ var (
 	outputLogPubKey    = flag.String("output_log_pubkey", "", "Public key for Output Log checkpoint verification (auditor/verifier mode).")
 	serveMirror        = flag.Bool("serve_mirror", false, "Enable verified mirror serving mode on listen_addr (auditor/verifier mode).")
 	failClosed         = flag.Bool("fail_closed", false, "Immediately revoke mirror serving on verification mismatch instead of serving last verified checkpoint (auditor/verifier mode).")
-	oneShot            = flag.Bool("oneshot", false, "Run verification once against log tip and exit (auditor/verifier mode).")
+	oneShot            = flag.Bool("oneshot", false, "Run synchronization once against log tip and exit (supported in publisher, auditor, and verifier modes).")
 	dbPath             = flag.String("db_path", "", "NVMe path for Pebble DB (Disk A).")
 	mptDir             = flag.String("mpt_dir", "", "Isolated NVMe path for MPT mmap files (Disk B).")
 	wasmPath           = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary (required).")
@@ -64,12 +66,28 @@ var (
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval       = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
-	enableUI           = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
+	enableUI             = flag.Bool("enable_ui", true, "Set to true to serve the single-page HTML UI at / and /index.html.")
+	wasmWorkers          = flag.Int("wasm_workers", 0, "Number of concurrent WASM worker instances (0 defaults to GOMAXPROCS - 1).")
+	fetchWorkers         = flag.Int("fetch_workers", 4, "Number of concurrent tile fetch workers (defaults to 4, 1 disables parallel fetching).")
+	fetchBatchBundles    = flag.Int("fetch_batch_bundles", 50, "Number of leaf bundles fetched per worker batch in Stage 1 (defaults to 50, ~12,800 leaves).")
+	disableReaper        = flag.Bool("disable_reaper", false, "Disable background tile cache reaper to keep tiles cached indefinitely.")
+	inputLogType         = flag.String("input_log_type", "auto", "Input log layout type: 'auto', 'tessera', or 'static-ct'.")
+	kvIndexerWorkers     = flag.Int("kv_indexer_workers", 0, "Number of worker goroutines for parallel key indexing (0 defaults to min(8, max(1, GOMAXPROCS/2))).")
+	mutexProfileFraction = flag.Int("mutex_profile_fraction", 0, "If > 0, enable mutex contention profiling sampling 1/N events.")
+	blockProfileRate     = flag.Int("block_profile_rate", 0, "If > 0, enable goroutine blocking profiling with nanosecond rate.")
+	cleanDirs            = flag.Bool("clean", false, "Clean db_path, mpt_dir, output_log_dir, and tile_cache_dir on startup.")
 )
 
 func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
+
+	if *mutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(*mutexProfileFraction)
+	}
+	if *blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(*blockProfileRate)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -79,11 +97,52 @@ func main() {
 	}
 }
 
+func validatePublisherFlags() error {
+	if *dbPath == "" {
+		return errors.New("--db_path flag is required")
+	}
+	if *wasmPath == "" {
+		return errors.New("--wasm_path flag is required")
+	}
+	if *outputLogDir == "" {
+		return errors.New("--output_log_dir flag is required in publisher mode")
+	}
+	if *outputLogSignerKey == "" {
+		return errors.New("--output_log_signer_key flag is required in publisher mode")
+	}
+	return nil
+}
+
+func cleanDirectories() error {
+	for _, d := range []string{*dbPath, *mptDir, *outputLogDir, *tileCacheDir} {
+		if d != "" {
+			if err := os.RemoveAll(d); err != nil {
+				return fmt.Errorf("failed to clean directory %q: %w", d, err)
+			}
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				return fmt.Errorf("failed to create directory %q: %w", d, err)
+			}
+		}
+	}
+	return nil
+}
+
 func run(ctx context.Context) error {
 	switch strings.ToLower(*mode) {
 	case "publisher", "coordinator", "":
+		if err := validatePublisherFlags(); err != nil {
+			return err
+		}
+		if *cleanDirs {
+			if err := cleanDirectories(); err != nil {
+				return err
+			}
+		}
 		return runPublisher(ctx)
 	case "auditor", "verifier":
+		if *cleanDirs {
+			return errors.New("--clean is not permitted in auditor or verifier mode to protect forensic state")
+		}
 		return runAuditor(ctx)
 	default:
 		return fmt.Errorf("unknown mode %q: expected 'publisher', 'auditor', or 'verifier'", *mode)
@@ -152,8 +211,14 @@ func runPublisher(ctx context.Context) error {
 
 	pub := tree.NewOutputPublisher(db, mptMgr, outputLog, nil)
 	idxer := kvstore.NewKVIndexer(db, *chunkSize)
+	if *kvIndexerWorkers > 0 {
+		idxer.SetNumWorkers(*kvIndexerWorkers)
+	}
 
 	// Setup Tile Cache & Fetcher
+	if *tileCacheDir == "" {
+		klog.Warning("--tile_cache_dir is not set; local disk tile caching is disabled. Historical crash recovery will require re-fetching from upstream.")
+	}
 	tileCache, err := ingest.NewManagedTileCache(*tileCacheDir, 0)
 	if err != nil {
 		return fmt.Errorf("failed to initialize tile cache: %w", err)
@@ -169,18 +234,28 @@ func runPublisher(ctx context.Context) error {
 			return fmt.Errorf("invalid input log URL %q: %w", *inputLogURL, err)
 		}
 
-		var verifier note.Verifier
+		var inVerifier note.Verifier
 		if *inputLogPubKey != "" {
-			v, err := note.NewVerifier(*inputLogPubKey)
+			v, err := verifier.ParseVerifier(*inputLogPubKey)
 			if err != nil {
 				return fmt.Errorf("failed to create input log verifier: %w", err)
 			}
-			verifier = v
+			inVerifier = v
 		}
 
-		tf, err := ingest.NewTiledFetcher(u, verifier, *inputLogOrigin, nil)
+		tf, err := ingest.NewTiledFetcher(u, inVerifier, *inputLogOrigin, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create input log fetcher: %w", err)
+		}
+		switch strings.ToLower(*inputLogType) {
+		case "static-ct", "ct":
+			tf.SetStaticCT(true)
+		case "tessera":
+			tf.SetStaticCT(false)
+		case "auto", "":
+			// retain auto-detected value
+		default:
+			return fmt.Errorf("unknown input_log_type %q: expected 'auto', 'tessera', or 'static-ct'", *inputLogType)
 		}
 		fetcher = tf
 	}
@@ -229,6 +304,12 @@ func runPublisher(ctx context.Context) error {
 
 	// 7. Run 3-Phase Crash Recovery
 	coord := coordinator.NewCoordinator(db, mptMgr, outputLog, pub, idxer, fetcher, tileCache, leafMapper)
+	if *fetchWorkers > 0 {
+		coord.SetFetchWorkers(*fetchWorkers)
+	}
+	if *fetchBatchBundles > 0 {
+		coord.SetFetchBatchBundles(*fetchBatchBundles)
+	}
 	klog.Info("Running 3-phase startup recovery...")
 	if err := coord.Recover(ctx); err != nil {
 		return fmt.Errorf("startup recovery failed: %w", err)
@@ -236,19 +317,25 @@ func runPublisher(ctx context.Context) error {
 	klog.Info("Startup recovery completed successfully.")
 
 	// 8. Start Background Tile Reaper
-	tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
-	go func() {
-		_ = tileReaper.Run(ctx, 60*time.Second)
-	}()
+	if !*disableReaper {
+		tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
+		go func() {
+			_ = tileReaper.Run(ctx, 60*time.Second)
+		}()
+	} else {
+		klog.Info("Tile cache reaper disabled via --disable_reaper; cached tiles will be retained indefinitely.")
+	}
 
 	// 9. Start Ingestion & Commit Pipeline Loop
 	if fetcher != nil {
 		if *oneShot {
 			klog.Info("Running oneshot publisher sync...")
+			syncStart := time.Now()
 			if err := coord.SyncOnce(ctx); err != nil {
 				return fmt.Errorf("oneshot publisher sync failed: %w", err)
 			}
-			klog.Info("Oneshot publisher sync completed.")
+			elapsed := time.Since(syncStart)
+			klog.Infof("Oneshot publisher sync completed in %v.", elapsed)
 			return nil
 		}
 		klog.Infof("Starting zero-WAL ingestion pipeline polling %q every %v", *inputLogURL, *pollInterval)
@@ -359,7 +446,7 @@ func initMapper(ctx context.Context, wasm string) (ingest.LeafMapper, func(), er
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read WASM binary %q: %w", wasm, err)
 	}
-	host, err := ingest.NewWASMHost(ctx, wasmBytes, 4)
+	host, err := ingest.NewWASMHost(ctx, wasmBytes, *wasmWorkers)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize WASM host: %w", err)
 	}
