@@ -23,8 +23,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +47,35 @@ func newTestSignerKey(t *testing.T, origin string) (string, string) {
 	return skey, vkey
 }
 
+var (
+	testWasmOnce sync.Once
+	testWasmPath string
+	testWasmErr  error
+)
+
+func getTestWasm(t *testing.T) string {
+	t.Helper()
+	testWasmOnce.Do(func() {
+		tmpDir, err := os.MkdirTemp("", "vindexd-wasm-*")
+		if err != nil {
+			testWasmErr = err
+			return
+		}
+		wasmPath := filepath.Join(tmpDir, "starter.wasm")
+		cmd := exec.Command("go", "build", "-buildmode=c-shared", "-o", wasmPath, "github.com/transparency-dev/incubator/vindex/v1/mapfn/examples/starter")
+		cmd.Env = append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm", "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			testWasmErr = fmt.Errorf("failed to build starter wasm: %w\n%s", err, string(out))
+			return
+		}
+		testWasmPath = wasmPath
+	})
+	if testWasmErr != nil {
+		t.Fatalf("getTestWasm failed: %v", testWasmErr)
+	}
+	return testWasmPath
+}
+
 func TestVindexd_FlagValidation_Publisher(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -59,7 +90,15 @@ func TestVindexd_FlagValidation_Publisher(t *testing.T) {
 	}
 	*dbPath = filepath.Join(tmpDir, "db")
 
-	// 2. Missing output_log_dir
+	// 2. Missing wasm_path
+	*wasmPath = ""
+	err = run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "--wasm_path flag is required") {
+		t.Fatalf("expected missing wasm_path error, got: %v", err)
+	}
+	*wasmPath = getTestWasm(t)
+
+	// 3. Missing output_log_dir
 	*outputLogDir = ""
 	err = run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "--output_log_dir flag is required") {
@@ -67,7 +106,7 @@ func TestVindexd_FlagValidation_Publisher(t *testing.T) {
 	}
 	*outputLogDir = filepath.Join(tmpDir, "outputlog")
 
-	// 3. Missing output_log_signer_key
+	// 4. Missing output_log_signer_key
 	*outputLogSignerKey = ""
 	err = run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "--output_log_signer_key flag is required") {
@@ -95,7 +134,7 @@ func TestVindexd_POSIXOutputLog_Lifecycle(t *testing.T) {
 	*outputLogSignerKey = skey
 	*outputLogOrigin = origin
 	*tileCacheDir = cacheD
-	*mapper = "identity"
+	*wasmPath = getTestWasm(t)
 	*listenAddr = "127.0.0.1:0"
 	*metricsAddr = ""
 	*inputLogURL = "" // no fetcher, run recovery and shutdown
@@ -195,7 +234,7 @@ func TestVindexd_POSIXOutputLog_SyncAndRestart(t *testing.T) {
 	*inputLogURL = inServer.URL
 	*inputLogOrigin = inOrigin
 	*inputLogPubKey = inVKey
-	*mapper = "identity"
+	*wasmPath = getTestWasm(t)
 	*oneShot = true
 	*listenAddr = "127.0.0.1:0"
 	*metricsAddr = ""
