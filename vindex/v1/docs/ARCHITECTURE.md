@@ -152,6 +152,12 @@ The KV storage engine persists search keys and their occurrence lists into an em
   - *Mechanism*: Evaluates RFC 6962 compact ranges across distinct keys concurrently in memory before sequentially applying chunk updates to Pebble.
   - *Impact*: Eliminates single-thread CPU bottlenecks on Merkle tree hashing during high-fanout ingestion, keeping pace with parallel WASM workers.
 
+- **[Performance Optimization] Dynamic File Descriptor Auto-Tuning, LSM Scaling & Configurable Block Cache**:
+  - *Mechanism*: Auto-tunes Pebble's `MaxOpenFiles` limit based on system `RLIMIT_NOFILE` (raising soft limits up to 65,536 where permitted, reserving a safety margin of 512 descriptors), scales `TargetFileSize` across upper LSM levels (L2=8MB, L3=16MB, L4=32MB, L5+=64MB) with full-level Bloom filters, and provides configurable block cache allocation (`--db_cache_size_mb`, supporting 4GB–16GB allocations on high-memory hosts).
+  - *Impact*: Eliminates continuous SSTable file descriptor thrashing (`openat` consuming ~25.8% cumulative CPU at >80M leaf scale when default 1,000 limit is exceeded across 8,000+ SSTables), prevents `EMFILE` panics, minimizes level compaction overhead, and keeps two-level index/filter blocks hot in RAM.
+
+
+
 ### 1.4 Stage 4: State Commitment ([`internal/tree/`](../internal/tree/README.md))
 The commitment plane anchors the updated search index in an append-only Output Log. As data preparation, each search key's occurrences in the Input Log form an append-only mini-log where each absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00, producing a mini-log sub-root committing to the complete historical sequence of occurrences.
 

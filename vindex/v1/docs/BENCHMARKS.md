@@ -280,6 +280,13 @@ In addition to synthetic workloads, the benchmark suite evaluates complete mirro
   | **Output MapRoot** | `0f0770cf43b9f9899860a0f2b1a41104bd97497ed5bad76f9f6b1d4933a4d1e0` | Cryptographically committed |
   | **Point Lookup Latency** | **< 1.0 ms** (P50 non-inclusion) | Cryptographic proof verified |
 
+- **Production Tuning Note (Pebble File Descriptor, Block Cache & LSM Level Scaling)**:
+  At massive log scales (>80M leaves in CT/MTC workloads with 8,000+ SSTables), default LSM configurations can induce severe file descriptor churn:
+  - *MaxOpenFiles Auto-Tuning*: The default Pebble limit (1,000) results in continuous table cache eviction, spending ~11.7% flat / ~25.8% cumulative CPU time in `syscall.openat`/`os.OpenFile`. Auto-tuning queries `RLIMIT_NOFILE`, elevates soft limits up to 65,536 when permitted, and clamps between 500 and 50,000 (with a 512-FD safety margin).
+  - *Upper-Level TargetFileSize Scaling*: Upper levels (L2+) scale SSTable target sizes (8MB, 16MB, 32MB, 64MB) rather than keeping a static 2MB target, preventing generation of tens of thousands of tiny files and slashing both file descriptor churn and compaction pressure.
+  - *Configurable Block Cache (`--db_cache_size_mb`)*: 64MB SSTables feature larger two-level index/filter blocks (~500 KB–1 MB per file). `--db_cache_size_mb` allows sizing the block cache to 4GB–16GB on high-RAM machines (e.g. 117GB host), ensuring index and Bloom filter blocks remain pinned in RAM.
+
+
 ---
 
 ## 4. Reporting & Verification Requirements

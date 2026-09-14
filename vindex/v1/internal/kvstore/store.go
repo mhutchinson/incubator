@@ -116,10 +116,17 @@ func Open(dir string, opts *pebble.Options) (*DB, error) {
 	if opts.MaxConcurrentCompactions == nil {
 		opts.MaxConcurrentCompactions = func() int { return 8 }
 	}
+	if opts.MaxOpenFiles <= 0 {
+		opts.MaxOpenFiles = autoTuneMaxOpenFiles()
+	}
 	if len(opts.Levels) == 0 {
 		opts.Levels = make([]pebble.LevelOptions, 7)
 		for i := range opts.Levels {
 			opts.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+			if i >= 2 {
+				// Scale SSTable sizes from 8MB in L2 up to 64MB in L5/L6
+				opts.Levels[i].TargetFileSize = int64((8 << 20) * (1 << min(i-2, 3)))
+			}
 		}
 	}
 

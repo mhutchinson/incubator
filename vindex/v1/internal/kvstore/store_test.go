@@ -223,3 +223,40 @@ func TestDB_DoubleClose(t *testing.T) {
 	_ = db.Close()
 }
 
+func TestDB_MaxOpenFilesAndLevels(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "db_open_files_auto")
+	opts := &pebble.Options{}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if opts.MaxOpenFiles < 500 {
+		t.Errorf("expected auto-tuned MaxOpenFiles >= 500, got %d", opts.MaxOpenFiles)
+	}
+	if len(opts.Levels) != 7 {
+		t.Fatalf("expected 7 levels, got %d", len(opts.Levels))
+	}
+	if opts.Levels[2].TargetFileSize != 8<<20 {
+		t.Errorf("expected L2 TargetFileSize 8MB, got %d", opts.Levels[2].TargetFileSize)
+	}
+	if opts.Levels[3].TargetFileSize != 16<<20 {
+		t.Errorf("expected L3 TargetFileSize 16MB, got %d", opts.Levels[3].TargetFileSize)
+	}
+
+	// Explicit override should be preserved
+	dir2 := filepath.Join(t.TempDir(), "db_open_files_explicit")
+	opts2 := &pebble.Options{MaxOpenFiles: 2500}
+	db2, err := Open(dir2, opts2)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	if opts2.MaxOpenFiles != 2500 {
+		t.Errorf("expected explicit MaxOpenFiles 2500, got %d", opts2.MaxOpenFiles)
+	}
+}
+
+

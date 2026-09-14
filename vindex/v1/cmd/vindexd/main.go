@@ -73,7 +73,10 @@ var (
 	disableReaper        = flag.Bool("disable_reaper", false, "Disable background tile cache reaper to keep tiles cached indefinitely.")
 	inputLogType         = flag.String("input_log_type", "auto", "Input log layout type: 'auto', 'tessera', or 'static-ct'.")
 	kvIndexerWorkers     = flag.Int("kv_indexer_workers", 0, "Number of worker goroutines for parallel key indexing (0 defaults to min(8, max(1, GOMAXPROCS/2))).")
+	dbMaxOpenFiles       = flag.Int("db_max_open_files", 0, "Maximum open files for Pebble DB (0 auto-tunes based on system ulimit -n).")
+	dbCacheSizeMB        = flag.Int("db_cache_size_mb", 0, "Pebble block cache size in megabytes (0 defaults to 512 MB, recommend 4096-16384 on large memory hosts).")
 	mutexProfileFraction = flag.Int("mutex_profile_fraction", 0, "If > 0, enable mutex contention profiling sampling 1/N events.")
+
 	blockProfileRate     = flag.Int("block_profile_rate", 0, "If > 0, enable goroutine blocking profiling with nanosecond rate.")
 	cleanDirs            = flag.Bool("clean", false, "Clean db_path, mpt_dir, output_log_dir, and tile_cache_dir on startup.")
 )
@@ -155,7 +158,17 @@ func runPublisher(ctx context.Context) error {
 	}
 
 	// 1. Open Pebble DB
-	db, err := kvstore.Open(*dbPath, &pebble.Options{})
+	pebbleOpts := &pebble.Options{}
+	if *dbMaxOpenFiles > 0 {
+		pebbleOpts.MaxOpenFiles = *dbMaxOpenFiles
+	}
+	if *dbCacheSizeMB > 0 {
+		cache := pebble.NewCache(int64(*dbCacheSizeMB) << 20)
+		defer cache.Unref()
+		pebbleOpts.Cache = cache
+	}
+	db, err := kvstore.Open(*dbPath, pebbleOpts)
+
 	if err != nil {
 		return fmt.Errorf("failed to open Pebble DB at %q: %w", *dbPath, err)
 	}

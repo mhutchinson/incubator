@@ -31,10 +31,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/pebble"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/storage/posix"
 	"golang.org/x/mod/sumdb/note"
 )
+
 
 func newTestSignerKey(t *testing.T, origin string) (string, string) {
 	t.Helper()
@@ -436,4 +439,40 @@ func TestVindexd_CleanDirs(t *testing.T) {
 		}
 	}
 }
+
+func TestVindexd_DBCacheSizeFlag(t *testing.T) {
+	tmpDir := t.TempDir()
+	origCache := *dbCacheSizeMB
+	origMaxFiles := *dbMaxOpenFiles
+	t.Cleanup(func() {
+		*dbCacheSizeMB = origCache
+		*dbMaxOpenFiles = origMaxFiles
+	})
+
+	*dbCacheSizeMB = 64
+	*dbMaxOpenFiles = 1200
+
+	pebbleOpts := &pebble.Options{}
+	if *dbMaxOpenFiles > 0 {
+		pebbleOpts.MaxOpenFiles = *dbMaxOpenFiles
+	}
+	if *dbCacheSizeMB > 0 {
+		cache := pebble.NewCache(int64(*dbCacheSizeMB) << 20)
+		defer cache.Unref()
+		pebbleOpts.Cache = cache
+	}
+	db, err := kvstore.Open(filepath.Join(tmpDir, "db"), pebbleOpts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if pebbleOpts.MaxOpenFiles != 1200 {
+		t.Errorf("expected MaxOpenFiles 1200, got %d", pebbleOpts.MaxOpenFiles)
+	}
+	if pebbleOpts.Cache.MaxSize() != int64(64)<<20 {
+		t.Errorf("expected Cache.MaxSize 64MB (%d), got %d", int64(64)<<20, pebbleOpts.Cache.MaxSize())
+	}
+}
+
 
