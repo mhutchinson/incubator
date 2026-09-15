@@ -117,6 +117,76 @@ type TiledReader interface {
 
 type tiledReader = TiledReader
 
+type pooledReader interface {
+	ReadTilePooled(ctx context.Context, l, i uint64, p uint8) ([]byte, *PooledBuffer, error)
+	ReadEntryBundlePooled(ctx context.Context, i uint64, p uint8) ([]byte, *PooledBuffer, error)
+}
+
+// PooledFileFetcher implements TiledReader and pooledReader using tiered buffer pools.
+type PooledFileFetcher struct {
+	Root string
+	pool *TieredBufferPool
+}
+
+// NewPooledFileFetcher creates a new PooledFileFetcher for local directory trees.
+func NewPooledFileFetcher(root string, pool *TieredBufferPool) *PooledFileFetcher {
+	if pool == nil {
+		pool = globalBufferPool
+	}
+	return &PooledFileFetcher{
+		Root: root,
+		pool: pool,
+	}
+}
+
+func (f *PooledFileFetcher) ReadCheckpoint(_ context.Context) ([]byte, error) {
+	return os.ReadFile(filepath.Join(f.Root, layout.CheckpointPath))
+}
+
+func (f *PooledFileFetcher) ReadTile(ctx context.Context, l, i uint64, p uint8) ([]byte, error) {
+	data, pBuf, err := f.ReadTilePooled(ctx, l, i, p)
+	if err != nil {
+		return nil, err
+	}
+	res := make([]byte, len(data))
+	copy(res, data)
+	pBuf.Release()
+	return res, nil
+}
+
+func (f *PooledFileFetcher) ReadTilePooled(_ context.Context, l, i uint64, p uint8) ([]byte, *PooledBuffer, error) {
+	tileRel := layout.TilePath(l, i, p)
+	filePath := filepath.Join(f.Root, tileRel)
+	data, pBuf, err := readPooledFile(filePath, f.pool)
+	if err != nil && p != 0 && errors.Is(err, os.ErrNotExist) {
+		fallbackRel := layout.TilePath(l, i, 0)
+		return readPooledFile(filepath.Join(f.Root, fallbackRel), f.pool)
+	}
+	return data, pBuf, err
+}
+
+func (f *PooledFileFetcher) ReadEntryBundle(ctx context.Context, i uint64, p uint8) ([]byte, error) {
+	data, pBuf, err := f.ReadEntryBundlePooled(ctx, i, p)
+	if err != nil {
+		return nil, err
+	}
+	res := make([]byte, len(data))
+	copy(res, data)
+	pBuf.Release()
+	return res, nil
+}
+
+func (f *PooledFileFetcher) ReadEntryBundlePooled(_ context.Context, i uint64, p uint8) ([]byte, *PooledBuffer, error) {
+	entriesRel := layout.EntriesPath(i, p)
+	filePath := filepath.Join(f.Root, entriesRel)
+	data, pBuf, err := readPooledFile(filePath, f.pool)
+	if err != nil && p != 0 && errors.Is(err, os.ErrNotExist) {
+		fallbackRel := layout.EntriesPath(i, 0)
+		return readPooledFile(filepath.Join(f.Root, fallbackRel), f.pool)
+	}
+	return data, pBuf, err
+}
+
 type leafBundleCache struct {
 	start  uint64
 	leaves [][]byte
@@ -198,7 +268,7 @@ func NewTiledFetcher(baseURL *url.URL, verifier note.Verifier, origin string, ht
 
 	var reader tiledReader
 	if baseURL.Scheme == "file" {
-		reader = &tclient.FileFetcher{Root: baseURL.Path}
+		reader = NewPooledFileFetcher(baseURL.Path, globalBufferPool)
 	} else {
 		httpReader, err := tclient.NewHTTPFetcher(baseURL, httpClient)
 		if err != nil {
@@ -374,19 +444,64 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 				return nil
 			}
 
-			bundle, err := tclient.GetEntryBundle(gCtx, f.fetcher.ReadEntryBundle, bIdx, treeSize)
-			if err != nil {
-				metrics.InputFetchErrorsTotal.Inc()
-				return fmt.Errorf("failed to fetch entry bundle %d: %w", bIdx, err)
+			var bundle api.EntryBundle
+			var bundlePBuf *PooledBuffer
+			if pr, ok := f.fetcher.(pooledReader); ok {
+				p := layout.PartialTileSize(0, bIdx, treeSize)
+				sRaw, pBuf, err := pr.ReadEntryBundlePooled(gCtx, bIdx, p)
+				if err != nil {
+					metrics.InputFetchErrorsTotal.Inc()
+					return fmt.Errorf("failed to fetch entry bundle %d: %w", bIdx, err)
+				}
+				if err := bundle.UnmarshalText(sRaw); err != nil {
+					pBuf.Release()
+					metrics.InputFetchErrorsTotal.Inc()
+					return fmt.Errorf("failed to parse EntryBundle at index %d: %w", bIdx, err)
+				}
+				bundlePBuf = pBuf
+			} else {
+				var err error
+				bundle, err = tclient.GetEntryBundle(gCtx, f.fetcher.ReadEntryBundle, bIdx, treeSize)
+				if err != nil {
+					metrics.InputFetchErrorsTotal.Inc()
+					return fmt.Errorf("failed to fetch entry bundle %d: %w", bIdx, err)
+				}
 			}
+
 			p := layout.PartialTileSize(0, bIdx, treeSize)
-			tileData, err := f.fetcher.ReadTile(gCtx, 0, bIdx, p)
-			if err != nil {
-				metrics.InputFetchErrorsTotal.Inc()
-				return fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+			var tileData []byte
+			var tileRelease func()
+			if pr, ok := f.fetcher.(pooledReader); ok {
+				tData, tPBuf, err := pr.ReadTilePooled(gCtx, 0, bIdx, p)
+				if err != nil {
+					if bundlePBuf != nil {
+						bundlePBuf.Release()
+					}
+					metrics.InputFetchErrorsTotal.Inc()
+					return fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+				}
+				tileData = tData
+				tileRelease = tPBuf.Release
+			} else {
+				tData, err := f.fetcher.ReadTile(gCtx, 0, bIdx, p)
+				if err != nil {
+					if bundlePBuf != nil {
+						bundlePBuf.Release()
+					}
+					metrics.InputFetchErrorsTotal.Inc()
+					return fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+				}
+				tileData = tData
 			}
+			if tileRelease != nil {
+				defer tileRelease()
+			}
+
 			bundleStartIdx := bIdx * bundleSz
 			if err := verifyBundleWithTile(&bundle, tileData, bundleStartIdx); err != nil {
+				if bundlePBuf != nil {
+					bundlePBuf.Release()
+				}
 				metrics.InputFetchErrorsTotal.Inc()
 				return fmt.Errorf("failed to authenticate entry bundle %d against tree tile: %w", bIdx, err)
 			}
@@ -394,6 +509,7 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 				BundleIdx:    bIdx,
 				StartLeafIdx: bundleStartIdx,
 				Leaves:       bundle.Entries,
+				PooledBuf:    bundlePBuf,
 			}
 			return nil
 		})
@@ -416,17 +532,64 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 
 func (f *TiledFetcher) fetchStaticCTBundle(ctx context.Context, bIdx, treeSize uint64) (*LeafBundle, error) {
 	p := layout.PartialTileSize(0, bIdx, treeSize)
-	tileData, err := f.fetcher.ReadTile(ctx, 0, bIdx, p)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+	var tileData []byte
+	var tileRelease func()
+	if pr, ok := f.fetcher.(pooledReader); ok {
+		tData, tPBuf, err := pr.ReadTilePooled(ctx, 0, bIdx, p)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+		}
+		tileData = tData
+		tileRelease = tPBuf.Release
+	} else {
+		tData, err := f.fetcher.ReadTile(ctx, 0, bIdx, p)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch tree tile %d: %w", bIdx, err)
+		}
+		tileData = tData
+	}
+	if tileRelease != nil {
+		defer tileRelease()
 	}
 
-	dataTile, err := f.readStaticCTDataTile(ctx, bIdx, p)
+	dataTile, dataPBuf, err := f.readStaticCTDataTilePooled(ctx, bIdx, p)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch data tile %d: %w", bIdx, err)
 	}
 
-	return parseAndVerifyStaticCTBundle(dataTile, tileData, bIdx)
+	lb, err := parseAndVerifyStaticCTBundle(dataTile, tileData, bIdx)
+	if err != nil {
+		if dataPBuf != nil {
+			dataPBuf.Release()
+		}
+		return nil, err
+	}
+	lb.PooledBuf = dataPBuf
+	return lb, nil
+}
+
+func (f *TiledFetcher) readStaticCTDataTilePooled(ctx context.Context, bIdx uint64, p uint8) ([]byte, *PooledBuffer, error) {
+	if f.baseURL == nil {
+		return nil, nil, errors.New("cannot read static-ct data tile without baseURL")
+	}
+	tileRel := layout.TilePath(0, bIdx, p)
+	if len(tileRel) < 7 {
+		return nil, nil, fmt.Errorf("unexpected tile path %q", tileRel)
+	}
+	relPath := fmt.Sprintf("tile/data/%s", tileRel[7:])
+	if f.baseURL.Scheme == "file" {
+		filePath := filepath.Join(f.baseURL.Path, relPath)
+		data, pBuf, err := readPooledFile(filePath, globalBufferPool)
+		if err != nil && p != 0 && errors.Is(err, os.ErrNotExist) {
+			fullRel := layout.TilePath(0, bIdx, 0)
+			fullRelPath := fmt.Sprintf("tile/data/%s", fullRel[7:])
+			data, pBuf, err = readPooledFile(filepath.Join(f.baseURL.Path, fullRelPath), globalBufferPool)
+		}
+		return data, pBuf, err
+	}
+
+	data, err := f.readStaticCTDataTile(ctx, bIdx, p)
+	return data, nil, err
 }
 
 func (f *TiledFetcher) readStaticCTDataTile(ctx context.Context, bIdx uint64, p uint8) ([]byte, error) {

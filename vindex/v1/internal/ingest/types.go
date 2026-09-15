@@ -48,6 +48,21 @@ type LeafBundle struct {
 	BundleIdx    uint64
 	StartLeafIdx uint64
 	Leaves       [][]byte
+	PooledBuf    *PooledBuffer
+}
+
+// Retain increments the reference count of the underlying pooled buffer, if any.
+func (b *LeafBundle) Retain() {
+	if b != nil && b.PooledBuf != nil {
+		b.PooledBuf.Retain()
+	}
+}
+
+// Release decrements the reference count of the underlying pooled buffer, returning it to pool on zero.
+func (b *LeafBundle) Release() {
+	if b != nil && b.PooledBuf != nil {
+		b.PooledBuf.Release()
+	}
 }
 
 // MappedBatch contains the extracted key-to-indices mapping for a LeafBundle.

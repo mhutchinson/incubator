@@ -74,18 +74,20 @@ func (c *ManagedTileCache) GetBundle(bundleIdx uint64) (*LeafBundle, error) {
 	}
 
 	bundlePath := c.bundlePath(bundleIdx)
-	data, err := os.ReadFile(bundlePath)
+	data, pBuf, err := readPooledFile(bundlePath, globalBufferPool)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// Fallback to legacy flat path if present.
 			legacyPath := filepath.Join(c.cacheDir, fmt.Sprintf("bundle_%016d.dat", bundleIdx))
-			if lData, lErr := os.ReadFile(legacyPath); lErr == nil {
+			if lData, lPBuf, lErr := readPooledFile(legacyPath, globalBufferPool); lErr == nil {
+				defer lPBuf.Release()
 				return unmarshalBundle(lData, bundleIdx)
 			}
 			return nil, ErrBundleNotFound
 		}
 		return nil, err
 	}
+	defer pBuf.Release()
 
 	return unmarshalBundle(data, bundleIdx)
 }

@@ -208,6 +208,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 							return
 						}
 						_ = p.cache.PutBundle(b)
+						b.Release()
 					}
 				}
 			}()
@@ -275,17 +276,21 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 							return
 						}
 						for _, b := range bundles {
-							select {
-							case <-pipeCtx.Done():
-								return
-							case leafBundleChan <- b:
-							}
 							if p.cache != nil {
+								b.Retain()
 								select {
 								case cacheBundleChan <- b:
 								case <-pipeCtx.Done():
+									b.Release()
+									b.Release()
 									return
 								}
+							}
+							select {
+							case <-pipeCtx.Done():
+								b.Release()
+								return
+							case leafBundleChan <- b:
 							}
 							nextIdx := b.StartLeafIdx + uint64(len(b.Leaves))
 							if nextIdx <= currIdx {
@@ -349,6 +354,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 			for bundle := range leafBundleChan {
 				select {
 				case <-pipeCtx.Done():
+					bundle.Release()
 					return
 				default:
 				}
@@ -362,6 +368,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 					endIdx = targetSize
 				}
 				if startIdx >= endIdx {
+					bundle.Release()
 					continue
 				}
 
@@ -438,6 +445,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 				metrics.MapDurationSeconds.Observe(time.Since(startMapBundle).Seconds())
 
 				if mapErr != nil {
+					bundle.Release()
 					recordError(mapErr)
 					return
 				}
@@ -452,6 +460,7 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 					Count:        uint32(endIdx - startIdx),
 					KeyMap:       keyMap,
 				}
+				bundle.Release()
 
 				select {
 				case <-pipeCtx.Done():
