@@ -76,8 +76,10 @@ var (
 	fetchWorkers         = flag.Int("fetch_workers", 4, "Number of concurrent tile fetch workers (defaults to 4, 1 disables parallel fetching).")
 	inputLogType         = flag.String("input_log_type", "auto", "Input log layout type: 'auto', 'tessera', or 'static-ct'.")
 	mutexProfileFraction = flag.Int("mutex_profile_fraction", 0, "If > 0, enable mutex contention profiling sampling 1/N events.")
-	blockProfileRate     = flag.Int("block_profile_rate", 0, "If > 0, enable goroutine blocking profiling with nanosecond rate.")
-	cleanDirs            = flag.Bool("clean", false, "Clean db_path, mpt_dir, output_log_dir, and tile_cache_dir on startup.")
+	blockProfileRate         = flag.Int("block_profile_rate", 0, "If > 0, enable goroutine blocking profiling with nanosecond rate.")
+	cleanDirs                = flag.Bool("clean", false, "Clean db_path, mpt_dir, output_log_dir, and tile_cache_dir on startup.")
+	backfillMaxPendingKeys   = flag.Int("backfill_max_pending_keys", 50000000, "Maximum deduplicated keys buffered in memory during Genesis Backfill before flushing to MPT (defaults to 50,000,000, ~5.5 GB RAM).")
+	coarseCheckpointInterval = flag.Int("coarse_checkpoint_interval", 50000000, "Maximum leaves between coarse checkpoints during Genesis Backfill (defaults to 50,000,000).")
 )
 
 func main() {
@@ -321,6 +323,12 @@ func runPublisher(ctx context.Context) error {
 	}
 	if *fetchBatchBundles > 0 {
 		coord.SetFetchBatchBundles(*fetchBatchBundles)
+	}
+	if *backfillMaxPendingKeys > 0 {
+		coord.SetBackfillMaxPendingKeys(uint64(*backfillMaxPendingKeys))
+	}
+	if *coarseCheckpointInterval > 0 {
+		coord.SetCoarseCheckpointInterval(uint64(*coarseCheckpointInterval))
 	}
 	klog.Info("Running 3-phase startup recovery...")
 	if err := coord.Recover(ctx); err != nil {

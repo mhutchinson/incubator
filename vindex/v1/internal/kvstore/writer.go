@@ -534,13 +534,16 @@ func (idx *KVIndexer) processKey(
 
 // GetSubRoot calculates the Merkle sub-root for the given keyHash up to maxInputLogSize.
 func (idx *KVIndexer) GetSubRoot(keyHash [sha256.Size]byte, maxInputLogSize uint64) ([sha256.Size]byte, error) {
-	prefix := EncodeChunkPrefix(keyHash)
 	iter, err := idx.db.NewIter(nil)
 	if err != nil {
 		return [sha256.Size]byte{}, err
 	}
 	defer func() { _ = iter.Close() }()
+	return idx.getSubRootWithIter(iter, keyHash, maxInputLogSize)
+}
 
+func (idx *KVIndexer) getSubRootWithIter(iter *pebble.Iterator, keyHash [sha256.Size]byte, maxInputLogSize uint64) ([sha256.Size]byte, error) {
+	prefix := EncodeChunkPrefix(keyHash)
 	if !iter.SeekPrefixGE(prefix) || !bytes.HasPrefix(iter.Key(), prefix) {
 		return EmptyRoot(), nil
 	}
@@ -599,4 +602,71 @@ func (idx *KVIndexer) GetSubRoot(keyHash [sha256.Size]byte, maxInputLogSize uint
 	}
 
 	return cr.Root(), nil
+}
+
+// GetSubRoots computes the Merkle sub-roots for a set of keys up to maxInputLogSize in parallel,
+// reusing Pebble iterators across worker goroutines and performing zero storage writes.
+func (idx *KVIndexer) GetSubRoots(ctx context.Context, keys [][sha256.Size]byte, maxInputLogSize uint64) (map[[sha256.Size]byte][sha256.Size]byte, error) {
+	if len(keys) == 0 {
+		return make(map[[sha256.Size]byte][sha256.Size]byte), nil
+	}
+
+	workers := idx.numWorkers
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(keys) {
+		workers = len(keys)
+	}
+
+	results := make([]struct {
+		key  [sha256.Size]byte
+		root [sha256.Size]byte
+	}, len(keys))
+
+	chunkSize := (len(keys) + workers - 1) / workers
+	g, gCtx := errgroup.WithContext(ctx)
+
+	for w := 0; w < workers; w++ {
+		w := w
+		start := w * chunkSize
+		if start >= len(keys) {
+			continue
+		}
+		end := min(start+chunkSize, len(keys))
+
+		g.Go(func() error {
+			iter, err := idx.db.NewIter(nil)
+			if err != nil {
+				return fmt.Errorf("failed to create iterator: %w", err)
+			}
+			defer func() { _ = iter.Close() }()
+
+			for i := start; i < end; i++ {
+				select {
+				case <-gCtx.Done():
+					return gCtx.Err()
+				default:
+				}
+				k := keys[i]
+				sr, err := idx.getSubRootWithIter(iter, k, maxInputLogSize)
+				if err != nil {
+					return err
+				}
+				results[i].key = k
+				results[i].root = sr
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	res := make(map[[sha256.Size]byte][sha256.Size]byte, len(keys))
+	for _, r := range results {
+		res[r.key] = r.root
+	}
+	return res, nil
 }

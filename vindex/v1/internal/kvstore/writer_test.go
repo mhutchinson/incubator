@@ -780,6 +780,65 @@ func TestKVIndexer_WorkerConfiguration(t *testing.T) {
 	}
 }
 
+func TestKVIndexer_GetSubRoots_Parallel(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	const chunkSize = 32
+	idx := NewKVIndexer(db, chunkSize)
+	idx.SetNumWorkers(4)
+
+	// Create 50 distinct keys with varied leaf indices
+	const numKeys = 50
+	keys := make([][sha256.Size]byte, numKeys)
+	keyMap := make(map[[sha256.Size]byte][]uint64)
+	expectedRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+
+	for i := 0; i < numKeys; i++ {
+		k := sha256.Sum256([]byte(fmt.Sprintf("parallel_key_%d", i)))
+		keys[i] = k
+		var indices []uint64
+		// Some keys have 1 occurrence, some have 10, some span multiple chunks
+		count := (i % 10) + 1
+		for j := 0; j < count; j++ {
+			indices = append(indices, uint64(i*5+j*20))
+		}
+		keyMap[k] = indices
+		expectedRoots[k] = computeExpectedSubRoot(indices)
+	}
+
+	batch := &ingest.MappedBatch{
+		Count:  1000,
+		KeyMap: keyMap,
+	}
+	res, err := idx.IndexBatch(ctx, batch, nil)
+	if err != nil {
+		t.Fatalf("IndexBatch failed: %v", err)
+	}
+
+	// 1. GetSubRoots with empty keys
+	emptyRes, err := idx.GetSubRoots(ctx, nil, 1000)
+	if err != nil || len(emptyRes) != 0 {
+		t.Fatalf("GetSubRoots(nil) = %v, err=%v, want empty map", emptyRes, err)
+	}
+
+	// 2. Parallel GetSubRoots across all 50 keys at tip
+	roots, err := idx.GetSubRoots(ctx, keys, 1000)
+	if err != nil {
+		t.Fatalf("GetSubRoots failed: %v", err)
+	}
+	if len(roots) != numKeys {
+		t.Fatalf("GetSubRoots returned %d keys, want %d", len(roots), numKeys)
+	}
+	for _, k := range keys {
+		if roots[k] != expectedRoots[k] {
+			t.Fatalf("GetSubRoots[%x] = %x, want %x", k, roots[k], expectedRoots[k])
+		}
+		if roots[k] != res.ModifiedSubRoots[k] {
+			t.Fatalf("GetSubRoots[%x] = %x != IndexBatch root %x", k, roots[k], res.ModifiedSubRoots[k])
+		}
+	}
+}
+
 func BenchmarkKVIndexer_IncrementalIndex(b *testing.B) {
 	ctx := context.Background()
 	const numKeys = 200
