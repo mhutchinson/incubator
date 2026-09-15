@@ -232,6 +232,99 @@ When indexing high-velocity logs, the upstream log head advances continuously. P
 
 Mini-log sub-roots within the target boundary are computed deterministically by encoding each occurrence index as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00. This deterministic leaf hashing guarantees that independent indexer replicas and client verifiers compute identical mini-log roots for any given Input Log prefix.
 
+### 2.4 Genesis Backfill Lifecycle (Unserved Bootstrap)
+
+When bootstrapping from leaf 0 on billion-scale, high-cardinality logs (such as Certificate Transparency with 900M+ leaves), accumulating intermediate sub-roots across the entire log in a single in-memory Go map before a final publish batch consumes prohibitive heap memory (>70 GB heap on 675M leaves, representing 95.7% of all allocations), causing severe OS swap thrashing that collapses ingestion throughput by ~90% (from ~97,000 leaves/sec down to ~10,000 leaves/sec).
+
+To resolve this without destabilizing the live serving state machine, VIndex automates a **Genesis Backfill** lifecycle for unserved bootstrap indexing:
+
+```mermaid
+stateDiagram-v2
+    [*] --> CheckOutputLog
+    CheckOutputLog --> GenesisBackfill: Output_CP.Size == 0 (Unserved Bootstrap)
+    CheckOutputLog --> NormalServing: Output_CP.Size > 0 (Live Serving)
+
+    state GenesisBackfill {
+        [*] --> StreamAndMap
+        StreamAndMap --> PebbleCommit: 4,096-leaf slabs
+        PebbleCommit --> DirectMPTSet: mptMgr.SetBatch(mutations)
+        DirectMPTSet --> DiscardMap: Free batch heap (< 10 GB RSS)
+        DiscardMap --> CheckInterval
+
+        state CheckInterval <<choice>>
+        CheckInterval --> CoarseCheckpoint: Every ~1M leaves OR SIGINT/SIGTERM
+        CheckInterval --> CheckTip: Between checkpoints
+
+        state CoarseCheckpoint {
+            [*] --> SyncPebble: 1. pebble.Sync (kvSize durably written)
+            SyncPebble --> SnapMPT: 2. mpt.tree.Snap(kvSize) (hashes dirty nodes, sets version)
+            SnapMPT --> SyncMPT: 3. mpt.tree.Sync() (flushes mmap pages & fsync)
+            SyncMPT --> [*]
+        }
+
+        CoarseCheckpoint --> CheckTip
+
+        state CheckTip <<choice>>
+        CheckTip --> StreamAndMap: More leaves
+        CheckTip --> GenesisFinalize: Reached Target_CP.Size
+    }
+
+    state GenesisFinalize {
+        [*] --> FinalPebbleSync: pebble.Sync
+        FinalPebbleSync --> FinalSnap: mpt.tree.Snap(Target_CP.Size) (computes MapRoot)
+        FinalSnap --> FinalMPTSync: mpt.tree.Sync()
+        FinalMPTSync --> PublishLeaf0: OutputLog.Append(Leaf 0) + Witness
+        PublishLeaf0 --> RatchetServing: SetServingState (atomic pointer swap)
+        RatchetServing --> [*]
+    }
+
+    GenesisFinalize --> NormalServing: Permanent One-Way Transition
+```
+
+#### 2.4.1 Activation Invariant & Serving Plane Isolation
+- **Gating Invariant**: Activated automatically if and only if the Output Log has zero commitment leaves (`Output_CP.Size == 0`).
+- **Read Serving Isolation**: Because the log has never served, read availability is unimpacted:
+  - Point lookups (`GET /vindex/v1/lookup/{keyhash}`) return `503 Service Unavailable ("serving state not initialized")`.
+  - Liveness probe (`GET /healthz`) returns `200 OK` ("ok\n"), verifying process health and background progress.
+  - Readiness and sync probes (`GET /readyz`, `GET /syncz`) return `503 Service Unavailable` with structured diagnostic JSON (`"genesis_backfill": true, "leaves_indexed": X, "target_leaves": Y`), preventing upstream load balancers and Kubernetes ingress from routing traffic to bootstrapping nodes.
+- **Permanent One-Way Promotion**: Once the genesis commitment (Leaf 0) is committed to the Output Log, `Output_CP.Size > 0` holds permanently. The coordinator ratchets serving state and transitions irrevocably to Normal Serving Mode. Subsequent restarts and catch-up cycles execute Normal Serving Mode exclusively.
+
+#### 2.4.2 Pipelined Execution & Heap Memory Bounding
+- **Double-Buffered Slab Pipeline**: Worker pipelines ingest upstream 256-leaf tiles, execute WASM guest plugins via Wazero, hash preimages with host vector instructions, and resequence bundles into 4,096-leaf commit slabs (`DefaultCommitBatchSize`).
+- **Storage Commit**: Each slab commits to Pebble LSM, ratcheting `m_kv_size`.
+- **Direct MPT Application**: MPT mutations returned by the indexer (`res.ModifiedSubRoots`) are applied directly to the in-memory trie via `mptMgr.SetBatch(res.ModifiedSubRoots)` under `writeMu`.
+- **Immediate Heap Deallocation**: The slab mutation map is discarded immediately after `SetBatch`, bounding daemon memory to < 10 GB RSS with zero swap paging.
+- **Bypassed Overheads**: Intermediate `mpt.Predict` root predictions, Output Log appends, and external witness signature collection are completely bypassed for intermediate slabs.
+
+#### 2.4.3 Coarse Checkpoint Protocol & Durability Barrier
+Calling `tree.Snap` or `tree.Sync` on every 4,096-leaf batch is prohibited (incurs O(log N) dirty-node hashing and disk fsync stalls per batch). Instead, coarse checkpoints are executed every ~1,000,000 leaves (and on `SIGINT`/`SIGTERM` graceful shutdown) under a strict 3-step durability sequence:
+1. **Pebble Durability Barrier**: The current commit slab MUST execute with `pebble.Sync` (durably flushing WAL and memtables), guaranteeing that `m_kv_size >= currentKVSize` is physically persisted to non-volatile disk.
+2. **MPT Snapshot**: `mpt.tree.Snap(int64(currentKVSize))` recomputes SHA-256 hashes for all dirty trie branches up to the root, records the watermark in the MPT header (`version = int64(currentKVSize)`), and clears the dirty bit.
+3. **MPT Durability Sync**: `mpt.tree.Sync()` flushes pending mmap patch frames and executes `fsync(2)` on the underlying tree files (`mpt.tree1`, `mpt.tree2`, `mpt.disk`).
+
+Because Step 1 strictly precedes Steps 2 and 3, the Universal Crash Invariant `kvSize >= mptPersistedSize` holds across all power loss and crash scenarios.
+
+#### 2.4.4 Torchwood MPT Version Semantics & Bounded Crash Recovery
+Torchwood MPT exposes snapshot versioning via `Version() (version int64, exact bool)`:
+- **Clean Shutdown (`SIGINT`/`SIGTERM`)**: Traps termination signals, drains the active slab, executes the coarse checkpoint protocol, and closes storage cleanly. Returns `version = kvSize, exact = true`. On restart, `resumeLeaf = min(kvSize, mptPersistedSize) = kvSize`. Cold restart requires **zero leaf replay**.
+- **Dirty Crash (`SIGKILL`, panic, power cut)**: Reopening the trie yields `version = lastSnapVersion, exact = false` (indicating uncommitted in-memory mutations occurred after the last snapshot). The coordinator recovers deterministically:
+  1. Computes `resumeLeaf = min(kvSize, mptPersistedSize) = mptPersistedSize`.
+  2. Resumes ingestion streaming from `resumeLeaf`.
+  3. **Zero Storage Write Amplification**: For replayed leaves `[mptPersistedSize .. kvSize)`, `kvstore/writer.go` detects `unpersisted == 0` for already-persisted indices. It performs zero disk writes and reconstructs sub-roots point-in-time via `GetSubRoot(key, batchEnd)`.
+  4. `mptMgr.SetBatch` applies the reconstructed sub-roots in monotonic sequence, deterministically overwriting any un-snapped trie state.
+  5. **Bounded Blast Radius**: Replay work is bounded to at most the last coarse checkpoint interval (< 1,000,000 leaves, < 10 seconds of streaming).
+
+#### 2.4.5 Tile Cache Retention & `SafeWatermark` Governance
+`TileReaper.SafeWatermark` calculates `min(kvSize, mptPersistedSize)`. During Genesis Backfill, `mptPersistedSize` remains pinned to the last durable coarse checkpoint boundary (e.g. 50M) while `kvSize` advances ahead (e.g. 50.8M). `TileReaper.PruneBefore(50M)` guarantees that all cached tiles in the uncommitted delta `[50M .. 50.8M)` remain preserved on local disk, ensuring crash recovery is 100% local, Zero-WAL, and network-free.
+
+#### 2.4.6 Genesis Finalization & Output Log Leaf 0 Commit
+Upon indexing the final batch reaching `Target_CP.Size`:
+1. Storage commits the final slab with `pebble.Sync`.
+2. `mpt.tree.Snap(int64(targetCP.Size))` hashes all remaining dirty nodes and calculates the final authoritative `MapRoot`.
+3. `mpt.tree.Sync()` fsyncs MPT files to disk.
+4. Publisher appends Leaf 0 to the Output Log, collects witness cosignatures, and executes atomic state promotion to `ServingState`.
+5. Read endpoints open immediately, permanently running in Normal Serving Mode.
+
 ---
 
 ## 3. Independent Auditor & Verified Mirror Architecture ([`internal/auditor/`](../internal/auditor/README.md))
@@ -322,15 +415,12 @@ The daemon exports Prometheus metrics covering the entire lifecycle:
 
 ## 5. Retired Ideas & Alternatives Considered
 
-### 5.1 Backfill Mode (Genesis Catch-Up Mode) Retirement
-- **Proposed**: A dedicated bulk ingestion mode ("Backfill Mode") that streamed leaves into Pebble and applied direct `mpt.SetBatch` mutations to in-memory MPT nodes, completely bypassing per-batch `mpt.Predict` root prediction and Output Log publishing.
-- **Why Investigated**: Theoretical concern that running `mpt.Predict` and publishing Output Log commitments per batch would bottleneck catch-up from leaf 0.
+### 5.1 Arbitrary Runtime Backfill Mode Switching (Retired)
+- **Proposed**: Allowing running daemons to switch dynamically between a bulk ingestion mode ("Backfill Mode") and Normal Serving Mode during live catch-up operations.
 - **Empirical Rejection Findings**:
-  1. **Normal Mode is 85.1% Faster on Go SumDB**: Normal Serving Mode achieved **90,797 leaves/sec** vs. Backfill Mode's **49,064 leaves/sec**. Normal Mode batches storage updates and streams leaf bundles efficiently without the per-batch in-memory MPT mutation overhead that throttled Backfill Mode.
-  2. **100% Read Starvation in Backfill Mode**: Backfill Mode shut down the HTTP read server, causing 0% query availability during catch-up. Normal Mode sustained sub-2ms P50 latency with 100% availability under concurrent queries.
-  3. **Identical Memory Footprint**: Backfill Mode saved only 20–30 MB out of a 220 MB working set.
-  4. **Production Personalities Never Adopted Backfill**: `cmd/sumdbindex` and `cmd/mtcindex` achieved headline rates (240,467 leaves/sec) using Normal Serving Mode (`SyncOnce`).
-- **Resolution**: Permanently retired in favor of unified normal serving mode catch-up.
+  1. **Read Starvation on Live Nodes**: Shutting down the HTTP read server during live catch-up breaks availability for active readers.
+  2. **State Machine Complexity**: Dynamic mode switching introduced edge cases around checkpoint continuity, witness synchronization, and reader lock handoffs.
+- **Resolution**: Arbitrary runtime switching was permanently retired. Live serving nodes always operate in Normal Serving Mode. However, for unserved logs bootstrapping from leaf 0 (`Output_CP.Size == 0`), an automated, low-memory **Genesis Backfill** lifecycle is retained (§2.4) to eliminate the 70+ GB heap accumulation observed on billion-scale Certificate Transparency logs.
 
 ### 5.2 Intermediate Write-Ahead Log in Storage ('w' Prefix & WalReaper)
 - **Proposed**: Staging mapped records under a transient `'w'` prefix in Pebble DB before an asynchronous background worker (`WalReaper`) converted them into inverted chunks (`'c'`).
