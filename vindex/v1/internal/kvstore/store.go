@@ -167,6 +167,28 @@ func (d *DB) Close() (retErr error) {
 	return err
 }
 
+// Sync flushes the memtable to stable storage, ensuring durability of all uncommitted writes.
+func (d *DB) Sync() (retErr error) {
+	if d == nil {
+		return nil
+	}
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	if d.closed {
+		return pebble.ErrClosed
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, pebble.ErrClosed) {
+				retErr = pebble.ErrClosed
+				return
+			}
+			panic(r)
+		}
+	}()
+	return d.db.Flush()
+}
+
 // Pebble returns the underlying *pebble.DB.
 func (d *DB) Pebble() *pebble.DB {
 	return d.db

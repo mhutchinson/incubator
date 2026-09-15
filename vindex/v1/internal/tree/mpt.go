@@ -356,13 +356,18 @@ func (m *Manager) ProveLocked(keyHash [sha256.Size]byte) (proof []byte, subRoot 
 	return []byte(p), [sha256.Size]byte(val), ok, nil
 }
 
-// PersistedVersion returns the version number of the MPT's last complete snapshot.
-func (m *Manager) PersistedVersion() int64 {
+// Version returns the version number of the MPT's last complete snapshot and whether it is exact.
+func (m *Manager) Version() (int64, bool) {
 	m.writeMu.RLock()
 	defer m.writeMu.RUnlock()
 	m.treeMu.RLock()
 	defer m.treeMu.RUnlock()
-	v, _ := m.tree.Version()
+	return m.tree.Version()
+}
+
+// PersistedVersion returns the version number of the MPT's last complete snapshot.
+func (m *Manager) PersistedVersion() int64 {
+	v, _ := m.Version()
 	return v
 }
 

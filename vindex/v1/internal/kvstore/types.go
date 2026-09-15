@@ -70,6 +70,7 @@ type IndexStore interface {
 	SetUint64(key []byte, val uint64) error
 	SetChunkSize(chunkSize uint64)
 	ChunkSize() uint64
+	Sync() error
 	Close() error
 }
 
