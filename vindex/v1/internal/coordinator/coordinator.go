@@ -59,6 +59,7 @@ type Coordinator struct {
 	backfillMaxPendingKeys    uint64
 	fetchWorkers              int
 	fetchBatchBundles         int
+	pipelineChanCap           int
 }
 
 // NewCoordinator creates a new recovery Coordinator.
@@ -185,6 +186,25 @@ func (c *Coordinator) FetchBatchBundles() int {
 		return ingest.DefaultFetchBatchBundles()
 	}
 	return c.fetchBatchBundles
+}
+
+// SetPipelineChannelCapacity sets the buffer capacity of internal pipeline channels.
+func (c *Coordinator) SetPipelineChannelCapacity(n int) {
+	if n < 1 {
+		n = 1
+	}
+	c.pipelineChanCap = n
+	if c.pipeline != nil {
+		c.pipeline.SetChannelCapacity(n)
+	}
+}
+
+// PipelineChannelCapacity returns the configured pipeline channel capacity.
+func (c *Coordinator) PipelineChannelCapacity() int {
+	if c.pipelineChanCap <= 0 {
+		return ingest.DefaultPipelineChannelCapacity()
+	}
+	return c.pipelineChanCap
 }
 
 // Recover runs the recovery sequence:

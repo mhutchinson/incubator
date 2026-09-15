@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/auditor"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/budget"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/coordinator"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
@@ -47,6 +48,9 @@ import (
 
 var (
 	mode               = flag.String("mode", "publisher", "Daemon operation mode: 'publisher' (default), 'auditor', or 'verifier'.")
+	maxMemory          = flag.String("max_memory", "", "Maximum RAM budget (e.g. '32GB', '16GiB', '8000M'). If unset, defaults to 16GB (or host physical limit if lower).")
+	maxCPUs            = flag.Int("max_cpus", 0, "Maximum CPU core allocation. 0 defaults to runtime.GOMAXPROCS(0).")
+	tune               = flag.String("tune", "", "Fine-grained resource tuning parameters in key=value format (e.g. 'genesis_key_buffer=25M,db_cache=4096MB').")
 	inputLogURL        = flag.String("input_log_url", "", "Base URL of the Input Log.")
 	inputLogOrigin     = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
 	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key or key file for Input Log checkpoint verification (standard note or mtc+<name>+<cosignerID>+<logID>+<pubKeyBase64>).")
@@ -158,15 +162,57 @@ func runPublisher(ctx context.Context) error {
 		return errors.New("--db_path flag is required")
 	}
 
+	// 0. Resolve Resource Budget
+	resBudget, err := budget.Resolve(budget.ResourceBudget{
+		MaxMemory: *maxMemory,
+		MaxCPUs:   *maxCPUs,
+		Tune:      *tune,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to resolve resource budget: %w", err)
+	}
+
+	// Apply CLI flag direct overrides if explicitly provided
+	if *dbCacheSizeMB > 0 {
+		resBudget.PebbleBlockCacheSizeMB = *dbCacheSizeMB
+	}
+	if *dbMaxOpenFiles > 0 {
+		resBudget.PebbleMaxOpenFiles = *dbMaxOpenFiles
+	}
+	if *wasmWorkers > 0 {
+		resBudget.WASMWorkers = *wasmWorkers
+	}
+	if isFlagPassed("fetch_workers") && *fetchWorkers > 0 {
+		resBudget.FetchWorkers = *fetchWorkers
+	}
+	if isFlagPassed("fetch_batch_bundles") && *fetchBatchBundles > 0 {
+		resBudget.FetchBatchBundles = *fetchBatchBundles
+	}
+	if *kvIndexerWorkers > 0 {
+		resBudget.KVIndexerWorkers = *kvIndexerWorkers
+	}
+
+	klog.Info(resBudget.LogSummary())
+
 	// 1. Open Pebble DB
 	pebbleOpts := &pebble.Options{}
-	if *dbMaxOpenFiles > 0 {
-		pebbleOpts.MaxOpenFiles = *dbMaxOpenFiles
+	if resBudget.PebbleMaxOpenFiles > 0 {
+		pebbleOpts.MaxOpenFiles = resBudget.PebbleMaxOpenFiles
 	}
-	if *dbCacheSizeMB > 0 {
-		cache := pebble.NewCache(int64(*dbCacheSizeMB) << 20)
+	if resBudget.PebbleBlockCacheSizeMB > 0 {
+		cache := pebble.NewCache(int64(resBudget.PebbleBlockCacheSizeMB) << 20)
 		defer cache.Unref()
 		pebbleOpts.Cache = cache
+	}
+	if resBudget.PebbleMemTableSizeMB > 0 {
+		pebbleOpts.MemTableSize = uint64(resBudget.PebbleMemTableSizeMB) << 20
+	}
+	if resBudget.PebbleMemTableStopWrites > 0 {
+		pebbleOpts.MemTableStopWritesThreshold = resBudget.PebbleMemTableStopWrites
+	}
+	if resBudget.ConcurrentCompactions > 0 {
+		compactions := resBudget.ConcurrentCompactions
+		pebbleOpts.MaxConcurrentCompactions = func() int { return compactions }
 	}
 	db, err := kvstore.Open(*dbPath, pebbleOpts)
 
@@ -186,7 +232,7 @@ func runPublisher(ctx context.Context) error {
 	if *wasmPath == "" {
 		return errors.New("--wasm_path flag is required")
 	}
-	leafMapper, closeMapper, err := initMapper(ctx, *wasmPath)
+	leafMapper, closeMapper, err := initMapper(ctx, *wasmPath, resBudget.WASMWorkers)
 	if err != nil {
 		return err
 	}
@@ -225,9 +271,7 @@ func runPublisher(ctx context.Context) error {
 
 	pub := tree.NewOutputPublisher(db, mptMgr, outputLog, nil)
 	idxer := kvstore.NewKVIndexer(db, *chunkSize)
-	if *kvIndexerWorkers > 0 {
-		idxer.SetNumWorkers(*kvIndexerWorkers)
-	}
+	idxer.SetNumWorkers(resBudget.KVIndexerWorkers)
 
 	// Setup Tile Cache & Fetcher
 	if *tileCacheDir == "" {
@@ -318,18 +362,18 @@ func runPublisher(ctx context.Context) error {
 
 	// 7. Run 3-Phase Crash Recovery
 	coord := coordinator.NewCoordinator(db, mptMgr, outputLog, pub, idxer, fetcher, tileCache, leafMapper)
-	if *fetchWorkers > 0 {
-		coord.SetFetchWorkers(*fetchWorkers)
-	}
-	if *fetchBatchBundles > 0 {
-		coord.SetFetchBatchBundles(*fetchBatchBundles)
-	}
+	coord.SetFetchWorkers(resBudget.FetchWorkers)
+	coord.SetFetchBatchBundles(resBudget.FetchBatchBundles)
+	coord.SetPipelineChannelCapacity(resBudget.PipelineChannelCapacity)
 	if *backfillMaxPendingKeys > 0 {
 		coord.SetBackfillMaxPendingKeys(uint64(*backfillMaxPendingKeys))
 	}
-	if *coarseCheckpointInterval > 0 {
+	if isFlagPassed("coarse_checkpoint_interval") && *coarseCheckpointInterval > 0 {
 		coord.SetCoarseCheckpointInterval(uint64(*coarseCheckpointInterval))
+	} else if resBudget.CoarseCheckpointInterval > 0 {
+		coord.SetCoarseCheckpointInterval(resBudget.CoarseCheckpointInterval)
 	}
+	coord.SetCommitBatchSize(resBudget.CommitBatchSize)
 	klog.Info("Running 3-phase startup recovery...")
 	if err := coord.Recover(ctx); err != nil {
 		return fmt.Errorf("startup recovery failed: %w", err)
@@ -402,7 +446,7 @@ func runAuditor(ctx context.Context) error {
 	if *wasmPath == "" {
 		return errors.New("--wasm_path flag is required")
 	}
-	leafMapper, closeMapper, err := initMapper(ctx, *wasmPath)
+	leafMapper, closeMapper, err := initMapper(ctx, *wasmPath, *wasmWorkers)
 	if err != nil {
 		return err
 	}
@@ -458,7 +502,17 @@ func resolveKey(keyOrPath string) (string, error) {
 	return keyOrPath, nil
 }
 
-func initMapper(ctx context.Context, wasm string) (ingest.LeafMapper, func(), error) {
+func isFlagPassed(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+func initMapper(ctx context.Context, wasm string, numWorkers int) (ingest.LeafMapper, func(), error) {
 	if wasm == "" {
 		return nil, nil, errors.New("--wasm_path flag is required")
 	}
@@ -466,7 +520,7 @@ func initMapper(ctx context.Context, wasm string) (ingest.LeafMapper, func(), er
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read WASM binary %q: %w", wasm, err)
 	}
-	host, err := ingest.NewWASMHost(ctx, wasmBytes, *wasmWorkers)
+	host, err := ingest.NewWASMHost(ctx, wasmBytes, numWorkers)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize WASM host: %w", err)
 	}
