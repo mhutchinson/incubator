@@ -169,14 +169,15 @@ func map_bundle(inputPtr uint32, inputLen uint32) uint64
 The mapping subsystem provides a standalone CLI tool (`vindex/v1/cmd/vindex-wasm`) to allow plugin authors to test and qualify their mapping binaries before production deployment:
 
 ```bash
-# Test mapping output against a sample tile or leaf
-vindex-wasm test --wasm=map.wasm --input=tile.bin
+# Test mapping output against a literal leaf string or file
+vindex-wasm test --wasm=map.wasm --input="golang.org/x/crypto v0.1.0 h1:..."
+vindex-wasm test --wasm=map.wasm --input_file=leaf.bin --format=json
 
 # Run performance and throughput benchmarks (leaves/sec)
-vindex-wasm bench --wasm=map.wasm --input=tile.bin --iterations=1000
+vindex-wasm bench --wasm=map.wasm --input="golang.org/x/crypto v0.1.0 h1:..." --iterations=1000
 
-# Assert bit-for-bit determinism across repeated executions
-vindex-wasm determinism --wasm=map.wasm --input=tile.bin
+# Assert bit-for-bit determinism across repeated executions and concurrency
+vindex-wasm verify-determinism --wasm=map.wasm --input="golang.org/x/crypto v0.1.0 h1:..."
 
 # Inspect exported memory slabs and ABI metadata
 vindex-wasm inspect --wasm=map.wasm

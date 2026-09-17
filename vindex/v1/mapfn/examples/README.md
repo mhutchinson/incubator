@@ -26,14 +26,20 @@ These examples demonstrate how external developers can implement and compile cus
    - Generates hierarchical domain sub-roots down to eTLD+1 using `publicsuffix`.
    - Emits canonical preimages to host runtime.
 
+4. **`starter`** (`mapfn/examples/starter`):
+   - Minimal boilerplate demonstrating zero-allocation leaf ingestion and key emission.
+   - Ideal starting point for writing a custom MapFn from scratch.
+
 ---
 
 ## Building the Examples
 
-### 1. Using `go generate`
+### 1. Using `just` or `go generate`
 Build all example WASM binaries from anywhere in the repository:
 
 ```bash
+just build-wasm
+# or:
 go generate ./vindex/v1/mapfn/examples/...
 ```
 
@@ -41,6 +47,14 @@ go generate ./vindex/v1/mapfn/examples/...
 Or compile individually using standard Go flags:
 
 ```bash
+# Build starter template
+GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build \
+  -trimpath \
+  -ldflags="-buildid=" \
+  -buildmode=c-shared \
+  -o vindex/v1/mapfn/examples/starter/starter.wasm \
+  github.com/transparency-dev/incubator/vindex/v1/mapfn/examples/starter
+
 # Build SumDB example
 GOOS=wasip1 GOARCH=wasm CGO_ENABLED=0 go build \
   -trimpath \

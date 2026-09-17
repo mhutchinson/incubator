@@ -2,6 +2,8 @@
 
 A **Verifiable Index (VIndex)** provides efficient, trustless, and cryptographically verifiable querying over append-only transparency logs (such as Certificate Transparency, Merkle Tree Certificates, and Go SumDB).
 
+> **New to VIndex?** Jump straight into the [**5-Minute Quickstart Guide**](./QUICKSTART.md) or run `just demo-local` to launch a fully self-contained local indexer and query client.
+
 ---
 
 ## 1. Context & Problem Statement
