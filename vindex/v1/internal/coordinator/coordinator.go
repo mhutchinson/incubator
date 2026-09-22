@@ -279,7 +279,7 @@ func (c *Coordinator) recoverGenesisBackfill(ctx context.Context) error {
 
 		batchChan, errChan := c.pipeline.StreamBatches(ctx, mptPersistedSize, kvSize)
 		modifiedKeys := make(map[[sha256.Size]byte]struct{})
-		var replayedLeaves uint64 = mptPersistedSize
+		replayedLeaves := mptPersistedSize
 		lastReplayLog := mptPersistedSize
 		for batch := range batchChan {
 			for k := range batch.KeyMap {
@@ -735,7 +735,7 @@ type backfillFlushJob struct {
 	coarseInterval := c.CoarseCheckpointInterval()
 	maxPendingKeys := c.BackfillMaxPendingKeys()
 	lastCheckpointLeaf := mptPersistedSize
-	var lastIndexedSize uint64 = startLogSize
+	lastIndexedSize := startLogSize
 
 	startTime := time.Now()
 	startProgressSize := startLogSize

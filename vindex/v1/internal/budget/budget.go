@@ -441,7 +441,7 @@ func detectHostMemory() uint64 {
 
 	// 3. Check /proc/meminfo
 	if f, err := os.Open("/proc/meminfo"); err == nil {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -469,35 +469,35 @@ func (r *ResolvedBudget) LogSummary() string {
 	b.WriteString("================================================================================\n")
 	b.WriteString("VINDEX RESOURCE BUDGET RESOLUTION\n")
 	b.WriteString("--------------------------------------------------------------------------------\n")
-	b.WriteString(fmt.Sprintf("Memory Budget:           %.2f GiB (%d bytes)\n", memGiB, r.MaxMemoryBytes))
-	b.WriteString(fmt.Sprintf("CPU Budget:              %d cores\n", r.MaxCPUs))
+	fmt.Fprintf(&b, "Memory Budget:           %.2f GiB (%d bytes)\n", memGiB, r.MaxMemoryBytes)
+	fmt.Fprintf(&b, "CPU Budget:              %d cores\n", r.MaxCPUs)
 	b.WriteString("--------------------------------------------------------------------------------\n")
 	b.WriteString("Derived Memory Partitions:\n")
-	b.WriteString(fmt.Sprintf("  • Genesis Key Buffer:   %s keys (~%.2f GiB, ~%.1f%% of memory budget)\n",
-		formatWithCommas(r.GenesisKeyBufferSize), keyBufGiB, (keyBufGiB/memGiB)*100))
-	b.WriteString(fmt.Sprintf("  • Pebble Block Cache:   %d MB (~%.2f GiB, ~%.1f%% of memory budget)\n",
-		r.PebbleBlockCacheSizeMB, cacheGiB, (cacheGiB/memGiB)*100))
-	b.WriteString(fmt.Sprintf("  • Pebble MemTable Size: %d MB (stop writes threshold: %d memtables)\n",
-		r.PebbleMemTableSizeMB, r.PebbleMemTableStopWrites))
-	b.WriteString(fmt.Sprintf("  • Pipeline Channel Cap: %d batches\n", r.PipelineChannelCapacity))
+	fmt.Fprintf(&b, "  • Genesis Key Buffer:   %s keys (~%.2f GiB, ~%.1f%% of memory budget)\n",
+		formatWithCommas(r.GenesisKeyBufferSize), keyBufGiB, (keyBufGiB/memGiB)*100)
+	fmt.Fprintf(&b, "  • Pebble Block Cache:   %d MB (~%.2f GiB, ~%.1f%% of memory budget)\n",
+		r.PebbleBlockCacheSizeMB, cacheGiB, (cacheGiB/memGiB)*100)
+	fmt.Fprintf(&b, "  • Pebble MemTable Size: %d MB (stop writes threshold: %d memtables)\n",
+		r.PebbleMemTableSizeMB, r.PebbleMemTableStopWrites)
+	fmt.Fprintf(&b, "  • Pipeline Channel Cap: %d batches\n", r.PipelineChannelCapacity)
 	headroomGiB := memGiB - keyBufGiB - cacheGiB - (float64(r.PebbleMemTableSizeMB*r.PebbleMemTableStopWrites) / 1024.0)
 	if headroomGiB < 0 {
 		headroomGiB = 0
 	}
-	b.WriteString(fmt.Sprintf("  • Uncommitted Headroom: ~%.2f GiB (OS page cache, GC slack, runtime heap)\n", headroomGiB))
+	fmt.Fprintf(&b, "  • Uncommitted Headroom: ~%.2f GiB (OS page cache, GC slack, runtime heap)\n", headroomGiB)
 	b.WriteString("Derived Concurrency Partitions:\n")
-	b.WriteString(fmt.Sprintf("  • WASM Workers:         %d instances\n", r.WASMWorkers))
-	b.WriteString(fmt.Sprintf("  • Fetch Workers:        %d workers (%d bundles/batch)\n", r.FetchWorkers, r.FetchBatchBundles))
-	b.WriteString(fmt.Sprintf("  • KV Indexer Workers:   %d workers\n", r.KVIndexerWorkers))
-	b.WriteString(fmt.Sprintf("  • Pebble Compactions:   %d concurrent workers\n", r.ConcurrentCompactions))
+	fmt.Fprintf(&b, "  • WASM Workers:         %d instances\n", r.WASMWorkers)
+	fmt.Fprintf(&b, "  • Fetch Workers:        %d workers (%d bundles/batch)\n", r.FetchWorkers, r.FetchBatchBundles)
+	fmt.Fprintf(&b, "  • KV Indexer Workers:   %d workers\n", r.KVIndexerWorkers)
+	fmt.Fprintf(&b, "  • Pebble Compactions:   %d concurrent workers\n", r.ConcurrentCompactions)
 	b.WriteString("Checkpoints & Commits:\n")
-	b.WriteString(fmt.Sprintf("  • Commit Batch Size:    %s leaves\n", formatWithCommas(r.CommitBatchSize)))
-	b.WriteString(fmt.Sprintf("  • Coarse Checkpoint:    %s leaves\n", formatWithCommas(r.CoarseCheckpointInterval)))
+	fmt.Fprintf(&b, "  • Commit Batch Size:    %s leaves\n", formatWithCommas(r.CommitBatchSize))
+	fmt.Fprintf(&b, "  • Coarse Checkpoint:    %s leaves\n", formatWithCommas(r.CoarseCheckpointInterval))
 
 	if len(r.Overrides) > 0 {
 		b.WriteString("Active Tuning Overrides:\n")
 		for k, v := range r.Overrides {
-			b.WriteString(fmt.Sprintf("  • %s = %s\n", k, v))
+			fmt.Fprintf(&b, "  • %s = %s\n", k, v)
 		}
 	} else {
 		b.WriteString("Active Tuning Overrides:  none\n")
