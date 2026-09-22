@@ -431,3 +431,39 @@ For detailed root cause profiling (including the 22M redundant `pwrite` syscalls
 
 👉 **[DESIGN_DISCUSSIONS.md §4: MPT Cold-Start Replay Pathology & Decoupled State Trie Lifecycle](./DESIGN_DISCUSSIONS.md#4-mpt-cold-start-replay-pathology--decoupled-state-trie-lifecycle)**
 
+---
+
+### 5.4 Lookup Read Path Scalability & Saturation Bottleneck Analysis
+
+Once startup replay completed, the lookup serving path (`GET /vindex/v1/lookup/{keyhash}`) was benchmarked against the live Sycamore 2026h1 dataset (926M leaves, 861M unique keys).
+
+#### 5.4.1 Empirical Lookup Throughput & Latency
+
+Tests evaluated a mixed query workload (80% known hot domain keys, 20% verified non-inclusion queries) across increasing worker concurrency:
+
+| Concurrency | Total Requests | Success Rate | Measured Throughput | P50 Latency | P90 Latency | P99 Latency | Max Latency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **16 workers** | 141,634 | 100.00% | **28,304 QPS** | 333 µs | 1.15 ms | 3.26 ms | 47.5 ms |
+| **64 workers** | 927,994 | 100.00% | **61,846 QPS** | 546 µs | 1.93 ms | 4.51 ms | 28.9 ms |
+| **128 workers** | 693,722 | 100.00% | **69,343 QPS** | 786 µs | 2.88 ms | 6.67 ms | 27.4 ms |
+| **256 workers** | 573,311 | 100.00% | **71,625 QPS** | 1.16 ms | 5.16 ms | 12.24 ms | 202.3 ms |
+| **512 workers** | 359,289 | 100.00% | **71,704 QPS** | 1.14 ms | 10.94 ms | 21.88 ms | 96.8 ms |
+
+Across all runs (>2.6 million requests executed), zero errors or timeouts occurred (100.00% HTTP 200 OK), maintaining sub-millisecond median response times up to 69k QPS.
+
+#### 5.4.2 Saturation Bottleneck Analysis (Limiting Factors)
+
+Throughput plateaus at **~71.7k QPS**. A 10-second `pprof` CPU and mutex profile captured during peak load identified the exact limiting factors:
+
+1. **CPU Profile Breakdown in `HandleLookup`**:
+   - **53.3% — Pebble KV Lookup (`kvstore.(*DB).Lookup`)**: SSTable block iterator seeks (`mergingIter.SeekGE`, `twoLevelIterator`) and chunk value unmarshaling.
+   - **25.5% — Cryptographic SMT Proof Synthesis (`tree.(*Manager).ProveLocked`)**: Traversing the 861-million-key in-memory radix trie to collect sibling hashes for authenticated inclusion/non-inclusion proofs (~2.5 million trie nodes validated per second).
+   - **11.4% — Wire Format Serialization (`server.FormatResponse`)**: Text note formatting and base64 encoding of multi-kilobyte inclusion proofs.
+   - **9.8% — HTTP Framing & TCP Socket I/O**: `net/http` connection writing and header construction.
+
+2. **System-Level Limiting Factors**:
+   - **Host CPU Contention (Co-located Client)**: Because the load tester ran on the same 64-core machine, client HTTP generation consumed ~18–20 cores, leaving only ~40–44 cores for `vindexd`. Total host CPU utilization reached ~52 of 64 cores (~81%).
+   - **POSIX Syscall Rate**: At 71.7k QPS, `Syscall6` accounted for **27.4% of total runtime** (`syscall.write`, `syscall.pread`, `syscall.read`). The Linux kernel handled **>215,000 syscalls/sec**, reaching the localhost socket and context-switching ceiling.
+   - **Zero Contention on MPT Lock**: `pprof` mutex and block profiles confirmed **0 delay on `mptMgr.RLock()`**, showing that read lock acquisition does not bottleneck read-only serving.
+
+
