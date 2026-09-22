@@ -372,3 +372,62 @@ When executing benchmark runs to populate the Standard Benchmark Matrix:
 2. **Resource Accounting**: Measurements must report wall duration, user CPU time, system CPU time, average CPU utilization percentage, peak Resident Set Size (RSS) captured via `/usr/bin/time -v`, and final on-disk database footprint.
 3. **Latency Percentiles**: Read query latency must report distribution percentiles (P50, P90, P99, Max) computed from a minimum of 100,000 executed client requests under active write load.
 4. **Zero-Failure Gate**: Any run encountering an invariant violation, cryptographic proof mismatch, or unhandled panics is marked invalid and fails the evaluation gate.
+
+---
+
+## 5. Post-Run Empirical Evaluation & Cold Startup Investigation (2026-09-22)
+
+### 5.1 Evaluation Context & Environment
+- **Evaluation Date**: 2026-09-22
+- **VIndex Commit**: `3ff0588b80290570d198f3c059f2d56dc7d177a2`
+- **Torchwood Upstream Commit / Module**: `filippo.io/torchwood v0.9.1-0.20260728161618-07e3c0e1ee8b` (with PR #91 patch vendored in `third_party/torchwood`)
+- **Dataset Under Test**: Completed Sycamore 2026h1 production CT log (926,062,388 leaves; 861,312,865 unique keys; 99 GB Pebble DB; 52 GB `mpt.disk`; 89 GB `mpt.tree1`; 85 GB `mpt.tree2`).
+- **Target SLO / Expectation**: Sub-500ms time-to-first-serve via Phase 1 fast-path recovery on clean restart from persisted state.
+
+### 5.2 Observed Behavior & Findings
+
+When attempting to bring up `vindexd` as a read/lookup server against the completed 926M-leaf persisted index, the daemon failed to begin serving within the 500ms SLO. HTTP requests to `:8080` received `Connection refused` for tens of minutes after process invocation.
+
+Detailed profiling of the running process revealed the exact failure mechanism:
+
+1. **Daemon Initialization Order**:
+   In `vindexd/main.go`, the initialization sequence executes:
+   1. `kvstore.Open(*dbPath, pebbleOpts)` (Pebble DB opened)
+   2. `tree.Open(*mptDir)` (MPT Manager opened) **<-- Process blocks here**
+   3. `initMapper(...)` (WASM runtime pools)
+   4. `tree.NewPOSIXOutputLog(...)`
+   5. `httpServer.ListenAndServe()` (Read Server bound to `:8080`)
+   6. `coord.Recover(ctx)` (Phase 1 fast-path check)
+
+   Because `tree.Open` precedes the Read Server setup, the server cannot accept any connections or execute the <5ms Phase 1 tip match check until the MPT manager has fully initialized.
+
+2. **Torchwood `pmem.Open` Journal Replay Pathology at Scale**:
+   In `torchwood/mpt/disk.go`, `Open()` invokes `pmem.Open("mpt tree\n", file1, file2, disk)`.
+   In `torchwood/mpt/internal/pmem/pmem.go`:
+   - The on-disk layout stores an initial base memory image (only 48 KB in size) followed by an append-only sequence of framed mutation blocks (patch frames up to 8 MB each).
+   - Over the course of 926 million leaves and 861 million unique keys, `mpt.tree1` accumulated **89 GB** of patch frames (~11,000 frames).
+   - On `pmem.Open`, `readFile()` is invoked:
+     ```go
+     func (m *Mem) readFile(r *reader) error {
+         ...
+         for {
+             n, err := r.readFrame(patch)  // Sequentially reads from disk & computes SHA-256
+             ...
+             m.replay(patch[:n])          // Decodes varints & applies mutations into memory
+         }
+     }
+     ```
+   - `readFile()` executes sequentially on a **single thread**. It reads all 89 GB from disk, computes a full SHA-256 digest over every frame, and replays each mutation into the memory span.
+   - At realistic NVMe read and single-core SHA-256 hashing throughput (~30–50 MB/s under concurrent Pebble startup background compactions), replaying 89 GB of patch frames requires **~45 to 55 minutes** of wall time.
+
+3. **Impact on Time-to-Serve SLO**:
+   - **Expected**: < 500 ms (Phase 1 O(1) tip equality assertion).
+   - **Observed**: ~45–50 minutes of single-threaded journal verification before port `:8080` is opened.
+   - **Root Cause**: Cold startup time is $O(\text{JournalSize})$ rather than $O(1)$ due to uncompacted mutation frames in the Torchwood persistence layer.
+
+### 5.3 Architectural Analysis & Mitigations
+
+For detailed root cause profiling (including the 22M redundant `pwrite` syscalls in `pmem.go`) and the proposed architectural solutions (compaction API, decoupled serving startup, and pipelined replay), see the design discussion:
+
+👉 **[DESIGN_DISCUSSIONS.md §4: MPT Cold-Start Replay Pathology & Decoupled State Trie Lifecycle](./DESIGN_DISCUSSIONS.md#4-mpt-cold-start-replay-pathology--decoupled-state-trie-lifecycle)**
+
