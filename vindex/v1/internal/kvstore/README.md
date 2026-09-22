@@ -60,7 +60,13 @@ Because chunk numbers are bitwise-inverted, the **highest (newest) chunk has the
   1. If the key does not exist, the Bloom filter prunes all SSTables, returning `iter.Valid() == false` with **zero disk I/O**.
   2. If the key exists, the iterator lands **directly on the latest active chunk in O(1) time**, completely skipping all older historical chunks.
 
+> [!NOTE]
+> **Open Design Discussion**: See [Bounded Chunk Visitation for Sparse Keys](../../docs/DESIGN_DISCUSSIONS.md#3-bounded-chunk-visitation-for-sparse-keys-p99-guardrail) for latency guardrails preventing pathological SSTable scans across sparsely populated keys.
+
 ### 2.2 Delimitless Binary Chunk Serialization & Compact Ranges
+> [!NOTE]
+> **Open Design Discussion**: See [Chunk-Aligned Paging](../../docs/DESIGN_DISCUSSIONS.md#2-chunk-aligned-paging-eliminating-dynamic-merkle-hashing) for research on aligning response boundaries to chunks to return precomputed compact ranges in O(1) and eliminate on-the-fly leaf hashing.
+
 Values store a cumulative RFC 6962 compact range covering all prior chunks, plus a dense array of 16-bit relative offsets for the current chunk:
 
 ```text

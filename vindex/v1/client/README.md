@@ -52,6 +52,9 @@ The client library is completely decoupled from the indexing and audit subsystem
 
 ### 2.2 The 5-Step Query Verification Sequence
 
+> [!NOTE]
+> **Open Design Discussion**: See [Zero-MPT Continuation & The "Map of Logs" API](../docs/DESIGN_DISCUSSIONS.md#1-zero-mpt-continuation--the-map-of-logs-api) for research on eliminating MPT proof verification on backward continuation requests (`before != nil`), verifying history purely through compact range continuity against previously authenticated mini-log roots.
+
 For every lookup request, the client SDK executes the following deterministic 5-step verification sequence:
 
 | Step | Phase | Operations | Mathematical Assertion |

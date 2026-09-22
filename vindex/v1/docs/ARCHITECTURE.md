@@ -156,7 +156,8 @@ The KV storage engine persists search keys and their occurrence lists into an em
   - *Mechanism*: Auto-tunes Pebble's `MaxOpenFiles` limit based on system `RLIMIT_NOFILE` (raising soft limits up to 65,536 where permitted, reserving a safety margin of 512 descriptors), scales `TargetFileSize` across upper LSM levels (L2=8MB, L3=16MB, L4=32MB, L5+=64MB) with full-level Bloom filters, and provides configurable block cache allocation (`--db_cache_size_mb`, supporting 4GB–16GB allocations on high-memory hosts).
   - *Impact*: Eliminates continuous SSTable file descriptor thrashing (`openat` consuming ~25.8% cumulative CPU at >80M leaf scale when default 1,000 limit is exceeded across 8,000+ SSTables), prevents `EMFILE` panics, minimizes level compaction overhead, and keeps two-level index/filter blocks hot in RAM.
 
-
+> [!NOTE]
+> **Open Design Discussion**: See [Chunk-Aligned Paging](./DESIGN_DISCUSSIONS.md#2-chunk-aligned-paging-eliminating-dynamic-merkle-hashing) and [Bounded Chunk Visitation](./DESIGN_DISCUSSIONS.md#3-bounded-chunk-visitation-for-sparse-keys-p99-guardrail) for proposed read-path optimizations on inverted chunk retrieval.
 
 ### 1.4 Stage 4: State Commitment ([`internal/tree/`](../internal/tree/README.md))
 The commitment plane anchors the updated search index in an append-only Output Log. As data preparation, each search key's occurrences in the Input Log form an append-only mini-log where each absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00, producing a mini-log sub-root committing to the complete historical sequence of occurrences.
@@ -200,6 +201,12 @@ The HTTP read server exposes verifiable point lookups adhering to Community Cryp
 - **[Performance Optimization] Direct Plaintext Streaming**:
   - *Mechanism*: Streams standardized multi-section plaintext responses directly to network sockets without intermediate JSON marshalling or reflection.
   - *Impact*: Maintains sub-millisecond median read latency (< 1ms P50, < 15ms P99) during heavy concurrent ingestion.
+
+> [!NOTE]
+> **Open Design Discussion**: See [Design Discussions & Open Frontiers](./DESIGN_DISCUSSIONS.md) for active research on:
+> 1. [Zero-MPT Continuation & The "Map of Logs" API](./DESIGN_DISCUSSIONS.md#1-zero-mpt-continuation--the-map-of-logs-api): Eliminating redundant MPT proofs and lock acquisitions on `before=X` continuations.
+> 2. [Chunk-Aligned Paging](./DESIGN_DISCUSSIONS.md#2-chunk-aligned-paging-eliminating-dynamic-merkle-hashing): Eliminating on-the-fly leaf hashing by aligning pagination to chunk boundaries.
+> 3. [Bounded Chunk Visitation for Sparse Keys](./DESIGN_DISCUSSIONS.md#3-bounded-chunk-visitation-for-sparse-keys-p99-guardrail): Guarding P99 latency during deep backward scans on sparse keys.
 
 ---
 

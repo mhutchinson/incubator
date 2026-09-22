@@ -54,7 +54,13 @@ The server exposes the following HTTP endpoints:
 | `/readyz` | `GET` | Readiness probe. Returns **HTTP 200 OK** (`ok\n`) when serving state is initialized, or **HTTP 503** if serving state is not yet ready. |
 | `/metrics` | `GET` | Exposes standard Prometheus metrics via `promhttp.Handler()`. |
 
+> [!NOTE]
+> **Open Design Discussion**: See [Zero-MPT Continuation & The "Map of Logs" API](../../docs/DESIGN_DISCUSSIONS.md#1-zero-mpt-continuation--the-map-of-logs-api) for active exploration on bypassing MPT locks during backward pagination, and [Bounded Chunk Visitation](../../docs/DESIGN_DISCUSSIONS.md#3-bounded-chunk-visitation-for-sparse-keys-p99-guardrail) for latency guardrails on sparse keys.
+
 ### 2.2 Multi-Section Plaintext Response Wire Format
+> [!NOTE]
+> **Open Design Discussion**: See [Chunk-Aligned Paging](../../docs/DESIGN_DISCUSSIONS.md#2-chunk-aligned-paging-eliminating-dynamic-merkle-hashing) for research on aligning response boundaries to chunks to eliminate on-the-fly leaf hashing on the read path.
+
 Responses use the C2SP multi-section plaintext format (`format.go`), where sections are delimited by blank lines (`\n\n`) and framed by section headers `— <section-name>[ <args>] —`:
 
 ```text

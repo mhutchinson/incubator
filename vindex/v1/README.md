@@ -119,6 +119,7 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 
 ### Core Architecture & Ecosystems
 - [**System Architecture**](./docs/ARCHITECTURE.md): Primary pipeline flow, subsystem map, system-wide invariants, Zero-WAL crash consistency, operational sizing, and retired alternatives.
+- [**Design Discussions & Open Frontiers**](./docs/DESIGN_DISCUSSIONS.md): Active research topics, zero-MPT backward pagination, chunk-aligned paging, and bounded chunk visitation for community collaboration.
 - [**Applications & Ecosystem Specifications**](./docs/APPLICATIONS.md): Universal Claim Subject Map model, canonicalization profiles, host hardware SIMD hashing, forward-compatible prefix tries, and ecosystem specifications (CT, MTC, Go SumDB, Sigstore, Sigsum).
 - [**Benchmarks & Empirical Evaluation**](./docs/BENCHMARKS.md): Empirical telemetry on 24-core NVMe hardware, full Go SumDB ingestion (up to 295k leaves/sec sustained / 258k leaves/sec overall), read latency distributions, MapFn FFI profiling (< 1% CPU), and capacity planning guidelines.
 
