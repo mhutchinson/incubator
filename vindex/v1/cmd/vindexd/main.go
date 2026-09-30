@@ -67,6 +67,7 @@ var (
 	wasmPath           = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary (required).")
 	listenAddr         = flag.String("listen_addr", ":8080", "HTTP Read Server address.")
 	metricsAddr        = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
+	pathPrefix         = flag.String("path_prefix", "", "Base URL path prefix to host vindex endpoints under (e.g. '/indices/sumdb' or 'indices/sumdb'). Defaults to empty (root).")
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval         = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
@@ -343,10 +344,9 @@ func runPublisher(ctx context.Context) error {
 	// 6. Start Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
 	readSrv.SetEnableUI(*enableUI)
+	readSrv.SetPathPrefix(*pathPrefix)
 	readMux := http.NewServeMux()
-	readSrv.RegisterRoutes(readMux)
-	readMux.Handle("/tile/", http.FileServer(http.Dir(*outputLogDir)))
-	readMux.Handle("/outputlog/", http.StripPrefix("/outputlog/", http.FileServer(http.Dir(*outputLogDir))))
+	readSrv.RegisterRoutesWithOutputLog(readMux, *outputLogDir)
 	httpServer := &http.Server{
 		Addr:    *listenAddr,
 		Handler: readMux,
@@ -468,6 +468,7 @@ func runAuditor(ctx context.Context) error {
 		FailClosed:      *failClosed,
 		ListenAddr:      *listenAddr,
 		MetricsAddr:     *metricsAddr,
+		PathPrefix:      *pathPrefix,
 		PollInterval:    *pollInterval,
 		CommitBatchSize: *chunkSize,
 	}

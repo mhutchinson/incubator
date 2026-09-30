@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -433,5 +435,120 @@ func TestReadServer_UI(t *testing.T) {
 	muxDisabled.ServeHTTP(w3, req3)
 	if w3.Code != http.StatusNotFound {
 		t.Fatalf("GET / with disabled UI status = %d, want 404", w3.Code)
+	}
+}
+
+func TestCleanPathPrefix(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"/", ""},
+		{"///", ""},
+		{"  ", ""},
+		{"indices/sumdb", "/indices/sumdb"},
+		{"/indices/sumdb", "/indices/sumdb"},
+		{"/indices/sumdb/", "/indices/sumdb"},
+		{"///indices/sumdb///", "/indices/sumdb"},
+	}
+
+	for _, tc := range tests {
+		got := CleanPathPrefix(tc.input)
+		if got != tc.want {
+			t.Errorf("CleanPathPrefix(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestReadServer_PathPrefix(t *testing.T) {
+	srv, _, _, pub := setupTestServer(t, 256)
+	srv.SetPathPrefix("/indices/sumdb")
+
+	rawInCP := []byte("example.com/input\n500\n" + strings.Repeat("A", 44) + "\n")
+	_, err := pub.Publish(context.Background(), rawInCP, 500, nil)
+	if err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// 1. Root-level redirect /indices/sumdb -> /indices/sumdb/
+	reqRedirect := httptest.NewRequest(http.MethodGet, "/indices/sumdb", nil)
+	recRedirect := httptest.NewRecorder()
+	mux.ServeHTTP(recRedirect, reqRedirect)
+	if recRedirect.Code != http.StatusMovedPermanently {
+		t.Fatalf("GET /indices/sumdb = %d, want 301", recRedirect.Code)
+	}
+	if loc := recRedirect.Header().Get("Location"); loc != "/indices/sumdb/" {
+		t.Fatalf("GET /indices/sumdb Location = %q, want /indices/sumdb/", loc)
+	}
+
+	// 2. Prefixed Checkpoint: /indices/sumdb/vindex/v1/checkpoint
+	reqCP := httptest.NewRequest(http.MethodGet, "/indices/sumdb/vindex/v1/checkpoint", nil)
+	recCP := httptest.NewRecorder()
+	mux.ServeHTTP(recCP, reqCP)
+	if recCP.Code != http.StatusOK {
+		t.Fatalf("GET /indices/sumdb/vindex/v1/checkpoint = %d, want 200", recCP.Code)
+	}
+
+	// 3. Unprefixed Checkpoint should 404
+	reqOldCP := httptest.NewRequest(http.MethodGet, "/vindex/v1/checkpoint", nil)
+	recOldCP := httptest.NewRecorder()
+	mux.ServeHTTP(recOldCP, reqOldCP)
+	if recOldCP.Code != http.StatusNotFound {
+		t.Fatalf("GET /vindex/v1/checkpoint without prefix = %d, want 404", recOldCP.Code)
+	}
+
+	// 4. Prefixed UI: /indices/sumdb/
+	reqUI := httptest.NewRequest(http.MethodGet, "/indices/sumdb/", nil)
+	recUI := httptest.NewRecorder()
+	mux.ServeHTTP(recUI, reqUI)
+	if recUI.Code != http.StatusOK {
+		t.Fatalf("GET /indices/sumdb/ = %d, want 200", recUI.Code)
+	}
+
+	// 5. Healthz at both root and under prefix
+	reqRootHealth := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recRootHealth := httptest.NewRecorder()
+	mux.ServeHTTP(recRootHealth, reqRootHealth)
+	if recRootHealth.Code != http.StatusOK {
+		t.Fatalf("GET /healthz at root = %d, want 200", recRootHealth.Code)
+	}
+
+	reqPrefixedHealth := httptest.NewRequest(http.MethodGet, "/indices/sumdb/healthz", nil)
+	recPrefixedHealth := httptest.NewRecorder()
+	mux.ServeHTTP(recPrefixedHealth, reqPrefixedHealth)
+	if recPrefixedHealth.Code != http.StatusOK {
+		t.Fatalf("GET /indices/sumdb/healthz = %d, want 200", recPrefixedHealth.Code)
+	}
+}
+
+func TestReadServer_RegisterRoutesWithOutputLog(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t, 256)
+	srv.SetPathPrefix("/myindex")
+
+	tmpDir := t.TempDir()
+	tilePath := filepath.Join(tmpDir, "tile", "test.txt")
+	if err := os.MkdirAll(filepath.Dir(tilePath), 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(tilePath, []byte("tile content"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutesWithOutputLog(mux, tmpDir)
+
+	// Fetch tile under prefix: /myindex/tile/test.txt
+	req := httptest.NewRequest(http.MethodGet, "/myindex/tile/test.txt", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /myindex/tile/test.txt = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "tile content" {
+		t.Fatalf("unexpected body: %q", rec.Body.String())
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +43,18 @@ const (
 // It returns nil if healthy, or an error detailing the health failure.
 type HealthChecker func() error
 
+// CleanPathPrefix cleans and normalizes a URL path prefix.
+// It ensures a leading slash and strips any trailing slashes.
+// An empty or "/" prefix is returned as "".
+func CleanPathPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return ""
+	}
+	return "/" + prefix
+}
+
 // ReadServer serves HTTP lookup and checkpoint queries.
 type ReadServer struct {
 	store         kvstore.IndexStore
@@ -49,6 +62,7 @@ type ReadServer struct {
 	publisher     *tree.OutputPublisher
 	chunkSize     uint64
 	enableUI      bool
+	pathPrefix    string
 	healthMu      sync.RWMutex
 	healthChecker HealthChecker
 	readyChecker  HealthChecker
@@ -84,6 +98,16 @@ func (s *ReadServer) SetEnableUI(enable bool) {
 	s.enableUI = enable
 }
 
+// SetPathPrefix configures the URL path prefix under which endpoints are served.
+func (s *ReadServer) SetPathPrefix(prefix string) {
+	s.pathPrefix = CleanPathPrefix(prefix)
+}
+
+// PathPrefix returns the normalized path prefix.
+func (s *ReadServer) PathPrefix() string {
+	return s.pathPrefix
+}
+
 // Publisher returns the underlying OutputPublisher.
 func (s *ReadServer) Publisher() *tree.OutputPublisher {
 	return s.publisher
@@ -105,7 +129,41 @@ func (s *ReadServer) SetReadyChecker(rc HealthChecker) {
 }
 
 // RegisterRoutes registers HTTP endpoints on the provided ServeMux.
+// If s.PathPrefix() is non-empty, routes are mounted under the prefix.
+// In addition, /healthz and /readyz are also registered at the root level for orchestrators.
 func (s *ReadServer) RegisterRoutes(mux *http.ServeMux) {
+	s.RegisterRoutesWithOutputLog(mux, "")
+}
+
+// RegisterRoutesWithOutputLog registers HTTP endpoints and optionally mounts output log tile and file servers.
+// If outputLogDir is non-empty, /tile/ and /outputlog/ are served from that directory.
+// If s.PathPrefix() is non-empty, all routes (including tile servers) are mounted under the prefix.
+func (s *ReadServer) RegisterRoutesWithOutputLog(mux *http.ServeMux, outputLogDir string) {
+	prefix := s.pathPrefix
+	if prefix == "" {
+		s.registerEndpoints(mux, outputLogDir)
+		return
+	}
+
+	// Internal sub-mux with clean un-prefixed routes
+	subMux := http.NewServeMux()
+	s.registerEndpoints(subMux, outputLogDir)
+
+	// Mount under prefix (strip prefix so handlers match root paths)
+	mux.Handle(prefix+"/", http.StripPrefix(prefix, subMux))
+
+	// Redirect /prefix -> /prefix/
+	mux.HandleFunc(prefix, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, prefix+"/", http.StatusMovedPermanently)
+	})
+
+	// Also expose health/readiness probes at the root level for container orchestrators
+	mux.HandleFunc("/healthz", s.HandleHealthz)
+	mux.HandleFunc("/readyz", s.HandleReadyz)
+	mux.HandleFunc("/syncz", s.HandleReadyz)
+}
+
+func (s *ReadServer) registerEndpoints(mux *http.ServeMux, outputLogDir string) {
 	if s.enableUI {
 		mux.HandleFunc("/", s.HandleUI)
 		mux.HandleFunc("/index.html", s.HandleUI)
@@ -120,6 +178,11 @@ func (s *ReadServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/vindex/v1/lookup/", s.HandleLookup)
 	mux.HandleFunc("/vindex/lookup/", s.HandleLookup)
 	mux.HandleFunc("/lookup/", s.HandleLookup)
+
+	if outputLogDir != "" {
+		mux.Handle("/tile/", http.FileServer(http.Dir(outputLogDir)))
+		mux.Handle("/outputlog/", http.StripPrefix("/outputlog/", http.FileServer(http.Dir(outputLogDir))))
+	}
 
 	mux.HandleFunc("/healthz", s.HandleHealthz)
 	mux.HandleFunc("/readyz", s.HandleReadyz)

@@ -545,6 +545,20 @@
                 document.getElementById('detail-overlay').classList.add('hidden');
             }
         };
+
+        window.addEventListener('DOMContentLoaded', () => {
+            let basePath = window.location.pathname;
+            if (basePath.endsWith('/index.html')) {
+                basePath = basePath.slice(0, -'/index.html'.length);
+            }
+            if (!basePath.endsWith('/')) {
+                basePath += '/';
+            }
+            const inputEl = document.getElementById('config-vindex-url');
+            if (inputEl) {
+                inputEl.value = basePath + 'vindex/v1/lookup/';
+            }
+        });
     </script>
 </body>
 </html>

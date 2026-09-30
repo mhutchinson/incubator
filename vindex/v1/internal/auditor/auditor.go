@@ -151,6 +151,7 @@ type Config struct {
 	FailClosed      bool
 	ListenAddr      string
 	MetricsAddr     string
+	PathPrefix      string
 	PollInterval    time.Duration
 	CommitBatchSize uint64
 
@@ -462,6 +463,7 @@ func New(cfg Config) (*Verifier, error) {
 	if cfg.ServeMirror {
 		v.publisher = tree.NewOutputPublisher(v.db, v.mptMgr, nil, nil)
 		v.readServer = server.NewReadServer(v.db, v.mptMgr, v.publisher, v.db.ChunkSize())
+		v.readServer.SetPathPrefix(cfg.PathPrefix)
 		v.readServer.SetReadyChecker(v.HealthCheck)
 		v.readServer.SetHealthChecker(func() error {
 			if v.cfg.FailClosed {

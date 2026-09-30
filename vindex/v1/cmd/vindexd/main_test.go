@@ -33,6 +33,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/server"
 	"github.com/transparency-dev/tessera"
 	"github.com/transparency-dev/tessera/storage/posix"
 	"golang.org/x/mod/sumdb/note"
@@ -471,5 +472,19 @@ func TestVindexd_CleanDirs(t *testing.T) {
 		if info, err := os.Stat(d); err != nil || !info.IsDir() {
 			t.Errorf("expected %q to exist as an empty directory after cleanDirectories", d)
 		}
+	}
+}
+
+func TestVindexd_PathPrefixFlag(t *testing.T) {
+	origPrefix := *pathPrefix
+	t.Cleanup(func() {
+		*pathPrefix = origPrefix
+	})
+
+	*pathPrefix = "/custom/prefix/"
+	srv := server.NewReadServer(nil, nil, nil, 256)
+	srv.SetPathPrefix(*pathPrefix)
+	if srv.PathPrefix() != "/custom/prefix" {
+		t.Fatalf("expected /custom/prefix, got %q", srv.PathPrefix())
 	}
 }
