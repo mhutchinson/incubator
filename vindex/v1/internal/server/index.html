@@ -157,16 +157,19 @@
             return entries;
         }
 
-        // Format tile index into /x/y/z path
+        // Format tile index into /x/y/z path according to C2SP tlog-tiles spec
         function formatTileIndex(n) {
-            const path = [];
-            let s = n.toString();
-            while (s.length > 3) {
-                path.unshift('x' + s.slice(-3));
-                s = s.slice(0, -3);
+            const s = n.toString();
+            const chunks = [];
+            for (let i = s.length; i > 0; i -= 3) {
+                let chunk = s.substring(Math.max(0, i - 3), i);
+                while (chunk.length < 3) chunk = '0' + chunk;
+                chunks.unshift(chunk);
             }
-            path.unshift('x' + s.padStart(3, '0'));
-            return path.join('/');
+            for (let i = 0; i < chunks.length - 1; i++) {
+                chunks[i] = 'x' + chunks[i];
+            }
+            return chunks.join('/');
         }
 
         // Compute SHA-256 hex string from string or raw bytes
@@ -554,9 +557,13 @@
             if (!basePath.endsWith('/')) {
                 basePath += '/';
             }
-            const inputEl = document.getElementById('config-vindex-url');
-            if (inputEl) {
-                inputEl.value = basePath + 'vindex/v1/lookup/';
+            const vindexInput = document.getElementById('config-vindex-url');
+            if (vindexInput) {
+                vindexInput.value = basePath + 'vindex/v1/lookup/';
+            }
+            const inlogInput = document.getElementById('config-inlog-url');
+            if (inlogInput) {
+                inlogInput.value = basePath + 'inputlog';
             }
         });
     </script>
