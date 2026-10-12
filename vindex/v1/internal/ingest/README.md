@@ -20,8 +20,8 @@ If ingestion is naive, four severe operational failure modes emerge:
   - Ingest upstream logs in native 256-leaf bundles matching the underlying tile structure.
   - Maximize upstream download throughput with adaptive concurrency while respecting HTTP 429 rate limits.
   - Parallelize CPU-heavy parsing across worker pools while emitting strictly contiguous leaf sequences.
-  - Maintain a bounded local staging buffer and crash-recovery cache (`ManagedTileCache`), enabling restarts and Zero-WAL recovery with zero network egress (not an immutable log of record).
-  - Bound local disk growth by having `TileReaper` actively prune cached tiles older than `SafeWatermark`.
+  - Maintain a bounded local staging buffer and crash-recovery cache, enabling restarts and Zero-WAL recovery with zero network egress (not an immutable log of record).
+  - Bound local disk growth by having the background tile reaper actively prune cached tiles older than the safe durability watermark.
 - **Non-Goals**:
   - **No Upstream Checkpoint Creation**: The ingestion engine does not publish checkpoints or modify upstream log state; it is strictly a read-only consumer.
   - **No In-Guest Storage Writes**: The WASM sandbox is forbidden from performing disk or network I/O; guest modules solely transform leaf bytes into preimages.
@@ -42,12 +42,12 @@ If ingestion is naive, four severe operational failure modes emerge:
 ### 2.1 The Assembly Line Sorter Architecture
 The ingestion subsystem operates as an assembly line pipeline:
 
-1. **`TileFetcher`**: Queries the upstream log's `/checkpoint` endpoint. Downloads data tiles (`/tile/data/x/y.p/z`) and corresponding Level-0 tree tiles.
-2. **`ManagedTileCache`**: Writes downloaded, Merkle-authenticated tiles to the local filesystem. This cache serves as a bounded local staging buffer and crash-recovery cache (not an immutable log of record), ensuring subsequent crash recovery can replay history without network egress.
-3. **WASM Worker Pool (`WasmMapper`)**: A configurable pool of parallel Wazero sandboxes (scaling across available host CPU capacity) running the compiled `.wasm` plugin. Each worker takes an **entire crate (256-leaf bundle)** and maps all 256 leaves in a single `map_bundle` invocation via the in-guest SDK (`mapfn/sdk`).
-4. **Host Hardware SIMD Hashing**: The Go host intercepts raw preimages returned by guest sandboxes and computes `KeyHash = sha256.Sum256(preimage)` using hardware vector instructions (Single Instruction, Multiple Data / SIMD, such as x86 SHA-NI or ARMv8 Crypto extensions).
-5. **Resequencer (Min-Heap)**: Receives completed batches out of order from workers and buffers them in a priority queue. Emits strictly ascending batches (`BundleIdx = StartLeafIdx / 256`) onto `chan *MappedBatch`.
-6. **`TileReaper`**: Periodically receives the authorized `SafeWatermark` from the Coordinator and actively prunes cached tiles older than `SafeWatermark` (where `(tileIndex + 1) * 256 <= SafeWatermark`) to bound local disk usage.
+1. **Tile Fetcher**: Queries the upstream log's `/checkpoint` endpoint. Downloads data tiles (`/tile/data/x/y.p/z`) and corresponding Level-0 tree tiles.
+2. **Local Tile Cache**: Writes downloaded, Merkle-authenticated tiles to the local filesystem. This cache serves as a bounded local staging buffer and crash-recovery cache (not an immutable log of record), ensuring subsequent crash recovery can replay history without network egress.
+3. **WASM Worker Pool**: A configurable pool of parallel Wazero sandboxes (scaling across available host CPU capacity) running the compiled `.wasm` plugin. Each worker takes an **entire crate (256-leaf bundle)** and maps all 256 leaves in a single `map_bundle` invocation via the in-guest SDK (`mapfn/sdk`).
+4. **Host Hardware SIMD Hashing**: The Go host intercepts raw preimages returned by guest sandboxes and computes SHA-256 key hashes (`SHA-256(preimage)`) using hardware vector instructions (Single Instruction, Multiple Data / SIMD, such as x86 SHA-NI or ARMv8 Crypto extensions).
+5. **Resequencer (Min-Heap)**: Receives completed batches out of order from workers and buffers them in a priority queue. Emits strictly ascending 256-leaf batches to the downstream storage channel.
+6. **Tile Reaper**: Periodically receives the authorized safe durability watermark from the Coordinator and actively prunes cached tiles fully covered by that watermark (`(tileIndex + 1) * 256 <= safeWatermark`) to bound local disk usage.
 
 ### 2.2 In-Situ Invariants & Performance Optimizations
 
@@ -57,19 +57,12 @@ The ingestion subsystem operates as an assembly line pipeline:
   - *Consequence ("Or Else")*: If an unauthenticated checkpoint were accepted, an adversary could feed forged leaves, causing the indexer to commit bogus state and permanently diverging from independent witnesses.
 
 - **[Correctness Invariant] Strictly Monotonic Resequencing**:
-  - *Rule*: Batches pushed to downstream storage must strictly follow ascending leaf index order without gaps:
-    ```text
-    batch[i+1].StartLeafIdx == batch[i].EndLeafIdx
-    ```
+  - *Rule*: Batches pushed to downstream storage must strictly follow ascending leaf index order without gaps, where each emitted batch's starting leaf index equals the preceding batch's ending leaf index.
   - *Rationale*: Inverted chunks maintain cumulative RFC 6962 compact ranges. Compact ranges require strictly increasing chronological leaves.
   - *Consequence ("Or Else")*: Committing out-of-order batches breaks the Merkle compact range tree structure, computing invalid mini-log roots that fail verifier inclusion proofs.
 
-- **[Correctness Invariant] TileReaper Authority & Pruning Bounds**:
-  - *Rule*: `TileReaper` must strictly prune only those tile files satisfying:
-    ```text
-    (tileIndex + 1) * 256 <= SafeWatermark
-    ```
-    where `SafeWatermark` is authoritative input dictated by the Coordinator.
+- **[Correctness Invariant] Tile Reaper Authority & Pruning Bounds**:
+  - *Rule*: The background tile reaper must strictly prune only those tile files whose highest leaf index is at or below the safe durability watermark (`(tileIndex + 1) * 256 <= safeWatermark`), where the safe durability watermark is authoritative input dictated by the Coordinator.
   - *Rationale*: Preserves un-synced historical tiles on disk so that Zero-WAL crash recovery can fast-forward lagging MPT state without network requests.
   - *Consequence ("Or Else")*: Pruning ahead of the durable MPT watermark causes dirty crash recovery to fail, forcing the daemon to re-download historical tiles over the network and violating the sub-500ms time-to-first-serve SLO.
 
@@ -97,14 +90,14 @@ The ingestion subsystem manages upstream data retrieval, sandboxed mapping, and 
 - **Outputs**:
   - Stream of mapped key-to-occurrence index batches ordered monotonically by log sequence.
 - **Pruning Contract**:
-  - Local tile cache retains tiles strictly within the active lag window; tiles older than `SafeWatermark` are deleted by the background reaper.
+  - Local tile cache retains tiles strictly within the active lag window; tiles older than the safe durability watermark are deleted by the background reaper.
 
 ---
 
 ## 3. Alternatives Considered (or Tried)
 
 ### 3.1 Per-Leaf Mapping (`map_leaf`) vs. Bundled Mapping (`map_bundle`)
-- **Proposed**: Invoking `map_leaf` individually for every leaf entry.
+- **Proposed**: Invoking a per-leaf export individually for every leaf entry.
 - **Empirical Rejection**: Generated 768 FFI calls per 256-leaf tile (memory allocation, leaf mapping, and arena reset transitions x 256), consuming ~23% of total host CPU cycles purely in boundary crossing overhead.
 - **Chosen Design**: Bundled execution (`map_bundle`) passes all 256 leaves per invocation, slashing boundary overhead by 99.6%.
 
@@ -114,9 +107,9 @@ The ingestion subsystem manages upstream data retrieval, sandboxed mapping, and 
 - **Chosen Design**: Guest emits raw string preimages; Go host hashes using native CPU hardware instructions (SHA-NI / ARMv8 Crypto).
 
 ### 3.3 Exporting Host Hardware Hashing into WASM vs. Pure Preimage Return
-- **Proposed**: Exposing an imported host function (`host.sha256(ptr, len)`) into the WebAssembly sandbox so guest modules could invoke host hardware crypto while still returning pre-computed hashes.
+- **Proposed**: Exposing an imported host hashing function into the WebAssembly sandbox so guest modules could invoke host hardware crypto while still returning pre-computed hashes.
 - **Theoretical Rejection (Ergonomics & Architectural Purity)**:
   - Ruled out without benchmarking due to excessive SDK complexity and architectural impurity.
-  - Binding against bespoke host runtime imports destroys the clean abstraction of `MapFn` as a pure, portable function (`func(leaf []byte, emit func(key []byte))`). Guest SDKs in other languages (Rust, TinyGo, Zig) would require specialized bindings and FFI boilerplate.
+  - Binding against bespoke host runtime imports destroys the clean abstraction of a mapping function as a pure, portable callback from raw leaf bytes to emitted key preimages. Guest SDKs in other languages (Rust, TinyGo, Zig) would require specialized bindings and FFI boilerplate.
   - Calling a host import for every hash introduces bidirectional FFI context switching overhead.
 - **Chosen Design**: Keep the guest contract completely pure and self-contained: the guest simply emits raw canonical string preimages, and the Go host performs bulk SIMD hashing natively.

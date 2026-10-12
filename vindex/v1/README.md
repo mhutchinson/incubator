@@ -86,7 +86,7 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 - **Inverted Chunk (`^chunkNum`)**: An LSM-tree partition storing up to 65,536 occurrence indices under a bitwise-inverted key number, placing the active append chunk lexicographically first.
 - **Sparse Merkle Patricia Trie (MPT)**: An authenticated binary trie mapping 32-byte key hashes to 32-byte mini-log roots, supporting logarithmic inclusion and non-inclusion proofs.
 - **Witnessed Output Log**: A secondary append-only Merkle log (`tlog-tiles`) that commits to the cryptographic state (`MapRoot` + Input Log checkpoint) and is cosigned by an independent witness network.
-- **Independent Auditor / Mirror**: A standalone daemon (`vindex-audit`) that re-indexes both logs from leaf 0, asserts root equality, halts forward sync and freezes database files on disk upon mismatches, raises critical alerts, and by default keeps serving lookups pinned to the last verified checkpoint (`Serving_CP`) with an opt-in fail-closed mode (`--fail_closed=true`).
+- **Independent Auditor / Mirror**: A standalone daemon (`vindex-auditor`) that re-indexes both logs from leaf 0, asserts root equality, halts forward sync and freezes database files on disk upon mismatches, raises critical alerts, and by default keeps serving lookups pinned to the last verified checkpoint (`Serving_CP`) with an opt-in fail-closed mode (`--fail_closed=true`).
 
 ---
 
@@ -106,8 +106,8 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 - Read [Read Serving & C2SP Query Protocol](./internal/server/README.md) for HTTP endpoints, multi-section response formats, and the inductive backward verification protocol.
 
 ### Auditor & Mirror Operator
-- Read [Independent Log Auditor & Verified Mirror](./internal/auditor/README.md) for the continuous audit loop (`AuditOnce`), root mismatch alerting, state-preserving halts, pinned last-known-good serving, and verified mirror serving (`--serve_mirror`).
-- Review operational commands in `cmd/vindex-audit/`.
+- Read [Independent Log Auditor & Verified Mirror](./internal/auditor/README.md) for the continuous audit loop, root mismatch alerting, state-preserving halts, pinned last-known-good serving, and verified mirror serving (`--serve_mirror`).
+- Review operational commands in `cmd/vindex-auditor/`.
 
 ### Test & Performance Engineer
 - Read [Benchmarks & Empirical Evaluation](./docs/BENCHMARKS.md) for full-scale Go SumDB and Certificate Transparency benchmarks, FFI overhead profiles, and capacity sizing matrices.
@@ -125,12 +125,12 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 
 ### Client & Subsystem Specifications
 - [**Client SDK & Query Proof Verification**](./client/README.md): Public, stateless Go client library, C2SP response parsing, 5-step cryptographic verification sequence, and backward pagination chains.
-- [**Ingestion Pipeline & Tile Cache**](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, WASM worker pool, host SIMD hashing, monotonic resequencing, and `TileReaper` pruning.
+- [**Ingestion Pipeline & Tile Cache**](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, WASM worker pool, host SIMD hashing, monotonic resequencing, and safe cache pruning.
 - [**WASM Guest SDK & Plugin Interface**](./mapfn/README.md): Guest SDK runtime harness, pack-and-wipe linear memory slabs, high-level developer experience, bytecode immutability, and `vindex-wasm` verification tooling.
 - [**Inverted Chunk Storage Engine**](./internal/kvstore/README.md): Embedded Pebble LSM engine, inverted chunk keys (`'c' + KeyHash + ^chunkNum`), 33-byte prefix Bloom filters, delimitless 16-bit offset serialization, and the `pebble-tests` empirical suite.
-- [**Authenticated State Commitment (MPT & Publisher)**](./internal/tree/README.md): Binary Sparse Merkle Patricia Trie in `mmap`, lock-free root prediction (`mpt.Predict`), 3-step atomic commitment dance, and split-locking concurrency (< 5ms critical section).
+- [**Authenticated State Commitment (MPT & Publisher)**](./internal/tree/README.md): Binary Sparse Merkle Patricia Trie in `mmap`, non-blocking root prediction, 3-step atomic commitment dance, and split-locking concurrency (< 5ms critical section).
 - [**Read Serving & C2SP Query Protocol**](./internal/server/README.md): C2SP HTTP REST endpoints, multi-section plaintext wire format, inductive backward verification protocol, and reader snapshot isolation.
-- [**Coordinator & Lifecycle Engine**](./internal/coordinator/README.md): Batch loop orchestration (`SyncOnce`), checkpoint progression chain, moving-goalpost prevention (freezing target sync checkpoints), and 3-phase Zero-WAL crash recovery.
+- [**Coordinator & Lifecycle Engine**](./internal/coordinator/README.md): Batch loop orchestration, checkpoint progression chain, moving-goalpost prevention (freezing target sync checkpoints), and 3-phase Zero-WAL crash recovery.
 - [**Independent Log Auditor & Verified Mirror**](./internal/auditor/README.md): Full-log audit verification from leaf 0, root mismatch alerting, state-preserving forensic halts, pinned last-known-good checkpoint serving (`Serving_CP`), opt-in fail-closed revocation (`--fail_closed=true`), and verified mirror serving.
 
 ### Tooling & Verification

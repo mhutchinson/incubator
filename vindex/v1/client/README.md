@@ -44,67 +44,63 @@ The client SDK functions like a bank customer verifying an itemized transaction 
 
 The client library is completely decoupled from the indexing and audit subsystems:
 
-| Component | Responsibility | External Dependencies |
+| Responsibility | Scope | External Dependencies |
 | :--- | :--- | :--- |
-| `client.Client` | HTTP communication with VIndex nodes (`GET /vindex/v1/lookup/{keyhash}`, `GET /vindex/v1/checkpoint`). | Go standard library (`net/http`, `context`). |
-| `client.Parser` | Parses C2SP multi-section plaintext wire format into structured proof objects. | Go standard library (`bufio`, `bytes`, `strconv`). |
-| `client.Verifier` | Executes pure cryptographic assertions on parsed proof structures. | Standard `crypto/sha256`, `github.com/transparency-dev/formats/log`. |
+| **HTTP Transport & Wire Framing** | Communicates with VIndex nodes (`GET /vindex/v1/lookup/{keyhash}`, `GET /vindex/v1/checkpoint`) and parses the multi-section plaintext wire format into structured proof sections. | Go standard library (`net/http`, `bufio`, `bytes`, `strconv`). |
+| **Stateless Proof Verification** | Executes pure cryptographic assertions over parsed checkpoint notes, Output Log inclusion proofs, Sparse Merkle Tree paths, and RFC 6962 compact ranges. | Standard `crypto/sha256`, `github.com/transparency-dev/formats/log`. |
 
 ### 2.2 The 5-Step Query Verification Sequence
 
 > [!NOTE]
-> **Open Design Discussion**: See [Zero-MPT Continuation & The "Map of Logs" API](../docs/DESIGN_DISCUSSIONS.md#1-zero-mpt-continuation--the-map-of-logs-api) for research on eliminating MPT proof verification on backward continuation requests (`before != nil`), verifying history purely through compact range continuity against previously authenticated mini-log roots.
+> **Open Design Discussion**: See [Zero-MPT Continuation & The "Map of Logs" API](../docs/DESIGN_DISCUSSIONS.md#1-zero-mpt-continuation--the-map-of-logs-api) for research on eliminating MPT proof verification on backward continuation requests, verifying history purely through compact range continuity against previously authenticated mini-log roots.
 
 For every lookup request, the client SDK executes the following deterministic 5-step verification sequence:
 
 | Step | Phase | Operations | Mathematical Assertion |
 | :--- | :--- | :--- | :--- |
 | **1** | **Checkpoint Authentication** | Verifies note format and cryptographic signatures on the Output Log checkpoint. | Enforces origin verification and witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). |
-| **2** | **Output Log Merkle Proof** | Verifies the Merkle inclusion proof committing `MapRoot` into the Output Log. | `proof.VerifyInclusion(OutputTreeSize, LeafIndex, MapRootCommitment) == OutputTreeRoot`. |
-| **3** | **MPT Proof Verification** | Evaluates the bitwise Sparse Merkle Tree path traversal against `MapRoot`. | **Inclusion**: Proves `SubRoot` exists at `KeyHash`.<br>**Non-Inclusion**: Proves path terminates in empty node or mismatched prefix. |
-| **4** | **Mini-Log Compact Range** | Reconstructs RFC 6962 compact range from returned leaf indices and prefix compact range. | `CompactRange.GetRootHash() == SubRoot`. |
-| **5** | **Monotonic History Check** | When evaluating consecutive queries on key K where S_new >= S_old: | `I_new[:len(I_old)] == I_old` (historical indices cannot mutate or disappear). |
+| **2** | **Output Log Merkle Proof** | Verifies the Merkle inclusion proof committing `MapRoot` into the Output Log. | Recomputes the Output Log leaf hash from the committed `MapRoot` and signed Input Log checkpoint, asserting inclusion under the authenticated Output Log root. |
+| **3** | **MPT Proof Verification** | Evaluates the bitwise Sparse Merkle Tree path traversal against `MapRoot`. | **Inclusion**: Proves the mini-log `SubRoot` exists at `KeyHash`.<br>**Non-Inclusion**: Proves the path terminates in an empty node or a leaf with a different key hash. |
+| **4** | **Mini-Log Compact Range** | Reconstructs the RFC 6962 compact range from returned leaf indices and any historical prefix compact range. | Reconstructed compact range root equals the authenticated MPT `SubRoot`. |
+| **5** | **Monotonic History Check** | When evaluating consecutive queries on the same key across non-decreasing checkpoint sizes: | Newly returned occurrence history contains the previously verified occurrences as an exact prefix (historical indices cannot mutate or disappear). |
 
 #### Step Details:
-1. **Checkpoint Authentication**: Fetches and parses the checkpoint note. Asserts that the origin string matches expectations and enforces witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note fails to satisfy the witness quorum or origin requirements defined by the policy, it is rejected immediately (`ErrUntrustedCheckpoint`).
-2. **Output Log Merkle Inclusion**: Parses the inclusion proof for the Output Log leaf containing the state commitment. Recomputes the audit path and asserts equality with the authenticated Output Log root.
+1. **Checkpoint Authentication**: Fetches and parses the checkpoint note. Asserts that the origin string matches expectations and enforces witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note fails to satisfy the witness quorum or origin requirements defined by the policy, it is rejected immediately.
+2. **Output Log Merkle Inclusion**: Reconstructs the canonical Output Log leaf bytes (`"<64-char-lowercase-hex-mapRoot>\n<right-newline-trimmed-rawInputLogCP>\n"`), hashes the leaf using RFC 6962 leaf domain separation (`0x00`), and verifies the Merkle inclusion proof against the authenticated Output Log root.
 3. **Sparse Merkle Tree Verification**: Evaluates the 256-bit path for the 32-byte key hash:
    - For an **inclusion proof**, asserts that hashing up the provided sibling nodes reproduces the committed `MapRoot`, proving that the returned `SubRoot` is authentically bound to the key.
-   - For a **non-inclusion proof**, asserts that the trie path terminates at a nil leaf or a conflicting prefix node, mathematically proving that no records exist for the key hash at this checkpoint.
+   - For a **non-inclusion proof**, asserts that the trie path terminates at an empty branch or a conflicting leaf node, mathematically proving that no records exist for the key hash at this checkpoint.
 4. **Mini-Log Compact Range Reconstruction**: Reconstructs the mini-log root using RFC 6962 tree hashing:
-   - Mini-log leaf hashing: each absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00.
-   - The client uses `compact.RangeFactory` (or `Range.Append`) to incrementally accumulate leaf hashes over the returned `IndexValue` occurrence indices.
-   - If paginating, it initializes the range from the `prefix-compact-range-v1` compact hashes committing to all preceding historical occurrences (`prefixCoveredSize`), then appends the page's indices.
+   - Mini-log leaf hashing: each absolute occurrence index is encoded as an 8-byte big-endian unsigned integer and hashed with RFC 6962 leaf domain separator `0x00`.
+   - The verifier incrementally accumulates leaf hashes over the returned occurrence indices in strictly ascending order.
+   - If paginating, it seeds the compact range from the `prefix-compact-range-v1` hashes committing to all preceding historical occurrences, then appends the page's occurrence indices.
    - The resulting compact range root is asserted to match the authenticated MPT `SubRoot`.
-5. **Monotonic History Assertion**: If the client maintains historical query cache for key K, it asserts that subsequent queries at larger checkpoints contain the previous indices as an exact prefix.
+5. **Monotonic History Assertion**: If the caller maintains a historical query cache for a key, it asserts that subsequent queries at larger or equal checkpoints contain the previous indices as an exact prefix.
 
 ### 2.3 Backward Pagination Protocol
 
 When a key has more occurrence records than fit in a single response (or when paginating using `?before={cursor}`):
 1. **Initial Tip Query**: The client queries `GET /vindex/v1/lookup/{keyhash}` without a cursor.
    - Response contains the latest page of occurrence indices, the MPT proof against `MapRoot`, and an optional `prefix-compact-range-v1` section if older entries exist.
-   - If more historical occurrences exist, the response includes a `next_before` cursor argument on `indices-v1`.
+   - If more historical occurrences exist, the response includes a `next_before` cursor header parameter on `indices-v1`.
 2. **Backward Continuation Query**: The client queries `GET /vindex/v1/lookup/{keyhash}?before={cursor}`.
    - Response contains earlier occurrences and an updated `prefix-compact-range-v1` committing to records preceding this page.
 3. **Incremental Compact Range Accumulation**:
    - Rather than relying on a separate hash chain, verification uses incremental RFC 6962 compact range accumulation.
-   - The client constructs a compact range from `prefix-compact-range-v1` (covering `prefixCoveredSize`) via `compact.RangeFactory`, then appends the returned `IndexValue` indices (each encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00).
-   - For tip queries (`before == nil`), the accumulated compact range root is directly asserted against the authenticated MPT `SubRoot`.
-   - For backward pagination, continuity is verified inductively by ensuring each page's indices and prefix range strictly precede the next page.
+   - The verifier initializes a compact range from `prefix-compact-range-v1` (covering the declared prefix leaf count), then appends the returned occurrence indices (each encoded as an 8-byte big-endian index hashed with RFC 6962 leaf domain separator `0x00`).
+   - For initial tip queries (no `before` cursor), the accumulated compact range root is directly asserted against the authenticated MPT `SubRoot`.
+   - For backward pagination, continuity is verified inductively by ensuring each page's indices and prefix range reproduce the compact range commitment expected by the subsequent page, terminating only when the prefix leaf count reaches zero.
 4. **Integrity Guarantee**: Inductive compact range accumulation guarantees that historical pages cannot be altered, reordered, or truncated by the server across multiple HTTP requests.
 
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
 - **[Correctness Invariant] Client-Side Cryptographic Assertion**:
-  - *Rule*: The client SDK must never expose search results to calling applications without first executing all 5 cryptographic verification checks to completion.
+  - *Rule*: The client SDK must never expose search results to calling applications without first executing all cryptographic verification checks to completion.
   - *Rationale*: Server responses are untrusted input; treating an unverified response as authentic re-introduces the operator trust dependency that verifiable logs exist to eliminate.
   - *Consequence ("Or Else")*: A compromised server could return fraudulent search results or hide critical security revocations from applications without detection.
 
 - **[Correctness Invariant] Monotonic History Invariant**:
-  - *Rule*: For any series of queries on key hash K where checkpoint size increases (S_new >= S_old), the client must assert that the newly returned indices contain the previously verified indices as an identical prefix:
-    ```text
-    indices_new[:len(indices_old)] == indices_old
-    ```
+  - *Rule*: For any series of queries on the same key hash where the checkpoint size is non-decreasing, the newly verified occurrence list must contain the previously verified occurrence list as an identical prefix.
   - *Rationale*: Inverted indices are append-only; historical occurrences cannot be deleted or reordered.
   - *Consequence ("Or Else")*: An operator could selectively delete historical associations, concealing past malicious activities.
 
@@ -112,16 +108,16 @@ When a key has more occurrence records than fit in a single response (or when pa
   - *Mechanism*: Proof verification operations operate strictly over byte slices in linear memory with zero heap allocations for intermediate tree nodes.
   - *Impact*: Client verification completes in under 1.2 ms per query, enabling high-throughput client validation exceeding 800 queries/sec per client CPU core.
 
-### 2.5 Error Taxonomy & Failure Handling
+### 2.5 Failure Taxonomy & Client Handling
 
-| Error Code | Root Cause | Client Action |
+| Failure Category | Root Cause | Client Action |
 | :--- | :--- | :--- |
-| `ErrUntrustedCheckpoint` | Checkpoint note fails witness quorum or origin requirements of configured `tlog-policy`. | Reject response immediately; abort query. |
-| `ErrOutputInclusionFailed` | Output Log Merkle inclusion proof does not evaluate to the checkpoint root. | Security alert; abort query (possible server equivocation). |
-| `ErrMPTProofInvalid` | Sparse Merkle Tree bitwise path does not match the committed `MapRoot`. | Security alert; abort query (server attempted to forge trie state). |
-| `ErrSubRootMismatch` | Reconstructed compact range does not match the verified `SubRoot`. | Security alert; abort query (server altered or truncated occurrences). |
-| `ErrHistoryRegression` | Returned occurrences omit or mutate indices present in earlier queries. | Security alert; abort query (server executed an index rollback). |
-| `ErrServerDegraded` | Server returned HTTP 503 (mirror in fail-closed mode or syncing). | Retry with exponential backoff or query an alternative mirror. |
+| **Untrusted Checkpoint** | Checkpoint note fails origin verification or witness cosignature quorum under the configured `tlog-policy`. | Reject response immediately; abort query. |
+| **Output Log Inclusion Failure** | Output Log Merkle inclusion proof does not evaluate to the authenticated checkpoint root. | Security alert; abort query (possible server equivocation). |
+| **MPT Proof Mismatch** | Sparse Merkle Tree bitwise path does not evaluate to the committed `MapRoot`. | Security alert; abort query (server attempted to forge trie state). |
+| **Mini-Log Sub-Root Mismatch** | Reconstructed RFC 6962 compact range root does not match the verified `SubRoot` (or pagination continuity check fails). | Security alert; abort query (server altered, reordered, or truncated occurrences). |
+| **History Regression** | Returned occurrences omit or mutate indices observed in an earlier verified query. | Security alert; abort query (server executed an index rollback). |
+| **Upstream Server Degraded (`HTTP 503`)** | Server or verified mirror is still warming up or has halted serving in fail-closed mode. | Retry with backoff or failover to an alternative mirror. |
 
 ### 2.6 Client Contract & API Requirements
 

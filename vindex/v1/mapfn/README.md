@@ -35,7 +35,7 @@ Relying on in-process native Go plugins or shared libraries introduces three sev
 
 ### 1.4 Requirements, Constraints & Known Pain Points
 - **Host Runtime**: Pure Go WebAssembly runtime via `github.com/tetratelabs/wazero` executing under the `wasip1` specification with zero CGO dependencies.
-- **WASM Memory Constraints**: Guest modules execute within a bounded linear memory space (default 16 MB, scalable via configuration).
+- **WASM Memory Constraints**: Guest modules execute within a bounded linear memory space (tens of megabytes by default, scalable via configuration), with pre-allocated multi-megabyte static input and output slabs.
 - **Known Pain Points ("Warts and All")**:
   - **Standard Go WASM Binary Size**: Standard Go (`GOOS=wasip1 GOARCH=wasm`) bundles the complete Go runtime and garbage collector into the binary, resulting in ~1.9 MB to ~2.5 MB binaries. While TinyGo produces ~200 KB binaries, it lacks support for certain standard library packages (such as full `crypto/x509`).
   - **Immutable Logic Cost**: Because mapping logic is frozen to prevent split-view attacks, any bug in key extraction cannot be hot-patched; it requires re-indexing the entire log from leaf 0.
@@ -90,52 +90,53 @@ func normalizeDomain(domain string) (string, error) {
 	return idna.Lookup.ToASCII(d)
 }
 
-func main() {
+func init() {
+	// Guest plugins compile with -buildmode=c-shared (GOOS=wasip1 GOARCH=wasm);
+	// the runtime executes package init() during module instantiation and invokes
+	// the exported map_bundle function directly without calling main().
 	sdk.RegisterEmit(mapCertificate)
 }
+
+func main() {}
 ```
 
 The `sdk.RegisterEmit` harness automatically binds the user's pure function to the low-level `map_bundle` FFI export. Each call to `emit(key)` writes the length-prefixed preimage directly into the pre-allocated output memory slab in-place. This eliminates intermediate slice allocations (`[]string` or `[][]byte`), dynamic array resizing, and garbage collector overhead inside the WebAssembly guest.
 
 #### WASM Guest ABI Contract:
 To exchange data across the FFI boundary while eliminating per-leaf allocation overhead:
-- **Memory Lifecycle**: The guest provides a linear memory arena for input tile bundles. The host passes the bundle into guest linear memory, invokes the entrypoint, and parses the resulting key-offset entries. The host resets the arena between invocations.
+- **Memory Lifecycle**: The guest exports `input_buffer() uint32` returning the base pointer of a pre-allocated multi-megabyte input slab in linear memory. The host serializes the 256-leaf bundle directly into this buffer, invokes `map_bundle`, and reads the resulting preimages from the returned output slab pointer.
 - **Statelessness Invariant**: Guest code must maintain zero mutable state across invocations. All mapping logic must be deterministic and pure; execution depends strictly on the bytes of each individual leaf.
 
 ---
 
 ### 2.2 Low-Level WASM ABI & The Pack-and-Wipe Memory Slab
-To eliminate the 23% CPU overhead of per-leaf FFI boundary crossings, the host and guest communicate through a single contiguous memory slab using the `map_bundle` export:
+To eliminate the 23% CPU overhead of per-leaf FFI boundary crossings, the host and guest communicate through contiguous pre-allocated memory slabs using the `input_buffer` and `map_bundle` exports:
 
 ```text
+//go:wasmexport input_buffer
+func input_buffer() uint32
+
 //go:wasmexport map_bundle
 func map_bundle(inputPtr uint32, inputLen uint32) uint64
 ```
 
 #### Memory Slab Lifecycle:
-1. **Pack (Host)**: The Go host serializes all 256 leaves of an Input Log data tile into a contiguous slab in the guest's linear memory.
+1. **Pack (Host)**: The Go host queries `input_buffer()` once on instance initialization and serializes all 256 leaves of an Input Log data tile into the contiguous input slab in the guest's linear memory.
 2. **Execute (FFI Call)**: The host invokes `map_bundle(inputPtr, inputLen)`.
-3. **Stream (Guest SDK)**: Inside WASM, the SDK harness reads the offset table, iterates over all 256 leaves in a tight in-guest loop, and invokes `userMapFn(leaf, emit)`. Each call to `emit` copies the preimage directly into the pre-allocated output slab at the current write cursor, avoiding intermediate collection allocations.
-4. **Return & Unpack (Host)**: The guest returns a packed 64-bit integer `uint64(outputPtr)<<32 | uint32(outputLen)`. The host reads all extracted preimages directly from the guest linear memory.
-5. **Wipe (Host)**: Both input and output memory slab pointers are reset (`offset = 0`) for the next batch, completely eliminating guest heap allocations and GC pauses.
+3. **Stream (Guest SDK)**: Inside WASM, the SDK harness reads the `[Count+1]uint32` offset table (`leaf := payload[offsets[i]:offsets[i+1]]`), iterates over all leaves in a tight in-guest loop, and invokes `userMapFn(leaf, emit)`. Each call to `emit` copies the length-prefixed preimage directly into the pre-allocated output slab at the current write cursor, avoiding intermediate collection allocations.
+4. **Return & Unpack (Host)**: The guest returns a packed 64-bit integer `uint64(outputPtr)<<32 | uint64(outputLen)`. The host reads all extracted preimages directly from the guest linear memory.
+5. **Wipe (Guest/Host)**: Output slab write cursors are reset (`offset = 0`) at the start of the next `map_bundle` call, completely eliminating guest heap allocations and GC pauses.
 
-#### Memory Lifecycle Sequence:
-1. **Host Ingestion**: The Go host writes the contiguous 256-leaf crate into the pre-allocated input slab in WASM linear memory.
-2. **Guest Execution**: The guest SDK loops over the input slab, executing `userMapFn(leaf, emit)` on each entry, streaming canonical string preimages directly into the output slab.
-3. **Register Return**: The guest returns a single 64-bit integer encoding `(outputPtr << 32) | outputLen` across the FFI boundary.
-4. **Host SIMD Hashing**: The Go host reads preimages directly from the output slab and computes 32-byte key hashes using host CPU vector instructions.
-5. **Arena Wipe**: The host resets slab allocation pointers to zero for the next batch with zero heap allocations.
-
-#### Binary Slab Layouts:
+#### Binary Slab Layouts (All `uint32` fields encoded in Little-Endian):
 
 | Memory Buffer | Offset | Field Name | Data Type | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **Input Slab** | `0` | `LeafCount` | `uint32` (4B) | Number of leaves in the crate (1 to 256). |
-| | `4` | `OffsetTable` | `[Count]uint32` | Byte offsets pointing to the start of each leaf in the payload block. |
-| | `4 + 4*Count` | `PayloadBlock` | `[]byte` | Raw, contiguous leaf bytes concatenated end-to-end. |
-| **Output Slab** | `0` | `LeafCount` | `uint32` (4B) | Number of leaves processed. |
-| | `4` | `KeyCountTable` | `[Count]uint32` | Number of preimages emitted by each respective leaf. |
-| | Follows | `PreimageBlock` | `[]byte` | Length-prefixed string preimages (`uint32 length` + raw UTF-8 bytes). |
+| **Input Slab** | `0` | `LeafCount` | `uint32` (4B, LE) | Number of leaves in the crate (`Count`, 1 to 256). |
+| | `4` | `OffsetTable` | `[Count+1]uint32` (LE) | `Count + 1` byte offsets relative to `PayloadBlock`: `OffsetTable[0] = 0`, followed by the end offset of each leaf (`leaf[i] = PayloadBlock[OffsetTable[i]:OffsetTable[i+1]]`). |
+| | `8 + 4*Count` | `PayloadBlock` | `[]byte` | Raw, contiguous leaf bytes concatenated end-to-end. |
+| **Output Slab** | `0` | `LeafCount` | `uint32` (4B, LE) | Number of leaves processed (`Count`). |
+| | `4` | `KeyCountTable` | `[Count]uint32` (LE) | Number of preimages emitted by each respective leaf. |
+| | `4 + 4*Count` | `PreimageBlock` | `[]byte` | Concatenated length-prefixed preimages (`uint32 length` (LE) + raw preimage bytes). |
 
 ---
 
@@ -233,12 +234,13 @@ While WebAssembly provides sandboxed memory safety and cross-platform determinis
 2. **Extraneous Cryptographic Decoding**: Standard `crypto/x509` decodes public key structures, executes `big.Int` modular arithmetic, and validates elliptic curve points—operations irrelevant to search key extraction.
 3. **Concurrency Saturation**: Under naive parsing, guest execution drops to ~1,200 leaves/s per core. Even scaling across 16 to 24 parallel Wazero workers caps aggregate throughput at ~14,000 leaves/s. Because the downstream storage engine and trie can commit >200,000 leaves/s, the pipeline becomes completely CPU-starved on guest mapping.
 
-> [!IMPORTANT]
-> **MapFn Throughput Invariant**: In any VIndex deployment, guest mapping efficiency is the primary determinant of overall ingestion throughput. Ecosystem authors must benchmark and profile their `MapFn` inside WebAssembly. Naive reliance on off-the-shelf parsing libraries will bottleneck the daemon regardless of allocated worker concurrency.
+- **[Performance Optimization] Zero-Allocation In-Guest Parsing**:
+  - *Mechanism*: Ecosystem plugins should avoid reflection-heavy standard library decoders in favor of targeted, in-place byte scanners over raw leaf payloads.
+  - *Impact*: Eliminates in-guest AST heap allocations and extraneous cryptographic validation, preventing guest WASM execution from starving the downstream storage and trie pipeline.
 
 ### A.2 Structural Architecture: Naive vs. Targeted Parsing
 - **Naive Architecture (Standard Library Decoders)**:
-  Deserializes the full certificate structure via `crypto/x509.ParseCertificate` and `encoding/asn1.Unmarshal`. Incurs full ASN.1 reflection overhead, parses public keys, and validates signatures.
+  Deserializes the full certificate structure via `crypto/x509` and `encoding/asn1`. Incurs full ASN.1 reflection overhead, parses public keys, and validates signatures.
 - **Optimized Architecture (Targeted In-Place Scanner)**:
   Bypasses `crypto/x509` and reflection entirely. A zero-allocation cursor scans the raw ASN.1 TLV stream in-place, extracting only the Subject Common Name (OID `2.5.4.3`) and SAN `dNSName` entries (OID `2.5.29.17`):
   - *Extension Filtering*: Unrecognized extension OIDs are skipped without decoding or allocating values.

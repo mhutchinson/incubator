@@ -32,11 +32,11 @@ The serving engine mirrors the inverted storage structure established in the KV 
 
 ### 1.4 Requirements, Dependencies & Known Pain Points
 - **Protocol Standards**: Adheres to Community Cryptography Specification Project ([C2SP](https://c2sp.org/)) conventions.
-- **Dependencies**: Pebble `IndexStore`, `MPTManager`, and `Publisher.GetServingState()`.
+- **Dependencies**: Reads from the Pebble inverted chunk store, the in-memory Sparse Merkle Patricia Trie, and the active serving state snapshot published by the tree subsystem.
 - **Known Pain Points ("Warts and All")**:
   - **Backward Cursor Friction**: Developers accustomed to conventional REST APIs (`page=2`, `start=X`) are often surprised by backward pagination (`before=X`). Client SDKs must abstract this traversal to present a standard forward iterator.
-  - **Sequential Roundtrips for Deep Keys**: Hot keys with 100,000+ entries require multiple sequential HTTP requests (e.g. 100 roundtrips at `limit=1000`) to retrieve complete historical logs.
-  - **Checkpoint Boundary Latency**: HTTP queries evaluate the latest committed checkpoint. Records in the active ingestion batch are invisible until the next commit cycle completes.
+  - **Sequential Roundtrips for Deep Keys**: Hot keys with 100,000+ entries require multiple sequential HTTP requests to retrieve complete historical logs.
+  - **Checkpoint Boundary Latency**: HTTP queries evaluate the latest committed checkpoint (`Serving_CP`). Records in the active ingestion batch are invisible until the next commit cycle completes.
 
 ---
 
@@ -47,12 +47,12 @@ The server exposes the following HTTP endpoints:
 
 | Endpoint | Method | Purpose & Parameters |
 | :--- | :--- | :--- |
-| `/vindex/v1/lookup/{keyhash}` | `GET` | Look up occurrences for a 32-byte hex-encoded key hash.<br>Query params: `before` (optional `uint64`), `limit` (optional `uint64`, default 100, max 1000). Evaluated against `ServingState`. Supported backward compatibility aliases: `/vindex/lookup/{keyhash}` and `/lookup/{keyhash}`. |
-| `/vindex/v1/checkpoint` | `GET` | Returns the latest signed, witnessed Output Log checkpoint note (`ServingState.RawCheckpoint`). Supported backward compatibility alias: `/checkpoint`. |
-| `/vindex/v1/inputlog_checkpoint` | `GET` | Returns the raw signed Input Log checkpoint note (`ServingState.RawInputLogCP`). Supported backward compatibility alias: `/inputlog_checkpoint`. |
+| `/vindex/v1/lookup/{keyhash}` | `GET` | Look up occurrences for a 32-byte hex-encoded key hash.<br>Query params: `before` (optional `uint64`), `limit` (optional `uint64`, default 100, max 1000). Evaluated against `Serving_CP`. Supported backward compatibility aliases: `/vindex/lookup/{keyhash}` and `/lookup/{keyhash}`. |
+| `/vindex/v1/checkpoint` | `GET` | Returns the latest signed, witnessed Output Log checkpoint note from `Serving_CP`. Supported backward compatibility alias: `/checkpoint`. |
+| `/vindex/v1/inputlog_checkpoint` | `GET` | Returns the raw signed Input Log checkpoint note from `Serving_CP`. Supported backward compatibility alias: `/inputlog_checkpoint`. |
 | `/healthz` | `GET` | Liveness probe. Returns **HTTP 200 OK** (`ok\n`) as long as the process is alive. |
 | `/readyz` | `GET` | Readiness probe. Returns **HTTP 200 OK** (`ok\n`) when serving state is initialized, or **HTTP 503** if serving state is not yet ready. |
-| `/metrics` | `GET` | Exposes standard Prometheus metrics via `promhttp.Handler()`. |
+| `/metrics` | `GET` | Exposes standard Prometheus telemetry metrics. |
 
 > [!NOTE]
 > **Open Design Discussion**: See [Zero-MPT Continuation & The "Map of Logs" API](../../docs/DESIGN_DISCUSSIONS.md#1-zero-mpt-continuation--the-map-of-logs-api) for active exploration on bypassing MPT locks during backward pagination, and [Bounded Chunk Visitation](../../docs/DESIGN_DISCUSSIONS.md#3-bounded-chunk-visitation-for-sparse-keys-p99-guardrail) for latency guardrails on sparse keys.
@@ -61,7 +61,7 @@ The server exposes the following HTTP endpoints:
 > [!NOTE]
 > **Open Design Discussion**: See [Chunk-Aligned Paging](../../docs/DESIGN_DISCUSSIONS.md#2-chunk-aligned-paging-eliminating-dynamic-merkle-hashing) for research on aligning response boundaries to chunks to eliminate on-the-fly leaf hashing on the read path.
 
-Responses use the C2SP multi-section plaintext format (`format.go`), where sections are delimited by blank lines (`\n\n`) and framed by section headers `— <section-name>[ <args>] —`:
+Responses use the C2SP multi-section plaintext format, where sections are delimited by blank lines (`\n\n`) and framed by section headers `— <section-name>[ <args>] —`:
 
 ```text
 — vindex/v1 —
@@ -93,10 +93,10 @@ MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
 ```
 
 #### Section Breakdown:
-1. `— vindex/v1 —`: Raw signed Output Log checkpoint note (`ServingState.RawCheckpoint`), containing tree size, root hash, and witness cosignatures.
-2. `— output-log-leaf-v1 <leaf_index> —`: Output Log leaf data at `<leaf_index>`:
-   - Line 1: Hexadecimal-encoded 32-byte `MapRoot` (64 characters).
-   - Line 2+: Raw signed Input Log checkpoint note (`ServingState.RawInputLogCP`).
+1. `— vindex/v1 —`: Raw signed Output Log checkpoint note from `Serving_CP`, containing tree size, root hash, and witness cosignatures.
+2. `— output-log-leaf-v1 <leaf_index> —`: Output Log leaf data at `<leaf_index>` (with trailing newlines trimmed for multi-section wire framing):
+   - Line 1: Lowercase hexadecimal-encoded 32-byte `MapRoot` (64 characters).
+   - Line 2+: Raw signed Input Log checkpoint note (right-trimmed of trailing newlines in section framing; canonical leaf bytes hashed into the Output Log are `"<64-char-lowercase-hex-mapRoot>\n<right-newline-trimmed-rawInputLogCP>\n"`).
 3. `— output-log-proof-v1 —`: Output Log Merkle inclusion proof hashes, one base64-encoded SHA-256 hash per line.
 4. `— mpt-proof-v1 <inclusion|non-inclusion> —`: Base64-encoded binary Sparse Merkle Patricia Trie proof:
    - `inclusion`: Proves that `SubRoot` exists at `KeyHash` within `MapRoot`.
@@ -117,15 +117,15 @@ To prove completeness across paginated responses without expensive consistency p
 
 #### Step 1: Initial Query (Tip / Page 1)
 1. The client queries `GET /vindex/v1/lookup/{KeyHash}?limit=100` (default limit 100, max 1000, no `before` cursor).
-2. The server acquires reader snapshot isolation under `ServingState`:
-   - Evaluates `mptMgr.ProveLocked(keyHash)`.
-   - Reads matching occurrence indices from Pebble DB up to `ServingState.InputLogSize`.
+2. The server acquires reader snapshot isolation under `Serving_CP`:
+   - Generates the MPT inclusion/non-inclusion proof under a shared read lock.
+   - Reads matching occurrence indices from Pebble DB strictly below `Serving_CP.InputSize`.
 3. The client receives Page 1 and verifies:
    - Verifies the Output Log checkpoint note (`— vindex/v1 —`) against trusted witness keys.
-   - Verifies the Output Log leaf (`— output-log-leaf-v1 <leaf_index> —`) inclusion proof (`— output-log-proof-v1 —`) against the Output Log checkpoint root.
+   - Reconstructs the canonical Output Log commitment leaf bytes (`"<64-char-lowercase-hex-mapRoot>\n<right-newline-trimmed-rawInputLogCP>\n"`) from `— output-log-leaf-v1 <leaf_index> —`, hashes the leaf with RFC 6962 leaf domain separator `0x00`, and verifies the inclusion proof (`— output-log-proof-v1 —`) against the Output Log checkpoint root.
    - Verifies the raw Input Log checkpoint note signature from the leaf data.
    - Verifies `— mpt-proof-v1 inclusion —` against `MapRoot`.
-   - Reconstructs the mini-log compact range from `— prefix-compact-range-v1 <covered_size> —` (if present) and `— indices-v1 —` decimal indices (each encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00), asserting equality with `SubRoot`.
+   - Reconstructs the mini-log compact range from `— prefix-compact-range-v1 <covered_size> —` (if present) and `— indices-v1 —` decimal indices (each encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator `0x00`), asserting equality with `SubRoot`.
    - **Page 1 is now cryptographically authenticated.**
 
 #### Step 2: Continuation Queries (Page 2..N)
@@ -138,47 +138,35 @@ To prove completeness across paginated responses without expensive consistency p
 5. This process repeats inductively until `prefix-compact-range-v1` is empty, proving that every historical leaf has been retrieved without gaps or omissions.
 
 ### 2.4 Reader Snapshot Isolation
-To ensure readers never observe uncommitted or un-witnessed records, the serving engine enforces strict watermark filtering:
+To ensure readers never observe uncommitted or unwitnessed records, the serving engine enforces strict watermark filtering (`Serving_CP.InputSize <= Output_CP.InputSize`):
 
-```text
-Serving_CP.InputSize <= Output_CP.InputSize
-```
-
-1. Every incoming lookup acquires an immutable snapshot of `ServingState`:
-   ```go
-   state := p.publisher.GetServingState()
-   ```
-2. When querying Pebble DB, the storage engine applies a strict filter:
-   ```go
-   if index >= state.InputLogSize {
-       // Ignore entry; uncommitted in current serving checkpoint
-   }
-   ```
-3. Lookups are completely decoupled from concurrent background ingestion; in-flight writes ahead of `state.InputLogSize` are invisible to readers.
+1. Every incoming lookup captures an atomic snapshot of `Serving_CP` along with the MPT proof under a shared read lock.
+2. When querying Pebble DB, the storage engine ignores any occurrence index `>= Serving_CP.InputSize`, ensuring uncommitted entries from in-flight batches are invisible to readers.
+3. Lookups are completely decoupled from concurrent background ingestion.
 4. **Resilience Under Divergence (Pinned Last Known Good State)**: If the background auditor detects an upstream Output Log root mismatch or sync divergence, forward sync halts and freezes database files on disk, but the serving pointer remains pinned to the last verified checkpoint (`Serving_CP`). Readers continue receiving valid, witnessed cryptographic proofs evaluated at `Serving_CP` without interruption.
-5. **Fail-Closed Mode (Opt-In)**: If the server is explicitly launched with `--fail_closed=true` (e.g. in mirror mode), a detected root mismatch or divergence causes the auditor to revoke the serving state (`SetServingState(nil)`), causing subsequent lookup requests to return HTTP 503 Service Unavailable immediately.
+5. **Fail-Closed Mode (Opt-In)**: If the server is explicitly launched with `--fail_closed=true` (e.g. in mirror mode), a detected root mismatch or divergence causes the auditor to clear the active serving state, causing subsequent lookup requests to return `HTTP 503 Service Unavailable` immediately.
 
 ### 2.5 In-Situ Invariants & Performance Optimizations
 
 - **[Correctness Invariant] Serving Snapshot Isolation**:
   - *Rule*: Query responses must evaluate state strictly bounded by the latest witnessed checkpoint (`Serving_CP.InputSize <= Output_CP.InputSize`).
   - *Rationale*: Guarantees that readers only observe data committed in the Output Log and witnessed by public monitors.
-  - *Consequence ("Or Else")*: Readers would observe uncommitted, un-witnessed entries, causing client-side Merkle proof verification to fail against witnessed checkpoints.
+  - *Consequence ("Or Else")*: Readers would observe uncommitted, unwitnessed entries, causing client-side Merkle proof verification to fail against witnessed checkpoints.
 
 - **[Correctness Invariant] Inductive Backward Verification Completeness**:
-  - *Rule*: For any continuation query where `before < latest_index`, the server must return a valid `prefix-compact-range-v1` committing to all occurrences with `index < min(page_indices)`.
+  - *Rule*: For any continuation query where `before` precedes the latest occurrence, the server must return a valid `prefix-compact-range-v1` committing to all occurrences strictly below the oldest index in the returned page.
   - *Rationale*: Enables the client to inductively link historical pages back to the witnessed `SubRoot`.
   - *Consequence ("Or Else")*: An adversary operating the server could omit historical entries during pagination without detection.
 
 - **[Performance Optimization] Zero-Reflection Plaintext Streaming**:
-  - *Mechanism*: Serializes C2SP multi-section responses directly into the `http.ResponseWriter` using buffered I/O, avoiding JSON reflection and heap marshalling.
+  - *Mechanism*: Serializes C2SP multi-section responses directly to the HTTP response stream using buffered I/O, avoiding JSON reflection and heap marshalling.
   - *Impact*: Delivers sub-millisecond P50 read latency (< 1ms) and sustains high lookup throughput under concurrent ingestion.
 
 ### 2.6 Serving Contract
 
 The read serving subsystem exposes point lookups and checkpoint retrieval over HTTP:
 
-- **Non-Blocking Read Path**: The read path is completely non-blocking with respect to ingestion and Output Log fsync. Requests acquire immutable serving state snapshots without holding locks or contending with storage writes.
+- **Non-Blocking Read Path**: The read path is completely non-blocking with respect to ingestion and Output Log `fsync`. Requests capture immutable serving state snapshots under a shared read lock without contending with background storage writes.
 - **Request Validation & Limits**: Requests strictly validate key hash format (requiring a 64-character lowercase hexadecimal string representing the 32-byte hash) and clamp query limits (default 100, maximum 1000).
 
 ---
@@ -210,7 +198,7 @@ The read serving subsystem exposes point lookups and checkpoint retrieval over H
 - **Chosen Design**: Server produces raw proofs; client SDK verifies them locally.
 
 ### 3.4 Aggressive 503 Circuit-Breaking vs. Pinned Last-Known-Good Serving
-- **Proposed**: Immediately revoking `ServingState` (setting it to nil) and returning HTTP 503 on all lookup queries the moment the background auditor detects an Output Log root mismatch or sync divergence.
+- **Proposed**: Immediately clearing the active serving state and returning HTTP 503 on all lookup queries the moment the background auditor detects an Output Log root mismatch or sync divergence.
 - **Operational & Availability Rejection**:
   - In mirror deployments, an upstream publisher bug, temporary network inconsistency, or signer mismatch instantly caused a total denial-of-service outage for downstream query clients. Downstream systems were starved of verified answers despite holding thousands of previously authenticated entries.
   - Tying liveness health probes (`/healthz`) to upstream sync status caused Kubernetes and cloud load balancers to prematurely kill or de-route healthy mirror replicas, exacerbating outages.

@@ -27,9 +27,9 @@ Because readers must verify proofs against a coherent snapshot, all mutations to
 ### 1.3 Requirements, Dependencies & Known Pain Points
 - **Dependencies**: Binary Sparse Merkle Patricia Trie via `filippo.io/torchwood/mpt`, Tessera Output Log writer, and external witness clients.
 - **Known Pain Points ("Warts and All")**:
-  - **Fatal Panic on Prediction Divergence**: If an in-memory calculation bug causes `actualRoot != predictedMapRoot`, the node halts immediately. The Output Log has already been appended; there is no graceful in-memory recovery path.
+  - **Fatal Halt on Prediction Divergence**: If an in-memory calculation defect causes the committed trie root to differ from the predicted root that was just appended to the Output Log, the node halts immediately. Because the Output Log is append-only, there is no graceful in-memory rollback path.
   - **RAM Sizing for Branch Locality**: Uniform 32-byte key hash distribution scatters updates across the 256-bit trie keyspace. While leaf data resides in `mmap` files, active branch nodes must remain resident in RAM (scaling from ~1 GB for 10M keys to 100+ GB for 1B keys).
-  - **External Witness Network Latency**: Waiting for witness cosignatures introduces commit cycle latency, though lock-free pre-computation insulates HTTP readers from this delay.
+  - **External Witness Network Latency**: Waiting for witness cosignatures introduces commit cycle latency, though non-blocking root prediction insulates HTTP readers from this delay.
 
 ---
 
@@ -40,84 +40,75 @@ The commitment plane maps 32-byte key hashes (`KeyHash`) to 32-byte mini-log roo
 
 1. **Binary Radix Structure**: Keys represent 256-bit paths from the root. Non-existent subtrees are represented by implicit zero-hash nodes, allowing concise non-inclusion proofs.
 2. **Memory-Mapped Storage**: Tree nodes and leaves are stored in append-only files managed via memory mapping (`mmap`), allowing fast lookups without loading entire historical trees into the Go heap.
-3. **SubRoot Values**: The value committed at each leaf is the RFC 6962 mini-log root computed by `kvstore.GetSubRoot`, authenticating all occurrences of that key in the Input Log.
+3. **SubRoot Values**: The value committed at each leaf is the RFC 6962 mini-log root computed by the KV storage layer, authenticating all occurrences of that key in the Input Log.
 
 ### 2.2 The 3-Step Atomic Commitment Sequence
 The publisher coordinates the progression from KV storage to public commitment through a structured 3-step sequence designed to satisfy two strict system constraints:
 
-1. **System Constraint 1 (Zero Unwitnessed State)**: Readers must never observe or obtain proofs against an in-memory root that has not yet been committed to the append-only Output Log and signed by a threshold of external witnesses. Mutating the tree before publishing would leak unwitnessed state to readers.
+1. **System Constraint 1 (Zero Unwitnessed State)**: Readers must never observe or obtain proofs against an in-memory root that has not yet been committed to the append-only Output Log and signed by a threshold of external witnesses. Mutating the live trie before publishing would leak unwitnessed state to readers.
 2. **System Constraint 2 (Sub-Millisecond Read Latency)**: Readers must never block on external network I/O. Because appending to the Output Log and collecting witness cosignatures takes 50ms–200ms+, holding an exclusive tree write lock across network calls would stall concurrent client queries and violate read latency SLOs (< 15ms P99).
-3. **Solution (Separate Prediction from Mutation)**: Pre-compute the deterministic future root (`mpt.Predict`) without mutating the live trie, append to the Output Log, and gather witness cosignatures while readers query unblocked. Once proofs and signatures are secured, acquire the lock briefly (< 5ms) to commit in-memory mutations, verify `assert(actualRoot == predictedMapRoot)`, and atomically ratchet the serving pointer.
-4. **Why Panic on Divergence**: `Predict` and `Commit` are deterministic functions over identical inputs. Any divergence is an internal invariant violation / software defect in the tree implementation. Halting immediately prevents the node from serving proofs that contradict the witnessed log.
+3. **Solution (Separate Prediction from Mutation)**: Pre-compute the deterministic candidate root under a shared read lock without mutating the live trie, release the read lock, and then append to the Output Log and gather witness cosignatures while readers query unblocked. Once proofs and signatures are secured, acquire the exclusive tree lock briefly (< 5ms) to commit in-memory mutations, assert that the committed root equals the predicted root, and atomically ratchet the serving state snapshot.
+4. **Why Halt on Divergence**: Candidate root prediction and in-place mutation are deterministic functions over identical inputs. Any divergence indicates an internal invariant violation or memory corruption in the trie. Halting immediately prevents the node from serving proofs that contradict the witnessed log.
 
-#### PublishBatch Locking & Concurrency:
-The publisher lock protects the in-memory trie commit and the serving state update. Concurrent batch publications are not supported without an external coordinator lock; the Coordinator serializes batch execution.
+#### Batch Publication Locking & Concurrency:
+Batch commits are serialized by the single-writer coordinator. Within each commit cycle, lock scope is minimized so readers never block on network or disk I/O:
 
 | Step | Phase | Operations | Lock State | Reader Impact |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Lock-Free Prediction & Witnessing** | 1. `predictedMapRoot = mpt.Predict(modifiedSubRoots)`<br>2. `outputLog.Append(predictedMapRoot, inputLogCP)`<br>3. `witness.Witness(outputLogCheckpoint)` | No tree lock held | **Zero blocking**; concurrent queries run unimpeded. |
-| **2** | **Atomic Mutation & Ratchet** | 1. Acquire publisher lock<br>2. Commit mutations to in-memory trie<br>3. Assert `actualRoot == predictedMapRoot`<br>4. Ratchet `ServingState`<br>5. Release publisher lock | Publisher lock held | **< 5ms** critical section duration. |
-| **3** | **Background Durability** | 1. Flush dirty mmap pages to disk<br>2. Advance `MPT_Durable_Size` | Disk persistence lock held; publisher lock released | **Zero blocking**; disk fsync runs outside reader lock. |
+| **1** | **Non-Blocking Prediction & Witnessing** | 1. Compute candidate `MapRoot` over modified sub-roots.<br>2. Append commitment leaf to Output Log.<br>3. Obtain witness cosignatures on Output Log checkpoint. | Shared read lock held only during in-memory prediction; **no lock held** during Output Log append and witness network calls. | **Zero blocking**; shared read locks allow concurrent HTTP proof generation to run in parallel. |
+| **2** | **Atomic Mutation & Ratchet** | 1. Acquire exclusive tree and persistence locks.<br>2. Commit batch mutations to in-memory trie.<br>3. Assert committed root equals predicted `MapRoot`.<br>4. Ratchet active serving state pointer.<br>5. Release locks. | Exclusive tree & persistence locks held. | **< 5ms** critical section duration. |
+| **3** | **Background Durability** | 1. Snapshot dirty trie pages (under brief shared read lock) and flush to disk.<br>2. Advance durable trie watermark. | Exclusive persistence lock held; exclusive tree lock released. | **Zero blocking**; disk `fsync` runs outside the exclusive tree lock. |
 
 #### Step Details:
-1. **Lock-Free Prediction & Witnessing**:
-   - The publisher computes candidate trie hashes on cloned branch nodes without acquiring the exclusive publisher lock.
-   - The commitment string (`hex(predictedMapRoot) + "\n" + rawInputLogCP`) is appended to the Tessera Output Log.
-   - The new Output Log checkpoint is submitted to external witnesses to gather threshold cosignatures.
-   - **Throughout this entire phase, concurrent readers execute lookups without blocking.**
+1. **Non-Blocking Prediction & Witnessing**:
+   - The publisher acquires a shared read lock on the trie to compute candidate hashes over cloned branch nodes without mutating the live tree, then immediately releases the read lock.
+   - The canonical commitment leaf (`"<64-char-lowercase-hex-mapRoot>\n<right-newline-trimmed-rawInputLogCP>\n"`) is appended to the Output Log with zero tree or persistence locks held.
+   - The resulting Output Log checkpoint is submitted to external witnesses to gather threshold cosignatures.
+   - **Throughout this entire phase, concurrent HTTP readers acquire shared read locks and generate proofs without blocking.**
 2. **Atomic Mutation & Ratchet**:
-   - The publisher acquires the exclusive publisher lock.
+   - The publisher acquires the exclusive tree lock (alongside the persistence lock).
    - Mutates in-memory MPT nodes in place.
-   - Asserts `actualRoot == predictedMapRoot`. If mismatched, panics immediately.
-   - Ratchets serving state pointer to the new witnessed Output Log checkpoint.
-   - Releases the publisher lock.
+   - Asserts that the committed root equals the predicted root. If mismatched, the process terminates immediately.
+   - Ratchets the active serving state pointer to the newly witnessed Output Log checkpoint.
+   - Releases the locks.
    - **Total critical section duration: < 5 milliseconds.**
 3. **Background Durability**:
-   - Under an independent persistence lock, the publisher flushes modified mmap pages to disk via msync/fsync.
-   - Once durable, `MPT_Durable_Size` is advanced, unblocking `TileReaper` in the ingestion layer.
+   - Under the independent persistence lock (acquiring only a brief shared read lock to snapshot dirty page references), the trie flushes modified memory-mapped pages to disk via `msync`/`fsync`.
+   - Once durable on disk, the durable trie watermark advances, allowing the tile cache reaper to prune superseded raw tiles.
 
 ### 2.3 Concurrency Architecture & Split-Locking
-The subsystem enforces strict isolation between read serving and background disk persistence using two distinct conceptual locks:
+The subsystem enforces strict isolation between in-memory proof serving and background disk persistence using two distinct locks:
 
 | Conceptual Lock | Synchronization Model | Scope & Protected State | Typical Duration |
 | :--- | :--- | :--- | :--- |
-| **Publisher Serving Lock** | Read-write lock | In-memory MPT nodes, active trie instance, and active serving state pointer. Acquired in shared mode by HTTP readers; acquired exclusively during in-memory ratchets. | **< 5ms** (exclusive)<br>**< 50µs** (shared) |
-| **Disk Persistence Lock** | Exclusive mutex | Disk fsync operations, Output Log appends, and witness network calls. | **5ms – 200ms** |
+| **In-Memory Tree Lock** | Read-write lock | Protects in-memory MPT nodes and the active serving state snapshot. Acquired in shared read mode by HTTP proof readers and candidate root prediction; acquired in exclusive write mode only during the in-memory batch commit and serving state ratchet. | **< 5ms** (exclusive write)<br>**< 50µs** (shared read) |
+| **Disk Persistence Lock** | Exclusive mutex | Serializes in-memory trie mutations against background snapshot serialization and disk `fsync` operations. Never held during Output Log appends or witness network calls. | **5ms – 20ms** |
 
-Because the disk persistence lock is completely decoupled from the publisher serving lock, slow disk syncs and network calls never block readers.
+Because disk persistence and network witnessing are decoupled from the exclusive tree lock, slow disk syncs and witness roundtrips never block HTTP readers.
 
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
-- **[Correctness Invariant] Fatal Panic on Root Prediction Divergence**:
-  - *Rule*: After the Output Log append succeeds, when the writer lock is acquired to commit in-memory mutations, the actual computed root must strictly match the predicted root:
-    ```go
-    if actualRoot != predictedMapRoot {
-        p.mptMgr.Unlock()
-        panic(fmt.Sprintf("FATAL: MPT root prediction mismatch after output log append: actual %x != predicted %x", actualRoot, predictedMapRoot))
-    }
-    ```
-  - *Rationale*: The Output Log is immutable. If the actual root diverges from the predicted root that was already appended and witnessed, execution must halt immediately.
+- **[Correctness Invariant] Fatal Halt on Root Prediction Divergence**:
+  - *Rule*: After the Output Log append succeeds, when the exclusive tree lock is acquired to apply the batch mutations in memory, the resulting trie root must equal the predicted root committed to the Output Log; any mismatch must immediately terminate the process.
+  - *Rationale*: The Output Log is immutable. If the committed in-memory root diverges from the predicted root that was already appended and witnessed, execution must halt immediately.
   - *Consequence ("Or Else")*: Continuing execution would publish an equivocal commitment to the Output Log that cannot be cryptographically proven by the node's internal state.
 
 - **[Correctness Invariant] Single-Timeline Equivocation Resistance**:
-  - *Rule*: Every published state commitment leaf binds the exact `MapRoot` to the exact signed `InputLogCheckpoint`.
+  - *Rule*: Every published state commitment leaf binds the exact `MapRoot` to the exact signed Input Log checkpoint.
   - *Rationale*: Independent witnesses sign the Output Log checkpoint note. The index operator cannot present conflicting views of index state to different clients without producing split-view signatures detectable by public monitors.
   - *Consequence ("Or Else")*: An operator attempting to selectively hide certificates or packages would be mathematically detected by any monitor cross-checking witness cosignatures.
 
 - **[Correctness Invariant] Serving Isolation & Atomic Ratcheting**:
-  - *Rule*: HTTP readers evaluate state strictly bounded by the active serving checkpoint:
-    ```text
-    Serving_CP.InputSize <= Output_CP.InputSize
-    ```
-  - *Rationale*: HTTP requests snapshot `ServingState` and enforce index filtering `index < Serving_CP.InputSize` across all storage reads.
-  - *Consequence ("Or Else")*: Readers would observe uncommitted, un-witnessed entries that are ahead of the latest published checkpoint, breaking client-side Merkle proof verification.
+  - *Rule*: HTTP readers evaluate state strictly bounded by the active serving checkpoint (`Serving_CP.InputSize <= Output_CP.InputSize`).
+  - *Rationale*: HTTP requests capture an atomic snapshot of the serving state and filter all storage reads to leaf indices strictly below the serving checkpoint's Input Log size.
+  - *Consequence ("Or Else")*: Readers would observe uncommitted, unwitnessed entries that are ahead of the latest published checkpoint, breaking client-side Merkle proof verification.
 
-- **[Performance Optimization] Lock-Free MPT Prediction**:
-  - *Mechanism*: Computes candidate trie roots without holding the publisher lock, allowing Output Log writes and witness network roundtrips to complete outside the critical section.
-  - *Impact*: Reduces the writer lock duration from ~250ms to < 5ms per commit cycle.
+- **[Performance Optimization] Non-Blocking MPT Prediction**:
+  - *Mechanism*: Computes candidate trie roots under a shared read lock and performs Output Log writes and witness network roundtrips with no tree locks held.
+  - *Impact*: Reduces exclusive writer lock duration from ~250ms to < 5ms per commit cycle.
 
 - **[Performance Optimization] Split-Locking Concurrency Engine**:
-  - *Mechanism*: Isolates background disk fsyncs from in-memory trie reads.
+  - *Mechanism*: Isolates background disk `fsync` operations from in-memory trie read locks.
   - *Impact*: Sustains 678,000 read queries/sec during active disk commits, compared to 53,000 reads/sec under coarse global locking (12.8x throughput improvement).
 
 ### 2.5 State Trie & Commitment Contract

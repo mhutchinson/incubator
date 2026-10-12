@@ -24,21 +24,21 @@ The verifier operates as an independent external auditor paired with a safe fore
 ### 1.3 Goals & Non-Goals
 - **Goals**:
   - Continuously audit published Output Log leaves against Input Log entries from leaf 0.
-  - Assert cryptographic equality between the independently reconstructed `localMapRoot` and the operator's `committedMapRoot`.
+  - Assert cryptographic equality between the independently reconstructed local `MapRoot` and the operator's committed `MapRoot`.
   - Provide immediate mismatch signaling via Prometheus metrics (`vindex_verifier_root_mismatch = 1`), structured logs, and sync status probe degradation (`/readyz` or `/syncz`).
   - Freeze physical database state on root mismatch to preserve forensic post-mortem evidence.
   - Serve verifiable read queries (`--serve_mirror=true`) pinned to the last verified checkpoint (`Serving_CP`) during sync halt, preserving read availability and partition resilience.
-  - Support an opt-in fail-closed mode (`--fail_closed=true`) for deployments requiring immediate serving revocation (HTTP 503).
+  - Support an opt-in fail-closed mode (`--fail_closed=true`) for deployments requiring immediate serving revocation (`HTTP 503`).
 - **Non-Goals**:
   - **No Automatic Retry / Self-Healing on Root Mismatch**: If a root mismatch occurs, the verifier does not guess or retry; it halts immediately to preserve evidence of operator fraud or software bug.
   - **No Operator Checkpoint Generation**: The verifier does not sign Output Log checkpoints; it is strictly an independent auditor and consumer.
 
 ### 1.4 Requirements, Dependencies & Known Pain Points
-- **Dependencies**: Integrates `TileFetcher`, `ManagedTileCache`, `IndexStore`, `MPTManager`, and `Publisher`.
+- **Dependencies**: Integrates the tile fetcher and local tile cache, KV chunk store, MPT commitment manager, and serving state publisher.
 - **Known Pain Points ("Warts and All")**:
   - **Hardware Sizing Parity**: Running a full-log verifier mirror requires the same RAM and disk capacity as the primary indexer to maintain the local MPT in memory.
   - **Audit Catch-Up vs. Issuance Velocity**: When catching up from leaf 0, the verifier experiences initial sync lag. However, because VIndex's indexing engine achieves 90,000 to 240,000+ leaves/sec—several orders of magnitude faster than steady-state log issuance rates (50 to 500 entries/sec)—catch-up over tens of millions of entries completes in hours rather than months, provided the upstream log's historical entry tiles remain resolvable over HTTP/CDN.
-  - **Stale Serving During Sync Halt**: By default, when an upstream root mismatch or sync divergence halts background sync, the mirror remains pinned to `Serving_CP`. While queries return cryptographically authentic proofs, index coverage remains frozen until human operators triage and resolve the divergence. Deployments requiring immediate cutoff can enable `--fail_closed=true` to fail lookups with HTTP 503 instead.
+  - **Stale Serving During Sync Halt**: By default, when an upstream root mismatch or sync divergence halts background sync, the mirror remains pinned to `Serving_CP`. While queries return cryptographically authentic proofs, index coverage remains frozen until human operators triage and resolve the divergence. Deployments requiring immediate cutoff can enable `--fail_closed=true` to fail lookups with `HTTP 503` instead.
 
 ---
 
@@ -51,57 +51,53 @@ VIndex verification operates across two distinct, complementary boundaries:
 | Role & Component | Execution Scope | Target Consumer | Threat Coverage |
 | :--- | :--- | :--- | :--- |
 | **Client Query Verification** (`vindex/v1/client`) | Evaluates individual query responses against witnessed Output Log checkpoints. | End-user apps, CLIs, light clients. | Verifies inclusion/non-inclusion of queried key; verifies witness cosignatures against policy; verifies backward pagination chain. |
-| **Full-Log Independent Auditor** (`vindex/v1/internal/auditor`) | Independently re-indexes all Input Log leaves from leaf 0 and reconstructs the full MPT. | Standalone monitoring daemon (`vindex-audit`). | Detects operator equivocation, forged map roots, targeted omission of unqueried keys, and log rollbacks; enforces policy witness quorum. |
+| **Full-Log Independent Auditor** (`vindex/v1/internal/auditor`) | Independently re-indexes all Input Log leaves from leaf 0 and reconstructs the full MPT. | Standalone monitoring daemon (`vindex-auditor`). | Detects operator equivocation, forged map roots, targeted omission of unqueried keys, and log rollbacks; enforces policy witness quorum. |
 
 #### Auditor Configuration & Witness Policy Enforcement
 The auditor daemon is provisioned with network endpoints, verifiers, and trust policies via its configuration. Crucially, Output Log checkpoint validation verifies origin signatures and witness cosignatures against a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note does not satisfy the witness quorum or origin requirements defined by the policy, it is rejected before processing any leaves.
 
-### 2.2 The Continuous Audit Loop (`AuditOnce`)
-The standalone auditor daemon continuously polls both logs, executing the following 5-step audit loop:
+### 2.2 The Continuous Audit Loop
+The standalone auditor daemon polls the Output Log for new commitments and extracts the target Input Log checkpoint directly from each Output Log leaf (never polling the Input Log's `/checkpoint` endpoint directly), executing the following 5-step audit loop:
 
 | Step | Phase | Action & Operations | Verification Check |
 | :--- | :--- | :--- | :--- |
 | **1** | **Poll Output Checkpoint** | Fetches latest Output Log `/checkpoint`. | Verifies origin signatures and witness cosignatures against configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If witness quorum or origin requirements are unsatisfied, rejected before processing leaves. |
-| **2** | **Stream Output Leaves** | Streams Output Log leaves in the range `[verifiedOutputWatermark .. targetOutputSize)`. | Asserts Merkle inclusion proof against the verified Output Log root. |
-| **3** | **Fetch & Map Input Tiles** | Downloads missing Input Log tiles up to `targetInputSize`, filters replayed leaves (`leafIdx < persistedInputWatermark`), and writes chunk updates atomically with verified input watermark via `store.WriteBatch`. | Authenticates tiles against Input Log root, enforces replay deduplication, and runs sandboxed mapping. |
-| **4** | **Reconstruct Local MPT** | Reconstructs mini-log sub-roots for all modified search keys. | Computes candidate `localMapRoot` in local memory. |
-| **5** | **Assert Root Equality** | Asserts `localMapRoot == committedMapRoot`. | **Match**: Advances verified Output Log watermark and ratchets public serving checkpoint (`Serving_CP`); storage progression remains strictly atomic.<br>**Mismatch**: Triggers state-preserving halt, freezes database files, emits alerts, and pins serving to `Serving_CP` (or revokes serving if `--fail_closed=true`). |
+| **2** | **Stream Output Leaves** | Streams unverified Output Log leaves from the last verified output watermark up to the new Output Log size. | Asserts Merkle inclusion proof against the verified Output Log root and verifies the embedded Input Log checkpoint signature. |
+| **3** | **Fetch & Map Input Tiles** | Downloads missing Input Log tiles up to the Input Log checkpoint committed in the Output Log leaf, filters already-persisted leaves, and indexes chunk updates into Pebble. | Authenticates tiles against the embedded Input Log root, enforces replay deduplication, and runs sandboxed mapping. |
+| **4** | **Predict Candidate MPT Root** | Evaluates modified mini-log sub-roots against the local MPT without mutating verified tree state. | Computes the candidate local `MapRoot` in memory under a shared read lock. |
+| **5** | **Assert Root Equality & Commit** | Asserts that the candidate local `MapRoot` equals the committed `MapRoot` in the Output Log leaf. | **Match**: Commits MPT mutations, persists verified watermarks, and ratchets public serving checkpoint (`Serving_CP`).<br>**Mismatch**: Triggers state-preserving halt, freezes database files, emits alerts, and pins serving to `Serving_CP` (or revokes serving if `--fail_closed=true`). |
 
 #### Step Details:
 1. **Discover & Authenticate Output Checkpoint**: Polls the Output Log's `/checkpoint` endpoint. Output Log checkpoint validation verifies origin signatures and witness cosignatures against a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note does not satisfy the witness quorum or origin requirements defined by the policy, it is rejected before processing any leaves.
-2. **Stream State Commitments**: Downloads new Output Log leaves using standard Merkle tile fetching. Verifies inclusion proofs for each leaf against the Output Log checkpoint root (`proof.VerifyInclusion`).
-3. **Fetch & Map Input Tiles**: For each state commitment leaf specifying `targetInputSize`:
-   - Validates monotonic progression: `targetInputSize >= verifiedInputWatermark`.
+2. **Stream State Commitments & Extract Input Checkpoint**: Downloads new Output Log leaves using standard Merkle tile fetching. Verifies Merkle inclusion proofs for each leaf against the Output Log checkpoint root, and parses and verifies the signed Input Log checkpoint embedded inside the Output Log leaf payload.
+3. **Fetch & Map Input Tiles**: For each state commitment leaf specifying a target Input Log size (from the embedded Input Log checkpoint):
+   - Validates monotonic progression against the previously verified Input Log watermark.
    - Downloads missing Input Log tiles from the upstream log and authenticates them against the Input Log root.
    - Evaluates the WASM `MapFn` on input leaves.
-   - **Replay Deduplication Invariant**: On restart or crash replay, any input leaf indices already persisted (`leafIdx < persistedInputWatermark`) are filtered out prior to appending to active chunks, ensuring idempotent crash recovery and preventing duplicate index entries from corrupting compact ranges.
-   - **Atomic Watermark Persistence**: Appends occurrence indices to inverted chunk records and writes updates to Pebble DB via `store.WriteBatch`. The batch persists the verified input watermark (`KeyVerifierInputWatermark`) atomically in the same batch as the inverted chunk updates, preventing open windows where storage is durable but watermark is stale.
-4. **Reconstruct Local MPT**: Queries `store.GetSubRoot(keyHash, targetInputSize)` for all modified keys and computes the local candidate root:
-   ```go
-   localMapRoot, err := v.mptMgr.CommitWithVersionLocked(modifiedSubRoots, int64(targetInputSize))
-   ```
-5. **Root Equality Assertion**: Asserts `localMapRoot == committedMapRoot`.
-   - If equal: advances the verified Output Log watermark (`KeyVerifierOutputWatermark`, `KeyVerifierLastRoot`) and ratchets the public serving checkpoint (`Serving_CP`), while storage progression remains strictly atomic.
-   - If divergent: enters the state-preserving halt protocol.
+   - **Replay Deduplication Invariant**: On restart or crash replay, any input leaf indices already persisted are filtered out prior to appending to active chunks, ensuring idempotent crash recovery and preventing duplicate index entries from corrupting compact ranges.
+4. **Predict Candidate MPT Root**: Evaluates the modified key sub-roots at the target Input Log size against the local MPT using non-mutating prediction to compute the candidate local `MapRoot`.
+5. **Root Equality Assertion & Commit**: Asserts that the candidate local `MapRoot` equals the operator's committed `MapRoot`.
+   - If equal: commits the MPT mutations, durably advances the verified input and output watermarks on disk, and ratchets the public serving checkpoint (`Serving_CP`).
+   - If divergent: enters the state-preserving halt protocol without advancing verified watermarks or mutating the verified MPT snapshot.
 
 ### 2.3 Root Mismatch Alerting & State-Preserving Halt
-If `localMapRoot != committedMapRoot`, or upstream sync divergence occurs, the verifier immediately executes a coordinated containment response:
+If the candidate local `MapRoot` differs from the committed `MapRoot`, or upstream sync divergence occurs, the verifier immediately executes a coordinated containment response:
 
 1. **Sync Engine Halt**:
    - The background audit sync loop terminates immediately.
-   - Watermarks are **not** advanced in Pebble DB (`KeyVerifierOutputWatermark`, `KeyVerifierInputWatermark`).
+   - Verified watermarks are **not** advanced on disk.
 2. **Forensic State Freeze**:
    - The database files and MPT state are left intact on disk, freezing the exact divergent state for forensic triage and public equivocation reporting.
 3. **Metrics & Structured Logging**:
    - Increments `vindex_verifier_root_mismatches_total`.
    - Sets gauge `vindex_verifier_root_mismatch = 1`.
-   - Emits structured error logs containing the divergent `output_leaf_index`, `target_input_size`, `local_map_root`, and `committed_map_root`.
+   - Emits structured error logs containing the divergent output leaf index, target input size, candidate local root, and committed root.
 4. **Serving Engine (Default Pinned Behavior)**:
-   - In mirror mode (`--serve_mirror=true`), the serving engine does **not** revoke serving state (`publisher.GetServingState()` remains populated with the last verified `Serving_CP`).
+   - In mirror mode (`--serve_mirror=true`), the serving engine does **not** revoke serving state.
    - The server remains pinned to the last verified Output Log checkpoint (`Serving_CP`), continuing to serve lookups with cryptographically valid proofs up to that verified checkpoint.
    - This avoids turning an upstream bug or index corruption into an instant denial of service for downstream readers, preserving read availability and partition resilience.
 5. **Fail-Closed Mode (Opt-In)**:
-   - If configured with `--fail_closed=true`, the verifier immediately revokes serving state via `publisher.SetServingState(nil)`.
+   - If configured with `--fail_closed=true`, the verifier immediately clears the active serving state.
    - Subsequent HTTP lookup requests immediately receive **HTTP 503 Service Unavailable**.
 6. **Health and Status Probes**:
    - `/healthz`: Remains **HTTP 200 OK** as long as the serving replica is alive and serving authentic verified state, preventing external load balancers and Kubernetes container orchestrators from prematurely terminating or de-routing traffic.
@@ -119,33 +115,30 @@ If `localMapRoot != committedMapRoot`, or upstream sync divergence occurs, the v
 
 ### 2.4 Verified Mirror Serving Engine (`--serve_mirror`)
 When deployed with `--serve_mirror=true`, the verifier acts as a production-grade read replica:
-- Exposes standard C2SP query endpoints (`/vindex/lookup/{keyhash}`, `/checkpoint`).
+- Exposes standard C2SP query endpoints (`/vindex/v1/lookup/{keyhash}`, `/vindex/v1/checkpoint`, `/vindex/v1/inputlog_checkpoint`).
 - Lookups are evaluated against the locally verified MPT and Pebble database under reader snapshot isolation.
 - Guarantees that clients querying the mirror never observe unverified data or commitments from an untrusted operator.
-- If upstream divergence occurs, the mirror freezes forward sync but continues serving valid proofs pinned to the last verified Output Log checkpoint (`Serving_CP`), protecting downstream clients from an immediate denial of service while ensuring they never consume unverified or fraudulent results. If the operator configures `--fail_closed=true`, the server instead immediately revokes serving state and returns HTTP 503.
+- If upstream divergence occurs, the mirror freezes forward sync but continues serving valid proofs pinned to the last verified Output Log checkpoint (`Serving_CP`), protecting downstream clients from an immediate denial of service while ensuring they never consume unverified or fraudulent results. If the operator configures `--fail_closed=true`, the server instead immediately clears serving state and returns `HTTP 503`.
 
 ### 2.5 Adversarial Threat Vector Matrix
 
 | Threat Vector | Adversary Action | Detection Mechanism | Verifier Action |
 | :--- | :--- | :--- | :--- |
 | **Publisher Equivocation** | Operator serves conflicting Output Log checkpoints to different mirrors. | Witness signature verification; Merkle consistency proofs between checkpoints. | Background sync halts immediately; alert logged; database frozen; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`). |
-| **Tree Size Rollback** | Operator serves an Output Log checkpoint with `Size < verifiedOutputWatermark`. | Monotonic tree size assertions in `VerifyOnce`. | Sync halts; watermarks frozen; `/healthz` remains HTTP 200; `/readyz`/`/syncz` reports degraded sync; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`). |
-| **Forged Map Root (Omission)** | Operator commits to an invalid `MapRoot` to hide specific records. | Local MPT re-computation from Input Log leaves; assertion `localMapRoot == committedMapRoot`. | Increments mismatch alert (`vindex_verifier_root_mismatch = 1`); freezes disk state; `/readyz`/`/syncz` reports degraded sync; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`); alerts witnesses. |
+| **Tree Size Rollback** | Operator serves an Output Log checkpoint smaller than the previously verified output watermark. | Monotonic tree size assertions during audit poll. | Sync halts; watermarks frozen; `/healthz` remains HTTP 200; `/readyz`/`/syncz` reports degraded sync; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`). |
+| **Forged Map Root (Omission)** | Operator commits to an invalid `MapRoot` to hide specific records. | Local MPT re-computation from Input Log leaves; root equality assertion against the Output Log leaf. | Increments mismatch alert (`vindex_verifier_root_mismatch = 1`); freezes disk state; `/readyz`/`/syncz` reports degraded sync; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`); alerts witnesses. |
 | **Corrupted Input Leaves** | Network attacker or corrupted CDN alters raw log entries. | Upstream tile Merkle verification fails against signed Input Log checkpoint root. | Pipeline aborts tile ingestion; retries from alternative mirrors. |
-| **Invalid Leaf Inclusion** | Operator publishes an Output Log leaf that is not part of the Output Log tree. | `proof.VerifyInclusion` fails against Output Log tree root. | Leaf rejected; sync terminates with `ErrInclusionFailed`. |
+| **Invalid Leaf Inclusion** | Operator publishes an Output Log leaf that is not part of the Output Log tree. | Merkle inclusion proof verification fails against the Output Log tree root. | Leaf rejected; sync terminates with an inclusion verification error. |
 
 ### 2.6 In-Situ Invariants & Performance Optimizations
 
 - **[Correctness Invariant] Strict Root Equality Assertion**:
-  - *Rule*: For every processed Output Log leaf, `localMapRoot` computed from raw Input Log leaves must strictly equal `committedMapRoot` committed in the Output Log leaf payload.
+  - *Rule*: For every processed Output Log leaf, the candidate `MapRoot` computed from raw Input Log leaves must strictly equal the `MapRoot` committed in the Output Log leaf payload.
   - *Rationale*: Guarantees that the operator's index state is 100% faithful to the Input Log.
   - *Consequence ("Or Else")*: Accepting mismatched roots allows an adversary to execute omission attacks or publish fabricated search states without detection.
 
 - **[Correctness Invariant] Non-Monotonic Size Rejection**:
-  - *Rule*: The target Input Log size specified in Output Log leaf N must strictly satisfy:
-    ```text
-    leaf[N].InputLogSize >= leaf[N-1].InputLogSize
-    ```
+  - *Rule*: The target Input Log size specified in each successive Output Log leaf must be monotonically non-decreasing (`leaf[N].InputLogSize >= leaf[N-1].InputLogSize`).
   - *Rationale*: Transparency logs are strictly append-only; historical input tree size cannot shrink.
   - *Consequence ("Or Else")*: An operator could rollback historical entries, truncating index coverage.
 
@@ -156,62 +149,28 @@ When deployed with `--serve_mirror=true`, the verifier acts as a production-grad
 ### 2.7 Operational Runbook: Responding to Mismatches
 When a root mismatch alert fires (`vindex_verifier_root_mismatch == 1` or `/readyz`/`/syncz` returning degraded sync status):
 1. **Triage & Containment**: The auditor sync engine has automatically halted forward sync and frozen database state on disk, while safely continuing to serve cryptographically authentic proofs pinned to `Serving_CP` (unless `--fail_closed=true` was specified). Do not restart the auditor process with cleared storage, as the disk contains crucial forensic data.
-2. **Inspect Structured Logs**: Examine the auditor logs for the `CRITICAL ROOT MISMATCH DETECTED` entry to identify the divergent `output_leaf_index`, `target_input_size`, `local_map_root`, and `committed_map_root`.
-3. **Forensic State Extraction**: Inspect local Pebble DB inverted chunks (`'c'`) and compare against raw Input Log leaves in the window `[verifiedInputSize .. targetInputSize)` to determine whether the publisher omitted leaves, altered keys, or encountered a non-deterministic `MapFn` bug.
-4. **Reproduce via Standalone CLI**: Run `vindex-audit --oneshot` with an isolated temporary directory against the target checkpoint to confirm the mismatch is 100% reproducible.
-5. **Publish Equivocation Bundle**: If the MapFn and input log entries are valid, publish the cryptographic proof bundle (signed Output Log checkpoint, leaf inclusion proof, raw leaf payload, signed Input Log checkpoint) to transparency witnesses and public coordination channels.
+2. **Inspect Structured Logs**: Examine the auditor logs for the `CRITICAL ROOT MISMATCH DETECTED` entry to identify the divergent output leaf index, target input size, local root, and committed root.
+3. **Forensic State Extraction**: Inspect local Pebble DB inverted chunks (`'c'`) and compare against raw Input Log leaves across the divergent leaf window to determine whether the publisher omitted leaves, altered keys, or encountered a non-deterministic `MapFn` bug.
+4. **Reproduce via Standalone CLI**: Run `vindex-auditor --oneshot` with an isolated temporary directory against the target checkpoint to confirm the mismatch is 100% reproducible.
+5. **Publish Equivocation Bundle**: If the `MapFn` and input log entries are valid, publish the cryptographic proof bundle (signed Output Log checkpoint, leaf inclusion proof, raw leaf payload, signed Input Log checkpoint) to transparency witnesses and public coordination channels.
 
-### 2.8 Go Interfaces & Public Types
+### 2.8 Auditor & Mirror Contract
 
-```go
-package auditor
+The auditor subsystem provides continuous full-log verification and optional read-mirror serving:
 
-import (
-	"context"
-	"crypto/sha256"
-	"net/http"
-	"time"
-
-	"github.com/transparency-dev/formats/log"
-	"golang.org/x/mod/sumdb/note"
-)
-
-// Auditor audits the Output Log against the Input Log and optionally serves verified lookups.
-type Auditor struct {
-	cfg        *AuditorConfig
-	inputLog   TesseraClient
-	outputLog  TesseraClient
-	store      IndexStore
-	mptMgr     MPTManager
-	publisher  Publisher
-	httpServer *http.Server
-}
-
-// AuditorConfig configures auditor and mirror parameters.
-type AuditorConfig struct {
-	InputLogURL       string
-	InputLogOrigin    string
-	InputLogVerifier  note.Verifier
-	OutputLogURL      string
-	OutputLogOrigin   string
-	OutputLogVerifier note.Verifier
-	OutputLogPolicy   string // C2SP tlog-policy enforcing origin and witness quorum
-	MapWasmPath       string
-	DataDir           string
-	ServeMirror       bool
-	FailClosed        bool
-	ListenAddr        string
-	PollInterval      time.Duration
-}
-
-// RootMismatchError provides structured diagnostics when verification fails.
-type RootMismatchError struct {
-	OutputIndex   uint64
-	InputSize     uint64
-	LocalRoot     [sha256.Size]byte
-	CommittedRoot [sha256.Size]byte
-}
-```
+- **Inputs**:
+  - Output Log URL, origin, verifier, and optional C2SP `tlog-policy` witness policy.
+  - Input Log URL, origin, and verifier (used strictly to verify embedded Input Log checkpoints and fetch tiles; never polled for `/checkpoint`).
+  - Compiled WASM `MapFn` module.
+  - Local Pebble DB and MPT storage directories.
+  - Mirror serving CLI flags (`--serve_mirror`, `--fail_closed`, `--listen`).
+- **Outputs**:
+  - Continuous verification status, Prometheus telemetry (`vindex_verifier_root_mismatch`), and `/readyz` / `/syncz` diagnostics.
+  - Optional verified C2SP read endpoints (`/vindex/v1/lookup/{keyhash}`, `/vindex/v1/checkpoint`, `/vindex/v1/inputlog_checkpoint`) pinned to the latest verified Output Log commitment.
+- **Safety Guarantees**:
+  - Never signs or publishes Output Log checkpoints.
+  - Never exposes unverified state to mirror readers: candidate MPT roots are predicted and asserted against the Output Log leaf commitment before mutating the verified MPT or advancing `Serving_CP`.
+  - Immediately halts forward sync and preserves forensic state on any checkpoint signature failure, tree size regression, inclusion proof failure, or `MapRoot` mismatch.
 
 ---
 
@@ -228,6 +187,6 @@ type RootMismatchError struct {
 - **Chosen Design**: State-preserving halt: the verifier freezes all Pebble DB and MPT files in-place, writes structured diagnostics to `/readyz` (or `/syncz`), keeps `/healthz` HTTP 200, and halts forward sync while continuing to serve pinned `Serving_CP`.
 
 ### 3.3 Aggressive 503 Circuit-Breaking vs. Pinned Last-Known-Good Serving
-- **Proposed**: Having the verifier immediately revoke serving state (`SetServingState(nil)`) and return HTTP 503 on all queries upon encountering a root mismatch or sync divergence.
+- **Proposed**: Having the verifier immediately clear the active serving state and return `HTTP 503` on all queries upon encountering a root mismatch or sync divergence.
 - **Operational & Availability Rejection**: In production mirror deployments, upstream glitches, signer delays, or isolated bugs converted immediately into total denial of service for all downstream applications. Downstream systems were starved of verified answers despite holding thousands of previously authenticated entries. Furthermore, load balancers de-routed or killed healthy mirrors due to failing health checks.
 - **Chosen Design**: Safe state-preserving halt with pinned last-known-good serving: background sync halts immediately, disk state is frozen for forensic triage, and alerts fire, while the serving engine safely continues answering lookups pinned to the last verified checkpoint (`Serving_CP`). Deployments strictly requiring total shutdown can opt into hard revocation via `--fail_closed=true`.

@@ -23,8 +23,8 @@ In an LSM-tree database (such as Pebble), storing this mapping naively leads to 
   - Provide O(1) active chunk location for batch appends regardless of key depth or historical occurrence count.
   - Eliminate disk I/O on missing keys via full-table 33-byte prefix Bloom filters.
   - Maximize storage density by encoding occurrence indices as 16-bit relative offsets within 64K chunks.
-  - Guarantee zero-overhead sub-root point-in-time calculation (`GetSubRoot`) to support lock-free MPT prediction and Zero-WAL crash recovery.
-  - Enforce synchronous durability (`pebble.Sync`) before state commitment handoff to guarantee persisted KV storage watermark >= Output_Size.
+  - Guarantee zero-overhead point-in-time mini-log sub-root calculation to support non-blocking MPT prediction and Zero-WAL crash recovery.
+  - Enforce synchronous durability before state commitment handoff to guarantee `KV_CP.Size >= Output_CP.InputSize`.
 - **Non-Goals**:
   - **No Distributed Storage**: Operates strictly as a single-host embedded database; distributed clustering and remote RPC storage backends are explicitly out of scope.
   - **No Cross-Key Range Scans**: Supports point queries by exact 32-byte key hash; lexical prefix scanning across different keys is out of scope for v1.
@@ -34,7 +34,7 @@ In an LSM-tree database (such as Pebble), storing this mapping naively leads to 
 - **Storage Engine**: Embedded [Pebble](https://github.com/cockroachdb/pebble) LSM-tree with a custom 33-byte prefix splitter and 10-bit Bloom filter policy.
 - **Merkle Tree Utilities**: RFC 6962 tree hashing and compact Merkle range representation via `github.com/transparency-dev/merkle`.
 - **Known Pain Points ("Warts and All")**:
-  - **Chunk Boundary Rollovers**: Every 65,536th occurrence of a key forces an active chunk rollover: the full chunk is frozen as immutable historical state and a new chunk is allocated with an updated compact range.
+  - **Window Boundary Rollovers**: Crossing a global 65,536-leaf Input Log window boundary (`chunkNum = leafIdx / 65536`) for a key seals the previous chunk as immutable historical state and allocates a new chunk containing the updated prefix compact range (`CoveredSize` and `CompactHashes`).
   - **Monotonic Key Growth**: Because records are never deleted or tombstoned, the total number of distinct search keys in the Pebble keyspace grows monotonically with the log.
   - **Backward Multi-Page Retrieval**: Hot keys with deep history cannot return all occurrences in a single HTTP response; client readers must page backward chunk by chunk using `before=X`.
 
@@ -43,21 +43,23 @@ In an LSM-tree database (such as Pebble), storing this mapping naively leads to 
 ## 2. Detailed Design
 
 ### 2.1 Logical Model & Inverted Chunk Key Layout
-To eliminate write amplification, each key's mini-log is partitioned into logical chunks of 65,536 entries (`ChunkSize = 65536`). 
+To eliminate write amplification and support direct window-based seeks, the Input Log leaf index space is partitioned into fixed global windows of 65,536 leaves (`ChunkSize = 65536`). Each occurrence at absolute Input Log index `leafIdx` maps deterministically to:
+- **Chunk Number**: `chunkNum = leafIdx / 65536`
+- **Relative Offset**: `relOffset = uint16(leafIdx % 65536)`
 
-Chunk keys are 41 bytes: `'c'` (1 byte) + `KeyHash` (32 bytes) + `^BigEndian(chunkNum)` (8 bytes, bitwise inverted so newer chunks sort first):
+Chunks are only allocated for windows in which a key actually occurs. Chunk keys are 41 bytes: `'c'` (1 byte) + `KeyHash` (32 bytes) + `^BigEndian(chunkNum)` (8 bytes, bitwise inverted so newer chunks sort first):
 
 ```text
 Key (41 bytes) = [Prefix 'c' (1B)] + [KeyHash (32B)] + [^BigEndian(chunkNum) (8B)]
 ```
-where `^BigEndian(chunkNum) = math.MaxUint64 - chunkNum`.
+where `^BigEndian(chunkNum) = 0xFFFFFFFFFFFFFFFF - chunkNum`.
 
 #### The Inverted Ordering Mechanism:
 Because chunk numbers are bitwise-inverted, the **highest (newest) chunk has the lexicographically smallest key** among all chunks for that key prefix.
-- Pebble's custom `Comparer` splits keys at byte 33 (`'c' + KeyHash`).
+- Pebble's custom key comparer splits keys at byte 33 (`'c' + KeyHash`).
 - Full-table 10-bit Bloom filters are indexed on this 33-byte prefix across all SSTable levels.
-- Calling `iter.SeekPrefixGE('c' + KeyHash)` achieves two simultaneous benefits:
-  1. If the key does not exist, the Bloom filter prunes all SSTables, returning `iter.Valid() == false` with **zero disk I/O**.
+- Performing a prefix-bounded seek on `'c' + KeyHash` achieves two simultaneous benefits:
+  1. If the key does not exist, the Bloom filter prunes all SSTables, returning empty with **zero disk I/O**.
   2. If the key exists, the iterator lands **directly on the latest active chunk in O(1) time**, completely skipping all older historical chunks.
 
 > [!NOTE]
@@ -67,68 +69,68 @@ Because chunk numbers are bitwise-inverted, the **highest (newest) chunk has the
 > [!NOTE]
 > **Open Design Discussion**: See [Chunk-Aligned Paging](../../docs/DESIGN_DISCUSSIONS.md#2-chunk-aligned-paging-eliminating-dynamic-merkle-hashing) for research on aligning response boundaries to chunks to return precomputed compact ranges in O(1) and eliminate on-the-fly leaf hashing.
 
-Values store a cumulative RFC 6962 compact range covering all prior chunks, plus a dense array of 16-bit relative offsets for the current chunk:
+Values store a cumulative RFC 6962 compact range covering all occurrences of that key across prior chunks (`chunk < chunkNum`), plus a dense array of 16-bit relative offsets for occurrences within the current 65,536-leaf window (`chunkNum`):
 
 ```text
-CoveredSize uint64 (8 bytes, BigEndian) || CompactHashes (32 bytes * bits.OnesCount64(CoveredSize)) || RelativeIndices (uint16, 2 bytes BigEndian * N)
+CoveredSize uint64 (8 bytes, BigEndian) || CompactHashes (32 bytes * popcount(CoveredSize)) || RelativeIndices (uint16, 2 bytes BigEndian * N)
 ```
 
 | Byte Offset | Field Name | Data Type | Description |
 | :--- | :--- | :--- | :--- |
-| `0` | `CoveredSize` | `uint64` (8 bytes, BigEndian) | Total number of entries in all prior chunks (`chunkNum * 65536`). |
-| `8` | `CompactHashes` | `[K][32]byte` | Compact range hashes committing to the prior `CoveredSize` leaves, where `K = bits.OnesCount64(CoveredSize)` (32 bytes * K). |
-| `8 + 32*K` | `RelativeIndices` | `[]uint16` (2 bytes BigEndian * N) | Dense 2-byte offsets: `uint16(index % 65536)` for each occurrence in this chunk. |
+| `0` | `CoveredSize` | `uint64` (8 bytes, BigEndian) | Actual cumulative number of occurrences for this key across all prior chunks. |
+| `8` | `CompactHashes` | `[K][32]byte` | Compact range hashes committing to the prior `CoveredSize` occurrences of this key, where `K = popcount(CoveredSize)` (32 bytes * K). |
+| `8 + 32*K` | `RelativeIndices` | `[]uint16` (2 bytes BigEndian * N) | Dense 2-byte offsets: `uint16(leafIdx % 65536)` for each occurrence of this key within global window `chunkNum` (`absIdx = chunkNum*65536 + uint64(relOffset)`). |
 
-#### Mini-Log Leaf Hashing:
-Each mini-log entry commits to an occurrence index in the Input Log. Mini-log leaf hashing strictly adheres to RFC 6962:
-- The absolute occurrence index is encoded as an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00.
-- Interior nodes are hashed with RFC 6962 node domain separator 0x01.
-- When an active chunk reaches capacity (`ChunkSize = 65536`), all its relative indices are converted to absolute indices, hashed as RFC 6962 leaves with domain separator 0x00, and appended to the chunk's running compact range.
+#### Per-Leaf Key Deduplication & Mini-Log Leaf Hashing:
+Each mini-log entry commits to a distinct Input Log leaf index where the search key occurred:
+- **Per-Leaf Deduplication**: If a single Input Log leaf emits the same `KeyHash` multiple times (e.g., identical domain in Subject CN and SAN, or parent domain expansion from sibling subdomains), batch indexing sorts and deduplicates `(KeyHash, leafIdx)` pairs. Each `leafIdx` is appended at most once to a key's mini-log, ensuring strictly increasing indices within every chunk (`relOffset_0 < relOffset_1 < ...`).
+- **Mini-Log Leaf Hashing**: The absolute occurrence index (`absIdx = chunkNum*65536 + uint64(relOffset)`) is encoded as an 8-byte big-endian integer and hashed with RFC 6962 leaf domain separator `0x00`.
+- **Interior Nodes & Chunk Rollover**: Interior nodes are hashed with RFC 6962 node domain separator `0x01`. When a new occurrence for a key falls into a higher global 65,536-leaf window, the previous chunk is sealed and a new chunk is initialized with `CoveredSize` and `CompactHashes` snapshotted from the key's running compact range across all prior chunks.
 
 #### Delimitless Deserialization:
-Because the number of compact range hashes is mathematically determined by `bits.OnesCount64(CoveredSize)`, the boundary between the compact range and the relative indices is computed dynamically in memory:
-```go
-compactBytesLen := 8 + bits.OnesCount64(coveredSize) * 32
-relativeOffsets := value[compactBytesLen:]
-```
-This layout eliminates field delimiters, length prefixes, and serialization padding, achieving optimal binary packing density.
+Because the number of compact range hashes is mathematically determined by the population count (number of set bits) of `CoveredSize` (`K = popcount(CoveredSize)`), the byte offset where `RelativeIndices` begins is always `8 + 32*K`. This layout eliminates field delimiters, length prefixes, and serialization padding, achieving optimal binary packing density.
 
 ### 2.3 Two-Generational Active Chunk Cache
-To avoid repeatedly reading active chunk descriptors from Pebble during sequential batching, the store maintains an in-memory two-generational chunk cache:
-- **`currentCache`**: Stores chunk descriptors accessed or modified during the active batch.
-- **`previousCache`**: Retains chunk descriptors from the immediately preceding batch.
-- **Eviction**: On batch commit, `previousCache` is replaced by `currentCache`, and a new `currentCache` is initialized. Bounded at 32,768 entries, this cache absorbs repeated writes to hot keys, eliminating >90% of Pebble block cache read I/O during high-throughput ingestion.
+To avoid repeatedly reading active chunk descriptors from Pebble during sequential batching, the store maintains a bounded in-memory two-generational chunk cache:
+- **Current Generation**: Stores chunk descriptors accessed or modified during the active batch.
+- **Previous Generation**: Retains chunk descriptors from the immediately preceding batch.
+- **Eviction**: When the current generation reaches capacity (scaling to hundreds of thousands of hot keys), the previous generation is replaced by the current generation, and a fresh current generation map is allocated. This absorbs repeated writes to hot keys without LRU lock contention, eliminating >90% of Pebble block cache read I/O during high-throughput ingestion.
 
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
 - **[Correctness Invariant] Synchronous Persistence Barrier**:
-  - *Rule*: `store.WriteBatch` must execute `pebble.Sync` and durably flush all modified `'c'` records and metadata (persisted KV storage watermark) to disk before returning to the Coordinator.
-  - *Rationale*: Enforces `persisted KV storage watermark >= Output_Size` across all crash and power-loss scenarios.
+  - *Rule*: Within a target sync cycle, intermediate commit slabs may write to Pebble without an immediate `fsync`, but the final slab reaching `Target_CP.Size` (or an explicit flush barrier) must execute a durable disk sync to flush all modified `'c'` records and metadata (`KV_CP`) to disk before returning to the Coordinator for Output Log publication.
+  - *Rationale*: Enforces `KV_CP.Size >= Output_CP.InputSize` across all crash and power-loss scenarios while amortizing disk `fsync` overhead across multi-slab sync cycles.
   - *Consequence ("Or Else")*: If the node crashed after appending a state commitment to the Output Log but before Pebble synced to disk, the published root would reference missing KV chunks. The node would be permanently unable to produce inclusion proofs for its own witnessed checkpoints.
 
-- **[Correctness Invariant] Point-in-Time Sub-Root Isolation (`GetSubRoot`)**:
+- **[Correctness Invariant] Per-Leaf Key Deduplication**:
+  - *Rule*: The KV store must deduplicate identical `(KeyHash, leafIdx)` emissions before appending relative offsets or updating the key's running compact range.
+  - *Rationale*: Guarantees that a key's mini-log contains each matching Input Log leaf index at most once in strictly ascending order.
+  - *Consequence ("Or Else")*: Duplicate relative offsets for the same leaf would be appended to chunk records, corrupting the mini-log compact range and violating pagination cursor monotonicity (`before=X`).
+
+- **[Correctness Invariant] Point-in-Time Sub-Root Isolation**:
   - *Rule*: When computing or reconstructing sub-roots for target Input Log size `S`, the storage engine strictly evaluates records with `index < S`, ignoring any chunks or indices written ahead of `S`.
   - *Rationale*: Allows startup recovery and reader lookups to safely inspect the database even if the KV store has synced batches ahead of the active serving state.
-  - *Consequence ("Or Else")*: Query responses would leak un-witnessed or in-flight indices, violating reader snapshot isolation.
+  - *Consequence ("Or Else")*: Query responses would leak unwitnessed or in-flight indices, violating reader snapshot isolation.
 
 - **[Performance Optimization] Bitwise Key Inversion (`^chunkNum`) & 33-Byte Bloom Filters**:
   - *Mechanism*: Bitwise inversion places the active chunk first under the prefix; the 33-byte prefix Bloom filter prunes non-existent keys.
   - *Impact*: Delivers true O(1) active chunk seeks, eliminating the 7.5x append latency penalty observed on deep keys in forward-ordered layouts.
 
 - **[Performance Optimization] 16-Bit Relative Offset Encoding**:
-  - *Mechanism*: Stores index offsets as `uint16(index % 65536)` instead of 8-byte integers.
-  - *Impact*: Saves 75% disk storage on index occurrence lists within each 64K chunk.
+  - *Mechanism*: Stores index offsets as `uint16(leafIdx % 65536)` within each global 64K leaf window instead of 8-byte integers.
+  - *Impact*: Saves 75% disk storage on index occurrence lists within each 64K window chunk.
 
 - **[Performance Optimization] Two-Generational Active Chunk Cache**:
-  - *Mechanism*: Caches active chunk structs across sequential batches.
+  - *Mechanism*: Caches active chunk descriptors across sequential batches.
   - *Impact*: Cuts Pebble block read I/O by >90% during sustained high-concurrency ingestion.
 
 - **[Performance Optimization] Bounded Backward Lookup & Compact Range Reuse**:
-  - *Mechanism*: Seeks directly to `maxChunkNum = (upperBound - 1) / ChunkSize`, reads only enough backward chunks to satisfy `limit`, and seeds `prefix-compact-range-v1` from the oldest evaluated chunk's `rec.CompactHashes` + `rec.CoveredSize` rather than re-hashing historical indices from scratch.
+  - *Mechanism*: Seeks directly to the highest valid chunk (`(upperBound - 1) / 65536`), reads only enough backward chunks to satisfy the requested page `limit`, and seeds `prefix-compact-range-v1` from the oldest evaluated chunk's stored `CompactHashes` and `CoveredSize` rather than re-hashing historical indices from scratch.
   - *Impact*: Bounds read latency and memory allocations strictly to O(limit), eliminating full-history scans and CPU hash loops across deep keys.
 
 - **[Performance Optimization] Key-Partitioned In-Memory Mini-Log Hashing**:
-  - *Mechanism*: Partitions distinct keys within each incoming mapped batch across a worker goroutine pool inside `IndexMappedBatch`. Workers independently compute `CompactRange.Append`, `runningRange.Root()`, and serialized `ChunkRecord` values in parallel in pure memory. The committer sequentially applies the precomputed writes into an atomic `pebble.Batch` via `pebble.Sync`.
+  - *Mechanism*: Partitions distinct keys within each incoming mapped batch across a worker pool. Workers independently compute mini-log compact range updates, sub-roots, and serialized chunk records in parallel in memory, while the committer sequentially applies the precomputed writes into an atomic Pebble batch.
   - *Impact*: Eliminates single-thread CPU bottlenecks on RFC 6962 mini-log Merkle hashing during high-throughput ingestion, preventing upstream pipeline backpressure on mapping workers while keeping database writes strictly sequential.
 
 ### 2.5 Storage Engine Contract
@@ -136,17 +138,17 @@ To avoid repeatedly reading active chunk descriptors from Pebble during sequenti
 The storage subsystem manages physical chunk persistence, mini-log compact ranges, and point lookups:
 
 - **Physical Format & Key Layout**:
-  - Chunks are keyed by 41 bytes: `'c'` (1 byte) + `KeyHash` (32 bytes) + `^BigEndian(chunkNum)` (8 bytes bitwise inverted).
+  - Chunks are partitioned by global 65,536-leaf Input Log windows (`chunkNum = leafIdx / 65536`) and keyed by 41 bytes: `'c'` (1 byte) + `KeyHash` (32 bytes) + `^BigEndian(chunkNum)` (8 bytes bitwise inverted).
   - Bitwise inversion places the newest active chunk first under the key prefix, enabling true O(1) active chunk seeks with 33-byte prefix Bloom filtering.
-  - Chunk values use a delimitless binary serialization format: an 8-byte big-endian `CoveredSize`, followed by RFC 6962 compact range hashes committing to prior chunks, followed by dense 2-byte relative index offsets (`uint16(index % 65536)`).
+  - Chunk values use a delimitless binary serialization format: an 8-byte big-endian `CoveredSize` (total occurrences for that key across prior chunks), followed by RFC 6962 compact range hashes committing to those `CoveredSize` prior occurrences, followed by dense 2-byte relative index offsets (`uint16(leafIdx % 65536)`).
 - **Write Contract & Rollover**:
-  - Monotonic batch writes accumulate leaf occurrences and commit synchronously to disk.
-  - When an active chunk reaches 65,536 entries (`ChunkSize = 65536`), it is frozen into an immutable historical chunk, its relative offsets are accumulated into the running compact range, and a new active chunk is allocated.
+  - Monotonic batch writes deduplicate `(KeyHash, leafIdx)` pairs per leaf, accumulate occurrences across multi-tile commit slabs, and execute a durable disk sync at the target checkpoint boundary before Output Log commitment.
+  - When an occurrence for a key crosses into a new global 65,536-leaf window, the prior chunk is sealed as immutable historical state and a new active chunk is allocated with the cumulative `CoveredSize` and `CompactHashes` of all prior occurrences.
 - **Lookup Contract & Bounded Backward Traversal**:
-  - Point lookups retrieve occurrence indices strictly before the effective upper bound `upperBound = min(before, maxInputLogSize)` up to `limit` entries.
-  - **Direct Seek**: Computes `maxChunkNum = (upperBound - 1) / ChunkSize` and seeks directly to `EncodeChunkKey(keyHash, maxChunkNum)`, landing on the newest valid chunk without scanning preceding or future chunks.
-  - **Bounded Reverse Traversal**: Iterates forward through inverted keys (`^chunkNum`), moving backward chronologically. Accumulates relative offsets converted to absolute indices and terminates iteration immediately once `totalMatched == limit`. Older historical chunks are never read or deserialized.
-  - **O(1) Compact Range Prefix Reuse**: If older historical entries remain, the prefix compact range is constructed directly from the oldest evaluated chunk's `rec.CompactHashes` and `rec.CoveredSize` (which commit to all preceding chunks in O(1)), plus any leftover intra-chunk relative indices below the split boundary. Historical chunks from leaf 0 are never re-scanned or re-hashed.
+  - Point lookups retrieve occurrence indices strictly before the effective upper bound (`min(before, Serving_CP.InputSize)`) up to `limit` entries.
+  - **Direct Seek**: Computes the target window (`(upperBound - 1) / 65536`) and seeks directly to that inverted chunk key, landing on the newest valid chunk without scanning preceding or future chunks.
+  - **Bounded Reverse Traversal**: Iterates forward through inverted keys (`^chunkNum`), moving backward chronologically. Accumulates relative offsets converted to absolute indices and terminates iteration immediately once `limit` matching entries are collected. Older historical chunks are never read or deserialized.
+  - **O(1) Compact Range Prefix Reuse**: If older historical entries remain, the prefix compact range is constructed directly from the oldest evaluated chunk's stored `CompactHashes` and `CoveredSize` (which commit to all preceding chunks in O(1)), plus any leftover intra-chunk relative indices below the page split boundary. Historical chunks from leaf 0 are never re-scanned or re-hashed.
 
 ---
 
@@ -183,8 +185,8 @@ Extensive empirical benchmarking across storage prototypes was conducted in the 
 
 *Conclusion*: `inverted_prefix_chunk_scan` achieved a **+48.4% to +60.5% write throughput improvement** on medium and high cardinality workloads, reduced P99 latency by over 50%, and maintained true O(1) active chunk seeks.
 
-### 3.2 Transient Write-Ahead Log ('w' Prefix & WalReaper) vs. Zero-WAL Direct Commits
-- **Proposed**: Staging mapped records under a transient `'w'` prefix before an asynchronous background worker (`WalReaper`) converted them into inverted chunks (`'c'`).
+### 3.2 Transient Write-Ahead Log ('w' Prefix) vs. Zero-WAL Direct Commits
+- **Proposed**: Staging mapped records under a transient `'w'` prefix before an asynchronous background worker converted them into inverted chunks (`'c'`).
 - **Empirical Rejection**: Testing on Go SumDB (61.7M entries) demonstrated that the staging WAL doubled disk write amplification, caused heavy LSM compaction churn, and spiked P99 read latency to over 1,200ms.
 - **Chosen Design**: Zero-WAL direct inverted chunk commit: batches append directly to `'c'` records and sync in a single atomic Pebble batch.
 
@@ -193,12 +195,12 @@ Extensive empirical benchmarking across storage prototypes was conducted in the 
 - **Theoretical & Architectural Rejection**:
   - Remote RPC roundtrips introduce 5–20ms network latency per batch seek, destroying ingestion throughput.
   - The authenticated Sparse Merkle Patricia Trie (MPT) already requires single-host RAM/mmap locality; placing the storage engine on a distributed cluster introduces operational complexity without solving tree state replication.
-- **Chosen Design**: Single-host embedded Pebble LSM engine encapsulated behind the `IndexStore` interface.
+- **Chosen Design**: Single-host embedded Pebble LSM engine.
 
 ### 3.4 Concurrent Database Iterators vs. Key-Partitioned In-Memory Hashing
-- **Proposed (Concurrent Database Iterators)**: Partition keys across worker goroutines where each worker manages an independent `pebble.Iterator` to read, mutate, and write chunks concurrently to disk.
+- **Proposed (Concurrent Database Iterators)**: Partition keys across worker goroutines where each worker manages an independent database iterator to read, mutate, and write chunks concurrently to disk.
 - **Empirical Rejection**: Concurrent Pebble iterators introduced lock contention, allocator overhead, and cache thrashing, yielding only an isolated ~14% speedup on 4 workers while degrading performance beyond 8 workers. Furthermore, concurrent disk I/O competed directly with background LSM compactions.
 - **Adopted Design (Key-Partitioned In-Memory Hashing)**: Decouples CPU-bound Merkle calculations from I/O-bound database mutations:
-  1. *Parallel In-Memory Hashing*: Distinct keys in each batch are distributed across worker goroutines. Each worker computes `runningRange.Append(LeafHash)` and serializes `ChunkRecord` entries independently in pure memory with zero shared state.
-  2. *Sequential Database Commit*: The precomputed key-value writes are merged into a single atomic `pebble.Batch` and committed sequentially with `pebble.Sync`.
+  1. *Parallel In-Memory Hashing*: Distinct keys in each batch are distributed across worker goroutines. Each worker computes compact range appends and serializes chunk entries independently in pure memory with zero shared state.
+  2. *Sequential Database Commit*: The precomputed key-value writes are merged into a single atomic Pebble batch and committed sequentially.
 - **Impact**: Delivers linear multi-core scaling for CPU-intensive mini-log hashing on high-throughput workloads, eliminating pipeline stalls while preserving zero-contention, deterministic single-threaded database durability.

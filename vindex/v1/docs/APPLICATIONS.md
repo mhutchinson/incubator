@@ -16,8 +16,8 @@ The core security property of a Claim Subject Map is **Discoverability**: a veri
 ### 0.1 Mental Models: The Phonebook and the Fanout Multiplier
 - **The "Universal Phonebook"**: VIndex is agnostic to the internal structure of the underlying log payload. It does not parse or interpret payloads during serving; it only requires an unambiguous canonical preimage (the "name" in the phonebook) and index pointers to construct authenticated inclusion proofs.
 - **The "Fanout Multiplier"**: Different ecosystems exhibit radically different mapping cardinality:
-  - In **Go SumDB**, each entry maps to exactly one module path (strict 1-to-1 mapping).
-  - In **Certificate Transparency (CT)**, a single certificate frequently contains dozens of Subject Alternative Names (1-to-N fanout). A single certificate can map to 50+ domain keys, multiplying Pebble write volume and requiring strict host-side deduplication.
+  - In **Go SumDB**, each entry maps to **at most one** module path (`0..1` keys per leaf; pseudo-versions are filtered out and emit zero keys, while tagged release entries emit one deduplicated module path).
+  - In **Certificate Transparency (CT)**, a single certificate frequently contains dozens of Subject Alternative Names and expands each domain up its parent hierarchy to the eTLD+1 (1-to-N fanout). A single certificate can map to 50+ domain keys, multiplying Pebble write volume and requiring strict host-side per-leaf deduplication.
 
 ---
 
@@ -31,8 +31,8 @@ To guarantee that verifiers can independently discover records, the indexer (`Ma
   - *Consequence ("Or Else")*: The client will query an unpopulated key hash and receive a valid cryptographic non-inclusion proof, falsely concluding that no records exist for their identity.
 
 - **[Correctness Invariant] Strict Lexicographical Sorting & Deduplication**:
-  - *Rule*: When a single leaf maps to multiple search keys (1-to-N fanout), the host runtime must sort extracted key hashes with `bytes.Compare` and deduplicate them using `slices.Compact`. A leaf index is recorded at most once per key hash.
-  - *Rationale*: Certificates frequently duplicate domains across the Common Name and Subject Alternative Name fields.
+  - *Rule*: When a single leaf maps to multiple search keys (1-to-N fanout), the host runtime must sort and deduplicate `(KeyHash, LeafIdx)` pairs so a leaf index is recorded at most once per key hash.
+  - *Rationale*: Certificates frequently duplicate domains across the Common Name, Subject Alternative Name fields, and shared parent suffixes during eTLD+1 expansion, while SumDB leaves repeat the module path across version and `/go.mod` lines.
   - *Consequence ("Or Else")*: Duplicate relative offsets would be appended to storage chunks, producing corrupted compact ranges and wasting storage.
 
 - **[Performance Optimization] Preimage Preservation & Host SIMD Hashing**:
@@ -43,9 +43,9 @@ To guarantee that verifiers can independently discover records, the indexer (`Ma
 
 | Application | Claim Subject Type | Canonical Preimage Extraction Profile (Guest WASM) | Host KeyHash Formula | Cardinality Profile |
 | :--- | :--- | :--- | :--- | :--- |
-| **Certificate Transparency** | Domain Name | Strip trailing dot (`.`); ASCII case-fold (`strings.ToLower`); IDNA2008 / UTS #46 Punycode (`xn--...`). | `SHA256(canonical_domain_ascii_bytes)` | 1-to-N (1 to 100+ keys/leaf) |
-| **Merkle Tree Certificates** | Domain Name | Strict lower-case Punycode domain string (same as CT). | `SHA256(canonical_domain_ascii_bytes)` | 1-to-N (typically 1 to 5 keys/leaf) |
-| **Go Software Supply Chain** | Module Path | Canonical module path casing; standard Go toolchain module path escaping (`golang.org/x/mod/module.EscapePath`). | `SHA256(canonical_module_path_bytes)` | 1-to-1 (exactly 1 key/leaf) |
+| **Certificate Transparency** | Domain Name & Parent Suffixes | Strip leading wildcard (`*.` / `*`) and trailing dot (`.`); ASCII lowercase; IDNA2008 / UTS #46 Punycode (`xn--...`); expand parent domain suffixes down to the registrable eTLD+1 boundary. | `SHA256(canonical_domain_ascii_bytes)` | 1-to-N (1 to 100+ keys/leaf) |
+| **Merkle Tree Certificates** | Domain Name & Parent Suffixes | Same as CT: strip leading wildcard and trailing dot, lowercase Punycode, and expand parent suffixes down to the eTLD+1 boundary. | `SHA256(canonical_domain_ascii_bytes)` | 1-to-N (typically 1 to 15 keys/leaf) |
+| **Go Software Supply Chain** | Module Path | Filter out untagged pseudo-versions (`vX.Y.Z-yyyymmddhhmmss-abcdefabcdef`); apply canonical Go module path case-escaping (`!` + lowercase for uppercase letters). | `SHA256(canonical_module_path_bytes)` | At most 1-to-1 (`0..1` keys/leaf) |
 | **Sigstore** | Artifact Digest | Lowercase hex string prefixed with algorithm: `sha256:<64_hex_digits>`. | `SHA256("sha256:" + lowercase_hex)` | 1-to-N (digest + identities) |
 | **Sigstore** | Signer Identity | Lowercase, whitespace-trimmed OIDC email or URI string. | `SHA256(canonical_identity_bytes)` | 1-to-N (digest + identities) |
 | **Sigsum** | Ed25519 Key | Raw 32-byte public key bytes. | `SHA256(raw_pubkey_bytes)` | 1-to-1 (exactly 1 key/leaf) |
@@ -62,21 +62,22 @@ To guarantee that verifiers can independently discover records, the indexer (`Ma
   - Primary production logs: Google Argon, Let's Encrypt Oak, Cloudflare Nimbus.
 
 #### The Problem
-In Certificate Transparency, domain owners must monitor all certificates issued for their domains to detect unauthorized issuance or compromised Certificate Authorities (CAs). Today, monitors face an untenable dilemma: either download and parse terabytes of massive CT logs, or trust centralized third-party search engines (like `crt.sh`), which can omit records inadvertently or maliciously without cryptographic detection.
+In Certificate Transparency, domain owners must monitor all certificates issued for their domains (and any subdomains beneath their registered domain) to detect unauthorized issuance or compromised Certificate Authorities (CAs). Today, monitors face an untenable dilemma: either download and parse terabytes of massive CT logs, or trust centralized third-party search engines (like `crt.sh`), which can omit records inadvertently or maliciously without cryptographic detection.
 
 #### Input Log Format & Payloads
 CT logs store RFC 6962 / `static-ct` entries consisting of serialized X.509 certificates and precertificates (`x509_entry` / `precert_entry`). Leaf payloads contain ASN.1 DER-encoded `TBSCertificate` structures with Subject Common Names (CN) and Subject Alternative Name (SAN) extensions (`dNSName`).
 
 #### MapFn Key Extraction & Normalization
-The WASM `MapFn` parses the DER certificate or precertificate, extracts the Subject CN and all SAN `dNSName` entries, and outputs canonical domain preimages:
-1. Strip trailing dot: `example.com.` -> `example.com`
-2. ASCII case-folding: `strings.ToLower(domain)`
-3. Convert Internationalized Domain Names (IDN) to Punycode via IDNA2008: `bücher.example` -> `xn--bcher-kva.example`
+The WASM `MapFn` parses the DER certificate or precertificate, extracts the Subject CN and all SAN `dNSName` entries, normalizes each domain, and expands parent domain suffixes:
+1. Strip leading wildcard prefix (`*.example.com` or `*example.com` -> `example.com`) and trailing dot (`example.com.` -> `example.com`).
+2. ASCII lowercase normalization.
+3. Convert Internationalized Domain Names (IDN) to Punycode via IDNA2008: `bücher.example` -> `xn--bcher-kva.example`.
+4. **Parent Domain Suffix Expansion (up to eTLD+1)**: Determine the registrable domain via the Public Suffix List (eTLD+1) and emit the full domain along with every intermediate parent domain down to the eTLD+1 (e.g., `a.b.example.co.uk` emits `a.b.example.co.uk`, `b.example.co.uk`, and `example.co.uk`, stopping before the public suffix `co.uk`).
 
-Each leaf produces a 1-to-N fanout mapping to index all associated domain names.
+Each leaf produces a 1-to-N fanout mapping, and duplicate emissions within the same leaf (such as two SANs sharing `example.com`) are deduplicated by the host KV store so each certificate index is recorded at most once per domain key.
 
 #### Verifier Query & Verification Flow
-1. **Query**: A domain owner queries `GET /vindex/lookup/{KeyHash}?before=X&limit=M` where `KeyHash = SHA256("example.com")`.
+1. **Query**: A domain owner queries `GET /vindex/v1/lookup/{KeyHash}?before=X&limit=M` where `KeyHash = SHA256("example.com")`. Because of parent suffix expansion during indexing, querying `example.com` returns all certificates issued for `example.com` as well as any subdomain `*.example.com`.
 2. **Response**: VIndex returns a compact, append-only list of leaf indices in the CT log, along with an MPT inclusion proof against `MapRoot` and a sub-log Merkle compact range proof.
 3. **Verification**: The verifier validates the cryptographic proof against the witnessed Output Log checkpoint, ensuring the list of indices is complete.
 4. **Certificate Retrieval**: The monitor fetches the raw certificates from the CT log using the returned indices to inspect validity dates, public keys, and revocation status via OCSP/CRL.
@@ -96,7 +97,7 @@ Merkle Tree Certificates replace traditional WebPKI X.509 signatures with Merkle
 MTC logs store compact binary assertions containing domain names, public keys, and validity windows. Leaf payloads are significantly smaller than X.509 certificates but are issued at 10x–50x the frequency of classic CT.
 
 #### MapFn Key Extraction & Normalization
-The WASM `MapFn` parses the binary assertion, extracts the domain labels, and applies the same canonical domain normalization rules as CT (strip trailing dot, lowercase, IDNA2008 Punycode).
+The WASM `MapFn` parses the binary assertion, extracts the domain labels, and applies the same canonical domain normalization and eTLD+1 parent suffix expansion rules as CT (strip leading wildcard and trailing dot, lowercase, IDNA2008 Punycode, and emit parent suffixes down to the registrable eTLD+1 boundary).
 
 #### Interaction with Log Pruning
 MTC logs rely on aggressive log pruning to discard expired certificates. VIndex supports this operational model:
@@ -117,24 +118,24 @@ MTC logs rely on aggressive log pruning to discard expired certificates. VIndex 
 The Go Checksum Database (`sum.golang.org`) ensures that module versions downloaded by `go get` match the versions downloaded by everyone else. However, SumDB provides point lookups only by exact version (`/lookup/{module}@{version}`). It provides no native mechanism to query all known versions of a module. Developers cannot discover whether new versions or unauthorized patch releases have been published without querying external package registries.
 
 #### Input Log Format & Payloads
-Each SumDB leaf contains plain-text, newline-delimited lines:
+Each SumDB leaf contains plain-text, newline-delimited lines (a module archive hash line and a `/go.mod` hash line):
 ```text
 github.com/google/uuid v1.3.0 h1:tIOElFI0...
 github.com/google/uuid v1.3.0/go.mod h1:Usq...
 ```
 
 #### MapFn Key Extraction & Normalization
-The WASM `MapFn` parses the first line of the leaf, extracts the module path (the token preceding the version string), and outputs the canonical module path.
-- Module paths are normalized using standard Go toolchain escaping (`golang.org/x/mod/module.EscapePath`), replacing uppercase characters with `!` followed by lowercase hex.
-- Mapping is strictly 1-to-1 (exactly one module path per leaf).
+The WASM `MapFn` scans the lines of the SumDB record, extracts the module path and version token, filters out ephemeral pseudo-versions (`vX.Y.Z-yyyymmddhhmmss-abcdefabcdef`), and emits the canonical module path for tagged releases:
+- Module paths are normalized using standard Go module path case-escaping, replacing uppercase characters with `!` followed by lowercase.
+- **At-Most 1-to-1 Cardinality (`0..1` keys per leaf)**: Many SumDB leaves represent untagged commit pseudo-versions and output **zero** keys. For tagged versions, the two lines in the record (`v1.3.0` and `v1.3.0/go.mod`) share the identical module path and are deduplicated per leaf by the KV store into a single occurrence entry.
 
 - **[Performance Optimization] Zero-Allocation Byte Scanner**:
-  - *Mechanism*: Guest WASM module replaces standard Go regex engines with a hand-tuned byte scanner (`isPseudoVersion([]byte)`) to filter pseudo-versions without heap allocations.
+  - *Mechanism*: Guest WASM module replaces standard Go regex engines with a zero-allocation byte scanner to filter pseudo-versions without heap allocations.
   - *Impact*: Eliminated `reflect`, `regexp`, and Unicode tables inside `sumdb.wasm`, reducing guest binary size by 24% (from 2.5 MB to 1.9 MB) and accelerating mapping throughput.
 
 #### Verifier Query & Verification Flow
-1. **Query**: A developer queries `GET /vindex/lookup/{KeyHash}?limit=100` where `KeyHash = SHA256("github.com/google/uuid")`.
-2. **Response**: VIndex returns the list of all Input Log indices where `github.com/google/uuid` appeared.
+1. **Query**: A developer queries `GET /vindex/v1/lookup/{KeyHash}?limit=100` where `KeyHash = SHA256("github.com/google/uuid")`.
+2. **Response**: VIndex returns the list of all Input Log indices where tagged versions of `github.com/google/uuid` appeared.
 3. **Audit**: The developer fetches the corresponding leaves from `sum.golang.org` to enumerate every release tag ever committed for that module.
 
 ---
@@ -186,11 +187,11 @@ The WASM `MapFn` extracts the 32-byte public key hash directly from the fixed bi
 
 ## 3. Future Work (Non-v1 Scope): Prefix-Trie & Subtree Indexing
 
-> **Note**: VIndex v1 implements exact 32-byte point lookups exclusively. Subdomain discovery and organizational namespace prefix searches are unreleased forward-compatibility design concepts, not supported query operations in v1.
+> **Note**: VIndex v1 implements exact 32-byte point lookups exclusively. While CT and MTC plugins support parent domain discovery in v1 by expanding domain suffixes up to eTLD+1 at mapping time, arbitrary prefix-trie and organizational namespace subtree searches without map-time expansion remain future design concepts.
 
 While VIndex v1 provides point lookups by exact 32-byte key hashes, preserving raw canonical Claim Subject preimages across the `map_bundle` guest-host boundary provides critical forward compatibility for future search extensions:
 
-1. **Subdomain Discovery (`*.example.com`)**: In Certificate Transparency, domain owners frequently need to query all certificates issued across arbitrary subdomains (e.g. `app.example.com`, `api.staging.example.com`).
+1. **Arbitrary Hierarchy Discovery Without Map-Time Fanout**: Instead of emitting every parent suffix as a separate key at map time, a prefix-trie index can support arbitrary subdomain or hierarchy queries directly.
 2. **Namespace / Organization Discovery (`github.com/org/*`)**: In Go SumDB and Sigstore, developers need to enumerate all modules or container images published under an organizational namespace.
 3. **Zero Guest ABI Changes**: Because plugins output canonical string preimages rather than one-way hashes, a future VIndex version can construct auxiliary prefix-trie indices (radix trees or patricia tries) directly from the preserved preimages without requiring guest WASM plugin authors to recompile or update their mapping logic.
 
@@ -209,7 +210,7 @@ While VIndex v1 provides point lookups by exact 32-byte key hashes, preserving r
 ### 5.1 In-Guest Regex Engines for Version Parsing
 - **Proposed**: Importing `golang.org/x/mod/module` inside the guest WASM binary to parse and filter pseudo-versions using standard Go regex expressions.
 - **Empirical Rejection**: Embedded `reflect`, `regexp`, and Unicode tables into the WASM bytecode, bloating `sumdb.wasm` to 2.5 MB and consuming significant heap allocation cycles.
-- **Resolution**: Replaced with a zero-allocation byte scanner (`isPseudoVersion([]byte)`), shrinking WASM binary size by 24% (down to 1.9 MB) and improving parsing throughput.
+- **Resolution**: Replaced with a zero-allocation byte scanner, shrinking WASM binary size by 24% (down to 1.9 MB) and improving parsing throughput.
 
 ### 5.2 In-Guest Software Cryptographic Hashing
 - **Proposed**: Compiling SHA-256 cryptographic hashing directly into guest WebAssembly bytecode.
