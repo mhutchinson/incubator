@@ -170,10 +170,11 @@ func TestMTCLeafMapper(t *testing.T) {
 		want []ingest.MappedEntry
 	}{
 		{
-			name: "Valid Type 1 (wildcard stripped)",
+			name: "Valid Type 1 (wildcard preserved, reversed-label with trailing dot)",
 			data: validType1,
 			want: []ingest.MappedEntry{
-				{KeyHash: sha256.Sum256([]byte("example.com"))},
+				{Key: "com.example.*.", KeyHash: sha256.Sum256([]byte("com.example.*."))},
+				{Key: "com.example.", KeyHash: sha256.Sum256([]byte("com.example."))},
 			},
 		},
 		{
@@ -192,20 +193,17 @@ func TestMTCLeafMapper(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "Subdomain indexing",
+			name: "Subdomain indexing (reversed-label single key)",
 			data: subdomainCert,
 			want: []ingest.MappedEntry{
-				{KeyHash: sha256.Sum256([]byte("deep.maps.google.co.uk"))},
-				{KeyHash: sha256.Sum256([]byte("maps.google.co.uk"))},
-				{KeyHash: sha256.Sum256([]byte("google.co.uk"))},
+				{Key: "uk.co.google.maps.deep.", KeyHash: sha256.Sum256([]byte("uk.co.google.maps.deep."))},
 			},
 		},
 		{
 			name: "Mixed case normalization",
 			data: mixedCaseCert,
 			want: []ingest.MappedEntry{
-				{KeyHash: sha256.Sum256([]byte("maps.google.com"))},
-				{KeyHash: sha256.Sum256([]byte("google.com"))},
+				{Key: "com.google.maps.", KeyHash: sha256.Sum256([]byte("com.google.maps."))},
 			},
 		},
 	}
@@ -282,6 +280,7 @@ func TestMTCLeafMapper_Golden(t *testing.T) {
 			var want []ingest.MappedEntry
 			for _, d := range tc.ExpectedDomains {
 				want = append(want, ingest.MappedEntry{
+					Key:     d,
 					KeyHash: sha256.Sum256([]byte(d)),
 				})
 			}
@@ -292,4 +291,35 @@ func TestMTCLeafMapper_Golden(t *testing.T) {
 		})
 	}
 }
+
+func TestCanonicalizeDomain(t *testing.T) {
+	tests := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"example.com", "com.example.", true},
+		{"mail.google.com", "com.google.mail.", true},
+		{"*.google.com", "com.google.*.", true},
+		{"*.mail.google.com.", "com.google.mail.*.", true},
+		{"  MAPS.GOOGLE.COM. ", "com.google.maps.", true},
+		{"münchen.de", "de.xn--mnchen-3ya.", true},
+		{"*.münchen.de", "de.xn--mnchen-3ya.*.", true},
+		{"_dmarc.example.com", "com.example._dmarc.", true},
+		{"", "", false},
+		{"localhost", "", false},
+		{"*.com", "", false},
+		{"*foo.example.com", "", false},
+		{"sub.*.example.com", "", false},
+		{"My Root CA", "", false},
+	}
+
+	for _, tc := range tests {
+		got, ok := CanonicalizeDomain(tc.in)
+		if ok != tc.wantOK || got != tc.want {
+			t.Errorf("CanonicalizeDomain(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
 

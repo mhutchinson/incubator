@@ -19,8 +19,10 @@ package main
 
 import (
 	"bytes"
+	"unsafe"
 
 	"github.com/transparency-dev/incubator/vindex/v1/mapfn/sdk"
+	"golang.org/x/mod/module"
 )
 
 func main() {}
@@ -35,6 +37,7 @@ var goModSuffix = []byte("/go.mod")
 func MapSumDBLeaf(data []byte, emit func(key []byte)) {
 	var emitted [8][]byte
 	n := 0
+	var overflow [][]byte
 
 	for len(data) > 0 {
 		var line []byte
@@ -52,10 +55,10 @@ func MapSumDBLeaf(data []byte, emit func(key []byte)) {
 		}
 
 		modEnd := bytes.IndexByte(line, ' ')
-		if modEnd == -1 {
+		if modEnd <= 0 {
 			continue
 		}
-		modPath := line[:modEnd]
+		rawModPath := line[:modEnd]
 
 		verStart := modEnd + 1
 		if verStart >= len(line) {
@@ -75,6 +78,20 @@ func MapSumDBLeaf(data []byte, emit func(key []byte)) {
 			continue
 		}
 
+		var modPath []byte
+		if isSimpleLowercaseModulePath(rawModPath) {
+			modPath = rawModPath
+		} else {
+			escaped, err := module.EscapePath(unsafe.String(unsafe.SliceData(rawModPath), len(rawModPath)))
+			if err != nil || len(escaped) == 0 {
+				continue
+			}
+			modPath = unsafe.Slice(unsafe.StringData(escaped), len(escaped))
+		}
+		if len(modPath) == 0 || len(modPath) > 1024 {
+			continue
+		}
+
 		duplicate := false
 		for i := 0; i < n; i++ {
 			if bytes.Equal(emitted[i], modPath) {
@@ -83,9 +100,19 @@ func MapSumDBLeaf(data []byte, emit func(key []byte)) {
 			}
 		}
 		if !duplicate {
+			for _, ov := range overflow {
+				if bytes.Equal(ov, modPath) {
+					duplicate = true
+					break
+				}
+			}
+		}
+		if !duplicate {
 			if n < len(emitted) {
 				emitted[n] = modPath
 				n++
+			} else {
+				overflow = append(overflow, modPath)
 			}
 			emit(modPath)
 		}
@@ -249,4 +276,37 @@ func isAlnum(b byte) bool {
 
 func isIdentChar(b byte) bool {
 	return isAlnum(b) || b == '-'
+}
+
+func isSimpleLowercaseModulePath(p []byte) bool {
+	if len(p) == 0 || p[0] == '/' || p[len(p)-1] == '/' || p[len(p)-1] == '.' {
+		return false
+	}
+	hasDotInFirstElem := false
+	inFirstElem := true
+	segStart := 0
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c == '/' {
+			if i == segStart || p[i-1] == '.' {
+				return false
+			}
+			inFirstElem = false
+			segStart = i + 1
+			continue
+		}
+		if c == '.' {
+			if i == segStart || (i+1 < len(p) && p[i+1] == '.') {
+				return false
+			}
+			if inFirstElem {
+				hasDotInFirstElem = true
+			}
+			continue
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return hasDotInFirstElem
 }

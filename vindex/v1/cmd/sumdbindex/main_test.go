@@ -95,6 +95,9 @@ func TestSumDBLeafMapper(t *testing.T) {
 		t.Fatalf("MapLeaf(exampleLeaf) got %d entries, want 1", len(entries))
 	}
 	wantHash := sha256.Sum256([]byte("golang.org/x/text"))
+	if entries[0].Key != "golang.org/x/text" {
+		t.Errorf("MapLeaf(exampleLeaf) key = %q, want %q", entries[0].Key, "golang.org/x/text")
+	}
 	if entries[0].KeyHash != wantHash {
 		t.Errorf("MapLeaf(exampleLeaf) key hash = %x, want %x", entries[0].KeyHash, wantHash)
 	}
@@ -119,6 +122,16 @@ func TestSumDBLeafMapper(t *testing.T) {
 	wantRCHash := sha256.Sum256([]byte("github.1485827954.workers.dev/aws/amazon-vpc-cni-k8s"))
 	if rcEntries[0].KeyHash != wantRCHash {
 		t.Errorf("MapLeaf(releaseCandidateLeaf) key hash = %x, want %x", rcEntries[0].KeyHash, wantRCHash)
+	}
+
+	// 4. Case-escaped module path via module.EscapePath
+	upperLeaf := []byte("github.com/Azure/azure-sdk-for-go v1.0.0 h1:abc=\n")
+	upperEntries, err := mapper.MapLeaf(ctx, upperLeaf)
+	if err != nil {
+		t.Fatalf("MapLeaf(upperLeaf) unexpected error: %v", err)
+	}
+	if len(upperEntries) != 1 || upperEntries[0].Key != "github.com/!azure/azure-sdk-for-go" {
+		t.Errorf("MapLeaf(upperLeaf) got %+v, want key github.com/!azure/azure-sdk-for-go", upperEntries)
 	}
 }
 

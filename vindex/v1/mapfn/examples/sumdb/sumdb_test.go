@@ -139,6 +139,26 @@ func TestIsPseudoVersion_Parity(t *testing.T) {
 	}
 }
 
+func TestMapSumDBLeaf_EscapePathAndValidation(t *testing.T) {
+	leaf := []byte(
+		"github.com/Azure/azure-sdk-for-go v1.0.0 h1:abc=\n" +
+			"github.com/Azure/azure-sdk-for-go v1.0.0/go.mod h1:def=\n" +
+			"invalid_no_dot_module v1.0.0 h1:bad=\n",
+	)
+	var keys []string
+	MapSumDBLeaf(leaf, func(key []byte) {
+		keys = append(keys, string(key))
+	})
+
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 key, got %d (%v)", len(keys), keys)
+	}
+	want := "github.com/!azure/azure-sdk-for-go"
+	if keys[0] != want {
+		t.Errorf("got %q, want %q", keys[0], want)
+	}
+}
+
 func BenchmarkMapSumDBLeaf(b *testing.B) {
 	leaf := []byte("golang.org/x/mod v0.40.0 h1:testHash123=\ngolang.org/x/mod v0.40.0/go.mod h1:testHash456=\n")
 	b.ReportAllocs()

@@ -177,7 +177,7 @@ func TestMTCVerify_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create leaf0: %v", err)
 	}
-	leaf1, err := marshalMTCEntry([]string{"service.corp.example.co.uk"})
+	leaf1, err := marshalMTCEntry([]string{"service.corp.example.co.uk", "*.service.corp.example.co.uk"})
 	if err != nil {
 		t.Fatalf("failed to create leaf1: %v", err)
 	}
@@ -228,13 +228,13 @@ func TestMTCVerify_Integration(t *testing.T) {
 		t.Fatalf("run() for example.com failed: %v", err)
 	}
 
-	// 2. Verify exploded subdomain "example.co.uk"
-	*domain = "example.co.uk"
+	// 2. Verify subdomain "service.corp.example.co.uk"
+	*domain = "service.corp.example.co.uk"
 	if err := run(ctx); err != nil {
-		t.Fatalf("run() for example.co.uk failed: %v", err)
+		t.Fatalf("run() for service.corp.example.co.uk failed: %v", err)
 	}
 
-	// 3. Verify wildcard normalized "*.service.corp.example.co.uk"
+	// 3. Verify wildcard "*.service.corp.example.co.uk"
 	*domain = "*.service.corp.example.co.uk"
 	if err := run(ctx); err != nil {
 		t.Fatalf("run() for *.service.corp.example.co.uk failed: %v", err)

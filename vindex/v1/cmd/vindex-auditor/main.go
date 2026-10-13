@@ -19,6 +19,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,29 +33,34 @@ import (
 
 	"github.com/transparency-dev/incubator/vindex/v1/internal/auditor"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/mtc"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/server"
+	"golang.org/x/mod/module"
 	"k8s.io/klog/v2"
 )
 
 var (
-	outputLogURL    = flag.String("output_log_url", "", "Base URL of Output Log to verify (required).")
-	outputLogPubKey = flag.String("output_log_pubkey", "", "Public key or key file for Output Log checkpoint verification.")
-	outputLogOrigin = flag.String("output_log_origin", "example.com/vindex/output", "Origin string for Output Log.")
-	inputLogURL     = flag.String("input_log_url", "", "Base URL of the Input Log (required).")
-	inputLogPubKey  = flag.String("input_log_pubkey", "", "Public key or key file for Input Log checkpoint verification.")
-	inputLogOrigin  = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
-	dbPath          = flag.String("db_path", "", "NVMe path for Pebble DB (Disk A) (required).")
-	mptDir          = flag.String("mpt_dir", "", "Isolated NVMe path for MPT mmap files (Disk B) (required).")
-	wasmPath        = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary.")
-	mapper          = flag.String("mapper", "identity", "Leaf mapper implementation: identity, ct, or sumdb.")
-	serveMirror     = flag.Bool("serve_mirror", false, "Enable verified mirror serving mode on listen_addr.")
-	failClosed      = flag.Bool("fail_closed", false, "Immediately revoke mirror serving on verification mismatch instead of serving last verified checkpoint.")
-	listenAddr      = flag.String("listen_addr", ":8080", "HTTP Read Server address for mirror lookups.")
-	metricsAddr     = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
-	chunkSize       = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
-	commitBatchSize = flag.Uint64("commit_batch_size", 4096, "Number of leaves accumulated per batch commit.")
-	tileCacheDir    = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
-	pollInterval    = flag.Duration("poll_interval", 10*time.Second, "Polling interval for new Output Log checkpoints.")
-	oneShot         = flag.Bool("oneshot", false, "Run verification once against log tip and exit.")
+	outputLogURL      = flag.String("output_log_url", "", "Base URL of Output Log to verify (required).")
+	outputLogPubKey   = flag.String("output_log_pubkey", "", "Public key or key file for Output Log checkpoint verification.")
+	outputLogOrigin   = flag.String("output_log_origin", "example.com/vindex/output", "Origin string for Output Log.")
+	inputLogURL       = flag.String("input_log_url", "", "Base URL of the Input Log (required).")
+	inputLogPubKey    = flag.String("input_log_pubkey", "", "Public key or key file for Input Log checkpoint verification.")
+	inputLogOrigin    = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
+	dbPath            = flag.String("db_path", "", "NVMe path for Pebble DB (Disk A) (required).")
+	mptDir            = flag.String("mpt_dir", "", "Isolated NVMe path for MPT mmap files (Disk B) (required).")
+	wasmPath          = flag.String("wasm_path", "", "Path to compiled MapFn WASM binary.")
+	mapper            = flag.String("mapper", "identity", "Leaf mapper implementation: identity, ct, or sumdb.")
+	serveMirror       = flag.Bool("serve_mirror", false, "Enable verified mirror serving mode on listen_addr.")
+	failClosed        = flag.Bool("fail_closed", false, "Immediately revoke mirror serving on verification mismatch instead of serving last verified checkpoint.")
+	listenAddr        = flag.String("listen_addr", ":8080", "HTTP Read Server address for mirror lookups.")
+	metricsAddr       = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
+	prefixPolicyFlag  = flag.String("prefix_policy", "allow", "Prefix lookup policy for ?prefix=true on mirror: allow, domain (eTLD+1), or none.")
+	maxPrefixKeysFlag = flag.Int("max_prefix_keys", server.DefaultMaxPrefixKeys, "Maximum number of keys returned by a single ?prefix=true scan on mirror.")
+	chunkSize         = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
+	commitBatchSize   = flag.Uint64("commit_batch_size", 4096, "Number of leaves accumulated per batch commit.")
+	tileCacheDir      = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
+	pollInterval      = flag.Duration("poll_interval", 10*time.Second, "Polling interval for new Output Log checkpoints.")
+	oneShot           = flag.Bool("oneshot", false, "Run verification once against log tip and exit.")
 )
 
 func main() {
@@ -101,6 +109,11 @@ func run(ctx context.Context) error {
 		defer closeMapper()
 	}
 
+	prefixPolicy, err := server.ParsePrefixPolicy(*prefixPolicyFlag)
+	if err != nil {
+		return err
+	}
+
 	cfg := auditor.Config{
 		InputLogURL:     *inputLogURL,
 		InputLogPubKey:  resolvedInPubKey,
@@ -116,6 +129,8 @@ func run(ctx context.Context) error {
 		FailClosed:      *failClosed,
 		ListenAddr:      *listenAddr,
 		MetricsAddr:     *metricsAddr,
+		PrefixPolicy:    prefixPolicy,
+		MaxPrefixKeys:   *maxPrefixKeysFlag,
 		PollInterval:    *pollInterval,
 		ChunkSize:       *chunkSize,
 		CommitBatchSize: *commitBatchSize,
@@ -193,67 +208,127 @@ func (m *defaultIdentityMapper) Close(_ context.Context) error { return nil }
 type ctLeafMapper struct{}
 
 func (m *ctLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	lines := strings.Split(string(leaf), "\n")
 	seen := make(map[string]struct{})
 	var entries []ingest.MappedEntry
+	addDomain := func(d string) {
+		key, ok := mtc.CanonicalizeDomain(d)
+		if !ok {
+			return
+		}
+		if _, exists := seen[key]; !exists {
+			seen[key] = struct{}{}
+			entries = append(entries, ingest.MappedEntry{
+				Key:     key,
+				KeyHash: sha256.Sum256([]byte(key)),
+			})
+		}
+	}
+
+	// RFC 6962 binary MerkleTreeLeaf (version == 0, leaf_type == 0)
+	if len(leaf) >= 15 && leaf[0] == 0 && leaf[1] == 0 {
+		entryType := uint16(leaf[10])<<8 | uint16(leaf[11])
+		switch entryType {
+		case 0: // X509Entry
+			certLen := int(leaf[12])<<16 | int(leaf[13])<<8 | int(leaf[14])
+			if certLen > 0 && 15+certLen <= len(leaf) {
+				if cert, err := x509.ParseCertificate(leaf[15 : 15+certLen]); err == nil {
+					if cert.Subject.CommonName != "" {
+						addDomain(cert.Subject.CommonName)
+					}
+					for _, dns := range cert.DNSNames {
+						addDomain(dns)
+					}
+				}
+			}
+		case 1: // PrecertEntry (32B issuer_key_hash + 3B length + TBSCertificate)
+			if len(leaf) >= 12+32+3 {
+				tbsOff := 12 + 32
+				tbsLen := int(leaf[tbsOff])<<16 | int(leaf[tbsOff+1])<<8 | int(leaf[tbsOff+2])
+				if tbsLen > 0 && tbsOff+3+tbsLen <= len(leaf) {
+					extractPrecertTBSDomains(leaf[tbsOff+3:tbsOff+3+tbsLen], addDomain)
+				}
+			}
+		}
+		return entries, nil
+	}
+
+	// Plaintext domain lines (used by synthetic CLI/E2E tests)
+	for _, b := range leaf {
+		if b != '\n' && b != '\r' && (b < 0x20 || b > 0x7E) {
+			return nil, nil
+		}
+	}
+	lines := strings.Split(string(leaf), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		parts := strings.Split(line, ".")
-		var etld1 string
-		if len(parts) >= 2 {
-			etld1 = parts[len(parts)-2] + "." + parts[len(parts)-1]
-		} else {
-			etld1 = line
-		}
-		if _, exists := seen[etld1]; !exists {
-			seen[etld1] = struct{}{}
-			entries = append(entries, ingest.MappedEntry{
-				KeyHash: sha256.Sum256([]byte(etld1)),
-			})
-		}
+		addDomain(line)
 	}
 	return entries, nil
 }
 
 func (m *ctLeafMapper) Close(_ context.Context) error { return nil }
 
+type precertTBSCertificate struct {
+	Version      int              `asn1:"optional,explicit,default:0,tag:0"`
+	SerialNumber asn1.RawValue
+	Signature    asn1.RawValue
+	Issuer       asn1.RawValue
+	Validity     asn1.RawValue
+	Subject      pkix.RDNSequence
+	PublicKey    asn1.RawValue
+	UniqueId     asn1.BitString   `asn1:"optional,tag:1"`
+	SubjectId    asn1.BitString   `asn1:"optional,tag:2"`
+	Extensions   []pkix.Extension `asn1:"optional,explicit,tag:3"`
+}
+
+func extractPrecertTBSDomains(tbsBytes []byte, emit func(string)) {
+	var tbs precertTBSCertificate
+	if _, err := asn1.Unmarshal(tbsBytes, &tbs); err != nil {
+		return
+	}
+	var subj pkix.Name
+	subj.FillFromRDNSequence(&tbs.Subject)
+	if subj.CommonName != "" {
+		emit(subj.CommonName)
+	}
+	oidSAN := asn1.ObjectIdentifier{2, 5, 29, 17}
+	for _, ext := range tbs.Extensions {
+		if !ext.Id.Equal(oidSAN) {
+			continue
+		}
+		var seq []asn1.RawValue
+		if _, err := asn1.Unmarshal(ext.Value, &seq); err != nil {
+			continue
+		}
+		for _, raw := range seq {
+			if raw.Class == 2 && raw.Tag == 2 {
+				emit(string(raw.Bytes))
+			}
+		}
+	}
+}
+
 type sumdbLeafMapper struct{}
 
 func (m *sumdbLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	keys := mapSumDBLeaf(leaf)
-	if len(keys) == 0 {
-		return nil, nil
-	}
-	entries := make([]ingest.MappedEntry, len(keys))
-	for i, k := range keys {
-		entries[i] = ingest.MappedEntry{KeyHash: k}
-	}
-	return entries, nil
+	return mapSumDBLeaf(leaf), nil
 }
 
 func (m *sumdbLeafMapper) MapBundle(_ context.Context, leaves [][]byte) ([][]ingest.MappedEntry, error) {
 	results := make([][]ingest.MappedEntry, len(leaves))
 	for i, leaf := range leaves {
-		keys := mapSumDBLeaf(leaf)
-		if len(keys) > 0 {
-			entries := make([]ingest.MappedEntry, len(keys))
-			for j, k := range keys {
-				entries[j] = ingest.MappedEntry{KeyHash: k}
-			}
-			results[i] = entries
-		}
+		results[i] = mapSumDBLeaf(leaf)
 	}
 	return results, nil
 }
 
 func (m *sumdbLeafMapper) Close(_ context.Context) error { return nil }
 
-func mapSumDBLeaf(data []byte) [][sha256.Size]byte {
-	var results [8][sha256.Size]byte
-	n := 0
+func mapSumDBLeaf(data []byte) []ingest.MappedEntry {
+	var results []ingest.MappedEntry
 
 	for len(data) > 0 {
 		var line []byte
@@ -271,24 +346,132 @@ func mapSumDBLeaf(data []byte) [][sha256.Size]byte {
 		}
 
 		modEnd := bytes.IndexByte(line, ' ')
-		if modEnd == -1 {
+		if modEnd <= 0 {
 			continue
 		}
-		modPath := line[:modEnd]
+		rawModPath := line[:modEnd]
 
-		h := sha256.Sum256(modPath)
+		verStart := modEnd + 1
+		if verStart >= len(line) {
+			continue
+		}
+		verLen := bytes.IndexByte(line[verStart:], ' ')
+		var verBytes []byte
+		if verLen == -1 {
+			verBytes = line[verStart:]
+		} else {
+			verBytes = line[verStart : verStart+verLen]
+		}
+		verBytes = bytes.TrimSuffix(verBytes, []byte("/go.mod"))
+		if isPseudoVersion(verBytes) {
+			continue
+		}
+
+		escaped, err := module.EscapePath(string(rawModPath))
+		if err != nil || escaped == "" || len(escaped) > 1024 {
+			continue
+		}
+
+		h := sha256.Sum256([]byte(escaped))
 		duplicate := false
-		for i := 0; i < n; i++ {
-			if results[i] == h {
+		for i := range results {
+			if results[i].KeyHash == h {
 				duplicate = true
 				break
 			}
 		}
-		if !duplicate && n < len(results) {
-			results[n] = h
-			n++
+		if !duplicate {
+			results = append(results, ingest.MappedEntry{
+				Key:     escaped,
+				KeyHash: h,
+			})
 		}
 	}
 
-	return results[:n]
+	return results
+}
+
+func isPseudoVersion(v []byte) bool {
+	if len(v) < 30 || v[0] != 'v' {
+		return false
+	}
+	if idx := bytes.IndexByte(v, '+'); idx != -1 {
+		build := v[idx+1:]
+		if len(build) == 0 {
+			return false
+		}
+		for _, b := range build {
+			if !isIdentChar(b) && b != '.' {
+				return false
+			}
+		}
+		v = v[:idx]
+	}
+	dashIdx := bytes.LastIndexByte(v, '-')
+	if dashIdx == -1 || dashIdx < 16 {
+		return false
+	}
+	rev := v[dashIdx+1:]
+	if len(rev) == 0 {
+		return false
+	}
+	for _, b := range rev {
+		if !isIdentChar(b) {
+			return false
+		}
+	}
+	tsStart := dashIdx - 14
+	ts := v[tsStart:dashIdx]
+	for _, b := range ts {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	prefix := v[:tsStart]
+	i := 1
+	for i < len(prefix) && prefix[i] >= '0' && prefix[i] <= '9' {
+		i++
+	}
+	if i == 1 || i >= len(prefix) || prefix[i] != '.' {
+		return false
+	}
+	rest := prefix[i+1:]
+	if bytes.Equal(rest, []byte("0.0-")) {
+		return true
+	}
+	j := 0
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	if j == 0 || j >= len(rest) || rest[j] != '.' {
+		return false
+	}
+	k := j + 1
+	for k < len(rest) && rest[k] >= '0' && rest[k] <= '9' {
+		k++
+	}
+	if k == j+1 || k >= len(rest) || rest[k] != '-' {
+		return false
+	}
+	afterPatchDash := rest[k+1:]
+	if bytes.Equal(afterPatchDash, []byte("0.")) {
+		return true
+	}
+	if !bytes.HasSuffix(afterPatchDash, []byte(".0.")) {
+		return false
+	}
+	pre := afterPatchDash[:len(afterPatchDash)-3]
+	if len(pre) == 0 {
+		return false
+	}
+	for _, b := range pre {
+		if b == '+' {
+			return false
+		}
+	}
+	return true
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '-'
 }

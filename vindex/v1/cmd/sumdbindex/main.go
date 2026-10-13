@@ -223,44 +223,238 @@ func run(ctx context.Context) error {
 type SumDBLeafMapper struct{}
 
 func (m *SumDBLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	keys := mapFn(leaf)
-	if len(keys) == 0 {
+	key, ok := extractSumDBModuleKey(leaf)
+	if !ok {
 		return nil, nil
 	}
-	entries := make([]ingest.MappedEntry, len(keys))
-	for i, k := range keys {
-		entries[i] = ingest.MappedEntry{KeyHash: k}
-	}
-	return entries, nil
+	return []ingest.MappedEntry{{
+		Key:     key,
+		KeyHash: sha256.Sum256([]byte(key)),
+	}}, nil
 }
 
 func (m *SumDBLeafMapper) Close(_ context.Context) error {
 	return nil
 }
 
-func mapFn(data []byte) [][32]byte {
+func extractSumDBModuleBytes(data []byte) ([]byte, string, bool) {
 	modEnd := bytes.IndexByte(data, ' ')
-	if modEnd == -1 {
-		return nil
+	if modEnd <= 0 {
+		return nil, "", false
 	}
 
 	verStart := modEnd + 1
 	verLen := bytes.IndexByte(data[verStart:], ' ')
 	if verLen == -1 {
-		return nil
+		return nil, "", false
 	}
-	verBytes := data[verStart : verStart+verLen]
+	verBytes := bytes.TrimSuffix(data[verStart:verStart+verLen], []byte("/go.mod"))
 
-	// Fast path: pseudo-versions always contain a dash.
-	if bytes.IndexByte(verBytes, '-') != -1 {
-		// Only allocate a string and call IsPseudoVersion if a dash is present.
-		if module.IsPseudoVersion(string(verBytes)) {
-			// Drop any ephemeral builds
-			return nil
+	// Fast zero-allocation pseudo-version filter
+	if isPseudoVersion(verBytes) {
+		return nil, "", false
+	}
+
+	rawMod := data[:modEnd]
+	if isSimpleLowercaseModulePath(rawMod) {
+		if len(rawMod) > 1024 {
+			return nil, "", false
+		}
+		return rawMod, "", true
+	}
+	escaped, err := module.EscapePath(string(rawMod))
+	if err != nil || escaped == "" || len(escaped) > 1024 {
+		return nil, "", false
+	}
+	return nil, escaped, true
+}
+
+func isPseudoVersion(v []byte) bool {
+	if len(v) < 30 || v[0] != 'v' {
+		return false
+	}
+	if idx := bytes.IndexByte(v, '+'); idx != -1 {
+		build := v[idx+1:]
+		if len(build) == 0 {
+			return false
+		}
+		for _, b := range build {
+			if !isIdentChar(b) && b != '.' {
+				return false
+			}
+		}
+		v = v[:idx]
+	}
+	lastDash := bytes.LastIndexByte(v, '-')
+	if lastDash == -1 {
+		return false
+	}
+	rev := v[lastDash+1:]
+	if len(rev) == 0 {
+		return false
+	}
+	for _, b := range rev {
+		if !isAlnum(b) {
+			return false
 		}
 	}
+	rest := v[:lastDash]
+	secondDash := bytes.LastIndexByte(rest, '-')
+	if secondDash == -1 {
+		return false
+	}
+	var timestamp, prefix []byte
+	dotAfterDash := bytes.LastIndexByte(rest[secondDash:], '.')
+	if dotAfterDash != -1 {
+		dotPos := secondDash + dotAfterDash
+		timestamp = rest[dotPos+1:]
+		prefix = rest[:dotPos]
+	} else {
+		timestamp = rest[secondDash+1:]
+		prefix = rest[:secondDash]
+	}
+	if len(timestamp) != 14 {
+		return false
+	}
+	for _, b := range timestamp {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	if dotAfterDash == -1 {
+		return isMajorDotZeroDotZero(prefix)
+	}
+	if !bytes.HasSuffix(prefix, []byte(".0")) && !bytes.HasSuffix(prefix, []byte("-0")) {
+		return false
+	}
+	dashIdx := bytes.IndexByte(prefix, '-')
+	if dashIdx == -1 {
+		return false
+	}
+	return isBaseSemver(prefix[:dashIdx])
+}
 
-	return [][32]byte{sha256.Sum256(data[:modEnd])}
+func isMajorDotZeroDotZero(s []byte) bool {
+	if len(s) < 6 || s[0] != 'v' || !bytes.HasSuffix(s, []byte(".0.0")) {
+		return false
+	}
+	major := s[1 : len(s)-4]
+	if len(major) == 0 || (len(major) > 1 && major[0] == '0') {
+		return false
+	}
+	for _, b := range major {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isBaseSemver(s []byte) bool {
+	if len(s) < 6 || s[0] != 'v' {
+		return false
+	}
+	s = s[1:]
+	dot1 := bytes.IndexByte(s, '.')
+	if dot1 <= 0 {
+		return false
+	}
+	major := s[:dot1]
+	if len(major) > 1 && major[0] == '0' {
+		return false
+	}
+	for _, b := range major {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	s = s[dot1+1:]
+	dot2 := bytes.IndexByte(s, '.')
+	if dot2 <= 0 {
+		return false
+	}
+	minor := s[:dot2]
+	if len(minor) > 1 && minor[0] == '0' {
+		return false
+	}
+	for _, b := range minor {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	patch := s[dot2+1:]
+	if len(patch) == 0 || (len(patch) > 1 && patch[0] == '0') {
+		return false
+	}
+	for _, b := range patch {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlnum(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func isIdentChar(b byte) bool {
+	return isAlnum(b) || b == '-'
+}
+
+func extractSumDBModuleKey(data []byte) (string, bool) {
+	rawMod, escaped, ok := extractSumDBModuleBytes(data)
+	if !ok {
+		return "", false
+	}
+	if escaped != "" {
+		return escaped, true
+	}
+	return string(rawMod), true
+}
+
+func mapFn(data []byte) [][32]byte {
+	rawMod, escaped, ok := extractSumDBModuleBytes(data)
+	if !ok {
+		return nil
+	}
+	if escaped != "" {
+		return [][32]byte{sha256.Sum256([]byte(escaped))}
+	}
+	return [][32]byte{sha256.Sum256(rawMod)}
+}
+
+func isSimpleLowercaseModulePath(p []byte) bool {
+	if len(p) == 0 || p[0] == '/' || p[len(p)-1] == '/' || p[len(p)-1] == '.' {
+		return false
+	}
+	hasDotInFirstElem := false
+	inFirstElem := true
+	segStart := 0
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c == '/' {
+			if i == segStart || p[i-1] == '.' {
+				return false
+			}
+			inFirstElem = false
+			segStart = i + 1
+			continue
+		}
+		if c == '.' {
+			if i == segStart || (i+1 < len(p) && p[i+1] == '.') {
+				return false
+			}
+			if inFirstElem {
+				hasDotInFirstElem = true
+			}
+			continue
+		}
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return hasDotInFirstElem
 }
 
 type localOutputLog struct {

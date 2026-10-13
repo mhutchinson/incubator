@@ -188,60 +188,60 @@ func TestMTCIndex_Integration(t *testing.T) {
 		t.Fatalf("client.New failed: %v", err)
 	}
 
-	// 1. Lookup "example.com"
-	respExample, err := cli.LookupAllKey(ctx, "example.com", 10)
+	// 1. Lookup "com.example."
+	respExample, err := cli.LookupAllKey(ctx, "com.example.", 10)
 	if err != nil {
-		t.Fatalf("cli.LookupAllKey(example.com) failed: %v", err)
+		t.Fatalf("cli.LookupAllKey(com.example.) failed: %v", err)
 	}
 	if !respExample.Exists {
-		t.Fatal("example.com should exist in index")
+		t.Fatal("com.example. should exist in index")
 	}
 	if len(respExample.Indices) != 1 || respExample.Indices[0] != 0 {
-		t.Fatalf("example.com indices = %v, want [0]", respExample.Indices)
+		t.Fatalf("com.example. indices = %v, want [0]", respExample.Indices)
 	}
 
-	// 2. Lookup "google.co.uk" (exploded from deep.maps.google.co.uk)
-	respUK, err := cli.LookupAllKey(ctx, "google.co.uk", 10)
+	// 2. Lookup "com.example.*." (wildcard preserved separately from apex)
+	respWildcard, err := cli.LookupAllKey(ctx, "com.example.*.", 10)
 	if err != nil {
-		t.Fatalf("cli.LookupAllKey(google.co.uk) failed: %v", err)
+		t.Fatalf("cli.LookupAllKey(com.example.*.) failed: %v", err)
 	}
-	if !respUK.Exists {
-		t.Fatal("google.co.uk should exist in index")
+	if !respWildcard.Exists {
+		t.Fatal("com.example.*. should exist in index")
 	}
-	if len(respUK.Indices) != 1 || respUK.Indices[0] != 1 {
-		t.Fatalf("google.co.uk indices = %v, want [1]", respUK.Indices)
+	if len(respWildcard.Indices) != 1 || respWildcard.Indices[0] != 0 {
+		t.Fatalf("com.example.*. indices = %v, want [0]", respWildcard.Indices)
 	}
 
-	// 3. Lookup "maps.google.co.uk"
-	respMapsUK, err := cli.LookupAllKey(ctx, "maps.google.co.uk", 10)
+	// 3. Lookup "uk.co.google.maps.deep."
+	respDeepUK, err := cli.LookupAllKey(ctx, "uk.co.google.maps.deep.", 10)
 	if err != nil {
-		t.Fatalf("cli.LookupAllKey(maps.google.co.uk) failed: %v", err)
+		t.Fatalf("cli.LookupAllKey(uk.co.google.maps.deep.) failed: %v", err)
 	}
-	if !respMapsUK.Exists {
-		t.Fatal("maps.google.co.uk should exist in index")
+	if !respDeepUK.Exists {
+		t.Fatal("uk.co.google.maps.deep. should exist in index")
 	}
-	if len(respMapsUK.Indices) != 1 || respMapsUK.Indices[0] != 1 {
-		t.Fatalf("maps.google.co.uk indices = %v, want [1]", respMapsUK.Indices)
+	if len(respDeepUK.Indices) != 1 || respDeepUK.Indices[0] != 1 {
+		t.Fatalf("uk.co.google.maps.deep. indices = %v, want [1]", respDeepUK.Indices)
 	}
 
-	// 4. Lookup "google.com" (from MAPS.GOOGLE.COM)
-	respGoogleCom, err := cli.LookupAllKey(ctx, "google.com", 10)
+	// 4. Lookup "com.google.maps." (from MAPS.GOOGLE.COM)
+	respGoogleMaps, err := cli.LookupAllKey(ctx, "com.google.maps.", 10)
 	if err != nil {
-		t.Fatalf("cli.LookupAllKey(google.com) failed: %v", err)
+		t.Fatalf("cli.LookupAllKey(com.google.maps.) failed: %v", err)
 	}
-	if !respGoogleCom.Exists {
-		t.Fatal("google.com should exist in index")
+	if !respGoogleMaps.Exists {
+		t.Fatal("com.google.maps. should exist in index")
 	}
-	if len(respGoogleCom.Indices) != 1 || respGoogleCom.Indices[0] != 2 {
-		t.Fatalf("google.com indices = %v, want [2]", respGoogleCom.Indices)
+	if len(respGoogleMaps.Indices) != 1 || respGoogleMaps.Indices[0] != 2 {
+		t.Fatalf("com.google.maps. indices = %v, want [2]", respGoogleMaps.Indices)
 	}
 
 	// 5. Lookup unknown key (verified non-inclusion)
-	respUnknown, err := cli.LookupAllKey(ctx, "nonexistent.example.org", 10)
+	respUnknown, err := cli.LookupAllKey(ctx, "org.example.nonexistent.", 10)
 	if err != nil {
-		t.Fatalf("cli.LookupAllKey(nonexistent.example.org) failed: %v", err)
+		t.Fatalf("cli.LookupAllKey(org.example.nonexistent.) failed: %v", err)
 	}
 	if respUnknown.Exists {
-		t.Fatal("nonexistent.example.org should not exist")
+		t.Fatal("org.example.nonexistent. should not exist")
 	}
 }

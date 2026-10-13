@@ -17,6 +17,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +29,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/mtc"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/mtc/mtctest"
 )
 
@@ -158,3 +162,87 @@ func BenchmarkMapMTCLeaf_WASM(b *testing.B) {
 		}
 	}
 }
+
+func buildCustomMTCLeaf(t *testing.T, cn string, sans []string) []byte {
+	t.Helper()
+	var subj pkix.RDNSequence
+	if cn != "" {
+		subj = pkix.RDNSequence{
+			pkix.RelativeDistinguishedNameSET{
+				pkix.AttributeTypeAndValue{
+					Type:  asn1.ObjectIdentifier{2, 5, 4, 3},
+					Value: cn,
+				},
+			},
+		}
+	}
+
+	var exts []asn1.RawValue
+	if len(sans) > 0 {
+		var rawNames []asn1.RawValue
+		for _, s := range sans {
+			rawNames = append(rawNames, asn1.RawValue{Tag: 2, Class: 2, Bytes: []byte(s)})
+		}
+		sanVal, err := asn1.Marshal(rawNames)
+		if err != nil {
+			t.Fatalf("failed to marshal SANs: %v", err)
+		}
+		ext := struct {
+			Id       asn1.ObjectIdentifier
+			Critical bool `asn1:"optional,default:false"`
+			Value    []byte
+		}{
+			Id:    asn1.ObjectIdentifier{2, 5, 29, 17},
+			Value: sanVal,
+		}
+		extBytes, err := asn1.Marshal(ext)
+		if err != nil {
+			t.Fatalf("failed to marshal extension: %v", err)
+		}
+		exts = append(exts, asn1.RawValue{FullBytes: extBytes})
+	}
+
+	entry := mtc.TBSCertificateLogEntry{
+		Subject:    subj,
+		Extensions: exts,
+	}
+	der, err := asn1.Marshal(entry)
+	if err != nil {
+		t.Fatalf("failed to marshal TBSCertificateLogEntry: %v", err)
+	}
+	return append([]byte{0, 1}, der...)
+}
+
+func TestMapMTCLeaf_SubjectCN_IDNA_TrailingDot_And_Overflow(t *testing.T) {
+	// 1. Subject CN only + IDNA Punycode + trailing dot
+	leaf1 := buildCustomMTCLeaf(t, "cn-only.example.com.", []string{"münchen.de.", "*.münchen.de"})
+	var got1 []string
+	MapMTCLeaf(leaf1, func(key []byte) {
+		got1 = append(got1, string(key))
+	})
+	want1 := []string{
+		"com.example.cn-only.",
+		"de.xn--mnchen-3ya.",
+		"de.xn--mnchen-3ya.*.",
+	}
+	if diff := cmp.Diff(want1, got1); diff != "" {
+		t.Errorf("MapMTCLeaf(CN/IDNA/TrailingDot) mismatch (-want +got):\n%s", diff)
+	}
+
+	// 2. Overflow >64 unique SANs and >2048 bytes
+	var sans []string
+	var want2 []string
+	for i := 0; i < 100; i++ {
+		sans = append(sans, fmt.Sprintf("host-%03d.long-subdomain-segment.example.com", i))
+		want2 = append(want2, fmt.Sprintf("com.example.long-subdomain-segment.host-%03d.", i))
+	}
+	leaf2 := buildCustomMTCLeaf(t, "", sans)
+	var got2 []string
+	MapMTCLeaf(leaf2, func(key []byte) {
+		got2 = append(got2, string(key))
+	})
+	if diff := cmp.Diff(want2, got2); diff != "" {
+		t.Errorf("MapMTCLeaf(100 SANs overflow) mismatch (-want +got):\n%s", diff)
+	}
+}
+

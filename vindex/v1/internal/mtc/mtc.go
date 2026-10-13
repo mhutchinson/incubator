@@ -31,7 +31,7 @@ import (
 
 	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
 	"golang.org/x/mod/sumdb/note"
-	"golang.org/x/net/publicsuffix"
+	"golang.org/x/net/idna"
 )
 
 // Validity represents the validity period of a certificate.
@@ -72,7 +72,7 @@ func ParseTBSCertificateLogEntry(der []byte) (*TBSCertificateLogEntry, error) {
 
 var oidExtensionSubjectAltName = asn1.ObjectIdentifier{2, 5, 29, 17}
 
-// ExtractDNSNames extracts DNS names from the SAN extension of the entry.
+// ExtractDNSNames extracts DNS names from the Subject CommonName and SAN extension of the entry.
 func ExtractDNSNames(entry *TBSCertificateLogEntry) []string {
 	var dnsNames []string
 	for _, rawExt := range entry.Extensions {
@@ -91,6 +91,20 @@ func ExtractDNSNames(entry *TBSCertificateLogEntry) []string {
 			if raw.Class == 2 && raw.Tag == 2 {
 				dnsNames = append(dnsNames, string(raw.Bytes))
 			}
+		}
+	}
+	var subjName pkix.Name
+	subjName.FillFromRDNSequence(&entry.Subject)
+	if cn := subjName.CommonName; cn != "" {
+		found := false
+		for _, existing := range dnsNames {
+			if strings.EqualFold(existing, cn) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dnsNames = append(dnsNames, cn)
 		}
 	}
 	return dnsNames
@@ -246,7 +260,10 @@ func encodeBase128(v uint32) []byte {
 	return encoded
 }
 
-var sanOIDBytes = []byte{0x55, 0x1d, 0x11} // id-ce-subjectAltName (2.5.29.17)
+var (
+	sanOIDBytes = []byte{0x55, 0x1d, 0x11} // id-ce-subjectAltName (2.5.29.17)
+	cnOIDBytes  = []byte{0x55, 0x04, 0x03} // id-at-commonName (2.5.4.3)
+)
 
 func readTagLen(b []byte) (tag byte, content []byte, rest []byte, ok bool) {
 	if len(b) < 2 {
@@ -274,17 +291,46 @@ func readTagLen(b []byte) (tag byte, content []byte, rest []byte, ok bool) {
 	return tag, b[2+numBytes : 2+numBytes+l], b[2+numBytes+l:], true
 }
 
-func extractDNSNamesFromDER(der []byte, emit func(dns string)) {
+func extractDNSNamesFromDER(der []byte, emit func(dns []byte)) {
 	tag, tbsContent, _, ok := readTagLen(der)
 	if !ok || tag != 0x30 {
 		return
 	}
 
+	seqCount := 0
 	for len(tbsContent) > 0 {
 		var field []byte
 		tag, field, tbsContent, ok = readTagLen(tbsContent)
 		if !ok {
 			return
+		}
+		if tag == 0x30 {
+			seqCount++
+			if seqCount == 3 { // 3rd SEQUENCE in TBSCertificateLogEntry is Subject
+				subjSeq := field
+				for len(subjSeq) > 0 {
+					var rdnSet []byte
+					tag, rdnSet, subjSeq, ok = readTagLen(subjSeq)
+					if !ok || tag != 0x31 {
+						break
+					}
+					for len(rdnSet) > 0 {
+						var attrSeq []byte
+						tag, attrSeq, rdnSet, ok = readTagLen(rdnSet)
+						if !ok || tag != 0x30 {
+							break
+						}
+						oTag, oid, attrRest, ok := readTagLen(attrSeq)
+						if ok && oTag == 0x06 && bytes.Equal(oid, cnOIDBytes) {
+							_, val, _, ok := readTagLen(attrRest)
+							if ok && len(val) > 0 {
+								emit(val)
+							}
+						}
+					}
+				}
+			}
+			continue
 		}
 		if tag == 0xa3 { // [3] EXPLICIT Extensions
 			tag, extSeq, _, ok := readTagLen(field)
@@ -328,7 +374,7 @@ func extractDNSNamesFromDER(der []byte, emit func(dns string)) {
 						return
 					}
 					if tag == 0x82 { // [2] IMPLICIT dNSName
-						emit(string(item))
+						emit(item)
 					}
 				}
 				return
@@ -337,9 +383,123 @@ func extractDNSNamesFromDER(der []byte, emit func(dns string)) {
 	}
 }
 
-// ExtractDomainNames parses an MTC log leaf and invokes emit for each unique canonical domain name
+func isASCIIWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
+}
 
-// and hierarchical sub-root down to eTLD+1.
+// canonicalizeDomainBytes normalizes a raw DNS name or Subject CN into a reversed-label
+// canonical key with a mandatory trailing dot (e.g. "*.mail.google.com" -> "com.google.mail.*.").
+func canonicalizeDomainBytes(raw []byte, outBuf *[256]byte) ([]byte, bool) {
+	for len(raw) > 0 && isASCIIWhitespace(raw[0]) {
+		raw = raw[1:]
+	}
+	for len(raw) > 0 && isASCIIWhitespace(raw[len(raw)-1]) {
+		raw = raw[:len(raw)-1]
+	}
+	if len(raw) > 0 && raw[len(raw)-1] == '.' {
+		raw = raw[:len(raw)-1]
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+
+	hasWildcard := false
+	if len(raw) >= 2 && raw[0] == '*' && raw[1] == '.' {
+		hasWildcard = true
+		raw = raw[2:]
+	} else if raw[0] == '*' {
+		return nil, false
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+
+	hasNonASCII := false
+	for i := 0; i < len(raw); i++ {
+		if raw[i] >= 0x80 {
+			hasNonASCII = true
+			break
+		}
+	}
+	if hasNonASCII {
+		ascii, err := idna.Lookup.ToASCII(string(raw))
+		if err != nil || len(ascii) == 0 {
+			return nil, false
+		}
+		if ascii[len(ascii)-1] == '.' {
+			ascii = ascii[:len(ascii)-1]
+		}
+		if len(ascii) == 0 {
+			return nil, false
+		}
+		raw = []byte(ascii)
+	}
+
+	needed := len(raw) + 1
+	if hasWildcard {
+		needed += 2
+	}
+	if len(raw) > 253 || needed > len(outBuf) {
+		return nil, false
+	}
+
+	outLen := 0
+	dotCount := 0
+	labelEnd := len(raw)
+
+	for i := len(raw) - 1; i >= -1; i-- {
+		if i == -1 || raw[i] == '.' {
+			if i >= 0 {
+				dotCount++
+			}
+			labelStart := i + 1
+			labelLen := labelEnd - labelStart
+			if labelLen < 1 || labelLen > 63 {
+				return nil, false
+			}
+			for j := labelStart; j < labelEnd; j++ {
+				c := raw[j]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+					return nil, false
+				}
+				outBuf[outLen] = c
+				outLen++
+			}
+			outBuf[outLen] = '.'
+			outLen++
+			labelEnd = i
+		}
+	}
+
+	if dotCount < 1 {
+		return nil, false
+	}
+	if hasWildcard {
+		outBuf[outLen] = '*'
+		outLen++
+		outBuf[outLen] = '.'
+		outLen++
+	}
+	return outBuf[:outLen], true
+}
+
+// CanonicalizeDomain converts a domain string (e.g. "mail.google.com" or "*.google.com")
+// into its reversed-label canonical key with a mandatory trailing dot ("com.google.mail."
+// or "com.google.*."). Returns ("", false) if the input is not a valid domain.
+func CanonicalizeDomain(raw string) (string, bool) {
+	var buf [256]byte
+	out, ok := canonicalizeDomainBytes([]byte(raw), &buf)
+	if !ok {
+		return "", false
+	}
+	return string(out), true
+}
+
+// ExtractDomainNames parses an MTC log leaf and invokes emit for each unique reversed-label
+// canonical domain key with a trailing dot.
 func ExtractDomainNames(leaf []byte, emit func(domain string)) {
 	if len(leaf) < 2 {
 		return
@@ -349,52 +509,21 @@ func ExtractDomainNames(leaf []byte, emit func(domain string)) {
 		return
 	}
 
-	var namesBuf [16]string
+	var namesBuf [64]string
 	names := namesBuf[:0]
+	var outBuf [256]byte
 
-	addName := func(s string) {
+	extractDNSNamesFromDER(leaf[2:], func(raw []byte) {
+		canonBytes, ok := canonicalizeDomainBytes(raw, &outBuf)
+		if !ok {
+			return
+		}
 		for _, existing := range names {
-			if existing == s {
+			if len(existing) == len(canonBytes) && existing == string(canonBytes) {
 				return
 			}
 		}
-		names = append(names, s)
-	}
-
-	extractDNSNamesFromDER(leaf[2:], func(cn string) {
-		cn = strings.ToLower(cn)
-		if strings.HasPrefix(cn, "*.") {
-			cn = cn[2:]
-		} else if strings.HasPrefix(cn, "*") {
-			cn = cn[1:]
-		}
-		if cn == "" {
-			return
-		}
-		addName(cn)
-
-		etld1, err := publicsuffix.EffectiveTLDPlusOne(cn)
-		if err != nil {
-			return
-		}
-		if cn == etld1 {
-			return
-		}
-		curr := cn
-		for {
-			idx := strings.Index(curr, ".")
-			if idx == -1 {
-				break
-			}
-			curr = curr[idx+1:]
-			if len(curr) < len(etld1) {
-				break
-			}
-			addName(curr)
-			if curr == etld1 {
-				break
-			}
-		}
+		names = append(names, string(canonBytes))
 	})
 
 	for _, name := range names {
@@ -410,6 +539,7 @@ func (m *MTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.Mapped
 	var entries []ingest.MappedEntry
 	ExtractDomainNames(leaf, func(name string) {
 		entries = append(entries, ingest.MappedEntry{
+			Key:     name,
 			KeyHash: sha256.Sum256([]byte(name)),
 		})
 	})

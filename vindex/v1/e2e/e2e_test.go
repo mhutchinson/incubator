@@ -442,11 +442,18 @@ func TestTier1_BackwardPagination_MultiPageChaining(t *testing.T) {
 	// 1. Stepwise backward pagination with page size 4
 	var collected []uint64
 	var before *uint64
+	var expectedSubRoot [32]byte
 	pageCount := 0
 
 	for {
 		pageCount++
-		resp, err := cli.Lookup(ctx, hotKey, before, 4)
+		var resp *client.LookupResponse
+		var err error
+		if before == nil {
+			resp, err = cli.Lookup(ctx, hotKey, nil, 4)
+		} else {
+			resp, err = cli.Lookup(ctx, hotKey, before, 4, expectedSubRoot)
+		}
 		if err != nil {
 			t.Fatalf("page %d lookup failed: %v", pageCount, err)
 		}
@@ -460,6 +467,11 @@ func TestTier1_BackwardPagination_MultiPageChaining(t *testing.T) {
 		if resp.NextBefore == nil {
 			break
 		}
+		nextSub, err := resp.NextExpectedSubRoot()
+		if err != nil {
+			t.Fatalf("page %d NextExpectedSubRoot failed: %v", pageCount, err)
+		}
+		expectedSubRoot = nextSub
 		before = resp.NextBefore
 	}
 
@@ -637,8 +649,15 @@ func TestTier2_ChunkBoundarySpanning_MicroChunks(t *testing.T) {
 	// Stepwise pagination across chunk boundaries with small page size (3 items)
 	var allIndices []uint64
 	var before *uint64
+	var expectedSubRoot [32]byte
 	for {
-		resp, err := cli.Lookup(ctx, targetKey, before, 3)
+		var resp *client.LookupResponse
+		var err error
+		if before == nil {
+			resp, err = cli.Lookup(ctx, targetKey, nil, 3)
+		} else {
+			resp, err = cli.Lookup(ctx, targetKey, before, 3, expectedSubRoot)
+		}
 		if err != nil {
 			t.Fatalf("Lookup failed at before=%v: %v", before, err)
 		}
@@ -649,6 +668,11 @@ func TestTier2_ChunkBoundarySpanning_MicroChunks(t *testing.T) {
 		if resp.NextBefore == nil {
 			break
 		}
+		nextSub, err := resp.NextExpectedSubRoot()
+		if err != nil {
+			t.Fatalf("NextExpectedSubRoot failed: %v", err)
+		}
+		expectedSubRoot = nextSub
 		before = resp.NextBefore
 	}
 
@@ -1149,6 +1173,7 @@ func TestTier4_SumDBPersonality_RealWorld(t *testing.T) {
 			if !seen[modPath] {
 				seen[modPath] = true
 				entries = append(entries, vindex.MappedEntry{
+					Key:     modPath,
 					KeyHash: sha256.Sum256([]byte(modPath)),
 				})
 			}
@@ -1171,34 +1196,46 @@ func TestTier4_SumDBPersonality_RealWorld(t *testing.T) {
 	cli := cluster.newClient(ts.URL)
 
 	// golang.org/x/text should be found at leaves 0, 1, 4 (pseudo-version leaf 3 filtered out)
-	respText, err := cli.Lookup(ctx, textKey, nil, 100)
+	respText, err := cli.LookupKey(ctx, "golang.org/x/text", nil, 100)
 	if err != nil {
-		t.Fatalf("Lookup(golang.org/x/text) failed: %v", err)
+		t.Fatalf("LookupKey(golang.org/x/text) failed: %v", err)
 	}
 	if !respText.Exists {
 		t.Fatalf("expected golang.org/x/text to exist")
 	}
 	if !slices.Equal(respText.Indices, []uint64{0, 1, 4}) {
-		t.Fatalf("Lookup(golang.org/x/text) indices = %v, want [0, 1, 4]", respText.Indices)
+		t.Fatalf("LookupKey(golang.org/x/text) indices = %v, want [0, 1, 4]", respText.Indices)
 	}
 
 	// golang.org/x/crypto should be found at leaf 2
-	respCrypto, err := cli.Lookup(ctx, cryptoKey, nil, 100)
+	respCrypto, err := cli.LookupKey(ctx, "golang.org/x/crypto", nil, 100)
 	if err != nil {
-		t.Fatalf("Lookup(golang.org/x/crypto) failed: %v", err)
+		t.Fatalf("LookupKey(golang.org/x/crypto) failed: %v", err)
 	}
 	if !respCrypto.Exists || !slices.Equal(respCrypto.Indices, []uint64{2}) {
-		t.Fatalf("Lookup(golang.org/x/crypto) = %v, want [2]", respCrypto.Indices)
+		t.Fatalf("LookupKey(golang.org/x/crypto) = %v, want [2]", respCrypto.Indices)
+	}
+
+	// Prefix lookup for "golang.org/x/" must return both golang.org/x/crypto and golang.org/x/text
+	prefixResp, err := cli.LookupPrefixAll(ctx, "golang.org/x/", 100)
+	if err != nil {
+		t.Fatalf("LookupPrefixAll(golang.org/x/) failed: %v", err)
+	}
+	if len(prefixResp.Results) != 2 {
+		t.Fatalf("LookupPrefixAll(golang.org/x/) len = %d, want 2", len(prefixResp.Results))
 	}
 
 	// example.com/pseudoonly should have 0 indexed entries -> authenticated non-inclusion
-	respPseudo, err := cli.Lookup(ctx, pseudoOnlyKey, nil, 100)
+	respPseudo, err := cli.LookupKey(ctx, "example.com/pseudoonly", nil, 100)
 	if err != nil {
-		t.Fatalf("Lookup(example.com/pseudoonly) failed: %v", err)
+		t.Fatalf("LookupKey(example.com/pseudoonly) failed: %v", err)
 	}
 	if respPseudo.Exists {
 		t.Fatalf("expected non-inclusion for pseudo-only module, got Exists=true")
 	}
+	_ = textKey
+	_ = cryptoKey
+	_ = pseudoOnlyKey
 }
 
 // TestTier4_MTCPersonality_RealWorld simulates Merkle Tree Certificates / Certificate
@@ -1220,26 +1257,13 @@ func TestTier4_MTCPersonality_RealWorld(t *testing.T) {
 
 	domainMapper := vindex.FuncMapper(func(_ context.Context, leaf []byte) ([]vindex.MappedEntry, error) {
 		name := strings.TrimSpace(string(leaf))
-		unique := make(map[string]bool)
-		curr := name
-		for {
-			unique[curr] = true
-			idx := strings.Index(curr, ".")
-			if idx == -1 || idx == len(curr)-1 {
-				break
-			}
-			curr = curr[idx+1:]
-			if !strings.Contains(curr, ".") {
-				break // reached TLD, e.g. "dev" or "com"
-			}
-		}
-		var entries []vindex.MappedEntry
-		for d := range unique {
-			entries = append(entries, vindex.MappedEntry{
-				KeyHash: sha256.Sum256([]byte(d)),
-			})
-		}
-		return entries, nil
+		labels := strings.Split(name, ".")
+		slices.Reverse(labels)
+		revKey := strings.Join(labels, ".") + "."
+		return []vindex.MappedEntry{{
+			Key:     revKey,
+			KeyHash: sha256.Sum256([]byte(revKey)),
+		}}, nil
 	})
 
 	engine, err := vindex.New(cluster.config, domainMapper)
@@ -1256,31 +1280,28 @@ func TestTier4_MTCPersonality_RealWorld(t *testing.T) {
 
 	cli := cluster.newClient(ts.URL)
 
-	// Query base domain "transparency.dev": should match leaves 0 and 1
-	transKey := sha256.Sum256([]byte("transparency.dev"))
-	respTrans, err := cli.Lookup(ctx, transKey, nil, 100)
+	// Query prefix "dev.transparency." (base domain transparency.dev): should match leaves 0 and 1 across 2 keys
+	respTransPrefix, err := cli.LookupPrefixAll(ctx, "dev.transparency.", 100)
 	if err != nil {
-		t.Fatalf("Lookup(transparency.dev) failed: %v", err)
+		t.Fatalf("LookupPrefixAll(dev.transparency.) failed: %v", err)
 	}
-	if !slices.Equal(respTrans.Indices, []uint64{0, 1}) {
-		t.Fatalf("Lookup(transparency.dev) = %v, want [0, 1]", respTrans.Indices)
+	if len(respTransPrefix.Results) != 2 {
+		t.Fatalf("LookupPrefixAll(dev.transparency.) keys = %d, want 2", len(respTransPrefix.Results))
 	}
 
-	// Query subdomain "auth.transparency.dev": should match leaf 1
-	authKey := sha256.Sum256([]byte("auth.transparency.dev"))
-	respAuth, err := cli.Lookup(ctx, authKey, nil, 100)
+	// Query exact subdomain "dev.transparency.auth.": should match leaf 1
+	respAuth, err := cli.LookupKey(ctx, "dev.transparency.auth.", nil, 100)
 	if err != nil {
-		t.Fatalf("Lookup(auth.transparency.dev) failed: %v", err)
+		t.Fatalf("LookupKey(dev.transparency.auth.) failed: %v", err)
 	}
 	if !slices.Equal(respAuth.Indices, []uint64{1}) {
-		t.Fatalf("Lookup(auth.transparency.dev) = %v, want [1]", respAuth.Indices)
+		t.Fatalf("LookupKey(dev.transparency.auth.) = %v, want [1]", respAuth.Indices)
 	}
 
-	// Query unissued domain "malicious.fake.com": verified non-inclusion
-	fakeKey := sha256.Sum256([]byte("malicious.fake.com"))
-	respFake, err := cli.Lookup(ctx, fakeKey, nil, 100)
+	// Query unissued domain "com.fake.malicious.": verified non-inclusion
+	respFake, err := cli.LookupKey(ctx, "com.fake.malicious.", nil, 100)
 	if err != nil {
-		t.Fatalf("Lookup(malicious.fake.com) failed: %v", err)
+		t.Fatalf("LookupKey(com.fake.malicious.) failed: %v", err)
 	}
 	if respFake.Exists {
 		t.Fatalf("expected non-inclusion for unissued domain, got true")

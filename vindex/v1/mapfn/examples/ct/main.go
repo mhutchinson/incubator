@@ -20,11 +20,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"slices"
-	"strings"
 
 	"github.com/transparency-dev/incubator/vindex/v1/mapfn/sdk"
-	"golang.org/x/net/publicsuffix"
+	"golang.org/x/net/idna"
 )
 
 func main() {}
@@ -38,76 +36,165 @@ var (
 	oidCNRaw  = []byte{0x55, 0x04, 0x03} // 2.5.4.3 (Common Name)
 )
 
-// MapCTLeaf extracts all domain names (CN + SANs) and hierarchical sub-roots from a CT log leaf.
+type domainSpan struct {
+	start uint16
+	end   uint16
+}
+
+var (
+	leafStorage [2048]byte
+	leafSpans   [64]domainSpan
+)
+
+// MapCTLeaf extracts all unique reversed-label canonical domain keys from a CT log leaf.
 func MapCTLeaf(data []byte, emit func(key []byte)) {
-	names := extractRawDomainNames(data)
-	if len(names) == 0 {
+	if len(data) == 0 {
 		return
 	}
 
-	uniqueNames := make(map[string]struct{}, len(names)*2)
-	for _, rawName := range names {
-		norm := normalizeDomain(rawName)
-		if norm == "" {
-			continue
-		}
-		uniqueNames[norm] = struct{}{}
+	storageUsed := 0
+	spanCount := 0
+	var overflowDomains [][]byte
+	var outBuf [256]byte
 
-		// Compute hierarchical domain sub-roots down to eTLD+1
-		etld1, err := publicsuffix.EffectiveTLDPlusOne(norm)
-		if err == nil && etld1 != "" {
-			uniqueNames[etld1] = struct{}{}
-			curr := norm
-			for {
-				idx := strings.Index(curr, ".")
-				if idx == -1 {
-					break
-				}
-				curr = curr[idx+1:]
-				if len(curr) < len(etld1) {
-					break
-				}
-				uniqueNames[curr] = struct{}{}
-				if curr == etld1 {
-					break
-				}
+	extractRawDomainNames(data, func(rawName []byte) {
+		canon, ok := canonicalizeDomainBytes(rawName, &outBuf)
+		if !ok {
+			return
+		}
+
+		for i := 0; i < spanCount; i++ {
+			sp := leafSpans[i]
+			if bytes.Equal(leafStorage[sp.start:sp.end], canon) {
+				return
 			}
+		}
+		for _, ov := range overflowDomains {
+			if bytes.Equal(ov, canon) {
+				return
+			}
+		}
+
+		if storageUsed+len(canon) <= len(leafStorage) && spanCount < len(leafSpans) {
+			baseStart := uint16(storageUsed)
+			baseEnd := baseStart + uint16(len(canon))
+			copy(leafStorage[baseStart:], canon)
+			storageUsed = int(baseEnd)
+			leafSpans[spanCount] = domainSpan{start: baseStart, end: baseEnd}
+			spanCount++
 		} else {
-			// Fallback if publicsuffix fails: generate sub-labels down to top 2 labels
-			curr := norm
-			for {
-				idx := strings.Index(curr, ".")
-				if idx == -1 {
-					break
-				}
-				curr = curr[idx+1:]
-				if !strings.Contains(curr, ".") {
-					break
-				}
-				uniqueNames[curr] = struct{}{}
-			}
+			overflowDomains = append(overflowDomains, append([]byte(nil), canon...))
 		}
-	}
+	})
 
-	sortedNames := make([]string, 0, len(uniqueNames))
-	for name := range uniqueNames {
-		sortedNames = append(sortedNames, name)
+	for i := 0; i < spanCount; i++ {
+		sp := leafSpans[i]
+		emit(leafStorage[sp.start:sp.end])
 	}
-	slices.Sort(sortedNames)
-	for _, name := range sortedNames {
-		emit([]byte(name))
+	for _, ov := range overflowDomains {
+		emit(ov)
 	}
 }
 
-func normalizeDomain(name string) string {
-	name = strings.TrimSpace(strings.ToLower(name))
-	if strings.HasPrefix(name, "*.") {
-		name = name[2:]
-	} else if strings.HasPrefix(name, "*") {
-		name = name[1:]
+func isASCIIWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
+}
+
+func canonicalizeDomainBytes(raw []byte, outBuf *[256]byte) ([]byte, bool) {
+	for len(raw) > 0 && isASCIIWhitespace(raw[0]) {
+		raw = raw[1:]
 	}
-	name = strings.TrimSuffix(name, ".")
-	return name
+	for len(raw) > 0 && isASCIIWhitespace(raw[len(raw)-1]) {
+		raw = raw[:len(raw)-1]
+	}
+	if len(raw) > 0 && raw[len(raw)-1] == '.' {
+		raw = raw[:len(raw)-1]
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+
+	hasWildcard := false
+	if len(raw) >= 2 && raw[0] == '*' && raw[1] == '.' {
+		hasWildcard = true
+		raw = raw[2:]
+	} else if raw[0] == '*' {
+		return nil, false
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+
+	hasNonASCII := false
+	for i := 0; i < len(raw); i++ {
+		if raw[i] >= 0x80 {
+			hasNonASCII = true
+			break
+		}
+	}
+	if hasNonASCII {
+		ascii, err := idna.Lookup.ToASCII(string(raw))
+		if err != nil || len(ascii) == 0 {
+			return nil, false
+		}
+		if ascii[len(ascii)-1] == '.' {
+			ascii = ascii[:len(ascii)-1]
+		}
+		if len(ascii) == 0 {
+			return nil, false
+		}
+		raw = []byte(ascii)
+	}
+
+	needed := len(raw) + 1
+	if hasWildcard {
+		needed += 2
+	}
+	if len(raw) > 253 || needed > len(outBuf) {
+		return nil, false
+	}
+
+	outLen := 0
+	dotCount := 0
+	labelEnd := len(raw)
+
+	for i := len(raw) - 1; i >= -1; i-- {
+		if i == -1 || raw[i] == '.' {
+			if i >= 0 {
+				dotCount++
+			}
+			labelStart := i + 1
+			labelLen := labelEnd - labelStart
+			if labelLen < 1 || labelLen > 63 {
+				return nil, false
+			}
+			for j := labelStart; j < labelEnd; j++ {
+				c := raw[j]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+					return nil, false
+				}
+				outBuf[outLen] = c
+				outLen++
+			}
+			outBuf[outLen] = '.'
+			outLen++
+			labelEnd = i
+		}
+	}
+
+	if dotCount < 1 {
+		return nil, false
+	}
+	if hasWildcard {
+		outBuf[outLen] = '*'
+		outLen++
+		outBuf[outLen] = '.'
+		outLen++
+	}
+	return outBuf[:outLen], true
 }
 
 // readASN1Header parses tag and length at pos. Returns (tag, contentStart, contentEnd, nextElem, ok).
@@ -142,21 +229,20 @@ func readASN1Header(b []byte, pos int) (tag byte, start, end, next int, ok bool)
 }
 
 // fastExtractDomainsFromTBS extracts CommonName and SAN DNSNames from raw TBSCertificate DER.
-func fastExtractDomainsFromTBS(tbs []byte) []string {
+func fastExtractDomainsFromTBS(tbs []byte, emit func(raw []byte)) bool {
 	tag, start, end, _, ok := readASN1Header(tbs, 0)
 	if !ok || tag != 0x30 {
-		return nil
+		return false
 	}
 	payload := tbs[start:end]
 
-	var names []string
 	pos := 0
 
 	// 1. Optional version [0] EXPLICIT
 	if pos < len(payload) && payload[pos] == 0xa0 {
 		_, _, _, next, ok := readASN1Header(payload, pos)
 		if !ok {
-			return nil
+			return false
 		}
 		pos = next
 	}
@@ -165,78 +251,51 @@ func fastExtractDomainsFromTBS(tbs []byte) []string {
 	if tag, _, _, next, ok := readASN1Header(payload, pos); ok && tag == 0x02 {
 		pos = next
 	} else {
-		return nil
+		return false
 	}
 
 	// 3. signature AlgorithmIdentifier SEQUENCE (0x30)
 	if tag, _, _, next, ok := readASN1Header(payload, pos); ok && tag == 0x30 {
 		pos = next
 	} else {
-		return nil
+		return false
 	}
 
 	// 4. issuer Name SEQUENCE (0x30)
 	if tag, _, _, next, ok := readASN1Header(payload, pos); ok && tag == 0x30 {
 		pos = next
 	} else {
-		return nil
+		return false
 	}
 
 	// 5. validity Validity SEQUENCE (0x30)
 	if tag, _, _, next, ok := readASN1Header(payload, pos); ok && tag == 0x30 {
 		pos = next
 	} else {
-		return nil
+		return false
 	}
 
 	// 6. subject Name SEQUENCE (0x30)
+	var subjectBytes []byte
 	if tag, sStart, sEnd, next, ok := readASN1Header(payload, pos); ok && tag == 0x30 {
 		pos = next
-		subjectBytes := payload[sStart:sEnd]
-		sPos := 0
-		for sPos < len(subjectBytes) {
-			_, setStart, setEnd, setNext, ok := readASN1Header(subjectBytes, sPos)
-			if !ok {
-				break
-			}
-			setBytes := subjectBytes[setStart:setEnd]
-			subPos := 0
-			for subPos < len(setBytes) {
-				_, seqStart, seqEnd, seqNext, ok := readASN1Header(setBytes, subPos)
-				if !ok {
-					break
-				}
-				seqBytes := setBytes[seqStart:seqEnd]
-				oTag, oStart, oEnd, oNext, ok := readASN1Header(seqBytes, 0)
-				if ok && oTag == 0x06 && bytes.Equal(seqBytes[oStart:oEnd], oidCNRaw) {
-					_, vStart, vEnd, _, ok := readASN1Header(seqBytes, oNext)
-					if ok {
-						val := string(seqBytes[vStart:vEnd])
-						if val != "" {
-							names = append(names, val)
-						}
-					}
-				}
-				subPos = seqNext
-			}
-			sPos = setNext
-		}
+		subjectBytes = payload[sStart:sEnd]
 	} else {
-		return nil
+		return false
 	}
 
 	// 7. subjectPublicKeyInfo SEQUENCE (0x30) - SKIP without parsing keys!
 	if tag, _, _, next, ok := readASN1Header(payload, pos); ok && tag == 0x30 {
 		pos = next
 	} else {
-		return nil
+		return false
 	}
 
 	// Optional: issuerUniqueID [1]
 	if pos < len(payload) && payload[pos] == 0x81 {
 		_, _, _, next, ok := readASN1Header(payload, pos)
 		if !ok {
-			return nil
+			return false
 		}
 		pos = next
 	}
@@ -245,9 +304,36 @@ func fastExtractDomainsFromTBS(tbs []byte) []string {
 	if pos < len(payload) && payload[pos] == 0x82 {
 		_, _, _, next, ok := readASN1Header(payload, pos)
 		if !ok {
-			return nil
+			return false
 		}
 		pos = next
+	}
+
+	// Emit Subject CN if present
+	sPos := 0
+	for sPos < len(subjectBytes) {
+		_, setStart, setEnd, setNext, ok := readASN1Header(subjectBytes, sPos)
+		if !ok {
+			break
+		}
+		setBytes := subjectBytes[setStart:setEnd]
+		subPos := 0
+		for subPos < len(setBytes) {
+			_, seqStart, seqEnd, seqNext, ok := readASN1Header(setBytes, subPos)
+			if !ok {
+				break
+			}
+			seqBytes := setBytes[seqStart:seqEnd]
+			oTag, oStart, oEnd, oNext, ok := readASN1Header(seqBytes, 0)
+			if ok && oTag == 0x06 && bytes.Equal(seqBytes[oStart:oEnd], oidCNRaw) {
+				_, vStart, vEnd, _, ok := readASN1Header(seqBytes, oNext)
+				if ok && vEnd > vStart {
+					emit(seqBytes[vStart:vEnd])
+				}
+			}
+			subPos = seqNext
+		}
+		sPos = setNext
 	}
 
 	// Optional: extensions [3] EXPLICIT (0xa3)
@@ -288,8 +374,8 @@ func fastExtractDomainsFromTBS(tbs []byte) []string {
 									if !ok {
 										break
 									}
-									if tag == 0x82 { // dNSName [2]
-										names = append(names, string(gnList[dStart:dEnd]))
+									if tag == 0x82 && dEnd > dStart { // dNSName [2]
+										emit(gnList[dStart:dEnd])
 									}
 									gnPos = gnNext
 								}
@@ -302,26 +388,26 @@ func fastExtractDomainsFromTBS(tbs []byte) []string {
 		}
 	}
 
-	return names
+	return true
 }
 
 // fastExtractDomainsFromCert unwraps the outer Certificate SEQUENCE and parses TBSCertificate.
-func fastExtractDomainsFromCert(certDer []byte) []string {
+func fastExtractDomainsFromCert(certDer []byte, emit func(raw []byte)) bool {
 	tag, start, end, _, ok := readASN1Header(certDer, 0)
 	if !ok || tag != 0x30 {
-		return nil
+		return false
 	}
 	outer := certDer[start:end]
 	tag, _, _, _, ok = readASN1Header(outer, 0)
 	if !ok || tag != 0x30 {
-		return nil
+		return false
 	}
-	return fastExtractDomainsFromTBS(outer)
+	return fastExtractDomainsFromTBS(outer, emit)
 }
 
-func extractRawDomainNames(data []byte) []string {
+func extractRawDomainNames(data []byte, emit func(raw []byte)) {
 	if len(data) == 0 {
-		return nil
+		return
 	}
 
 	// 1. Try RFC 6962 MerkleTreeLeaf parsing (starts with 0x00, 0x00 version & leaf_type)
@@ -329,16 +415,16 @@ func extractRawDomainNames(data []byte) []string {
 		entryType := binary.BigEndian.Uint16(data[10:12])
 		if entryType == 0 && len(data) >= 15 { // x509_entry
 			certLen := int(data[12])<<16 | int(data[13])<<8 | int(data[14])
-			if len(data) >= 15+certLen {
-				if names := fastExtractDomainsFromCert(data[15 : 15+certLen]); len(names) > 0 {
-					return names
+			if certLen > 0 && len(data) >= 15+certLen {
+				if fastExtractDomainsFromCert(data[15:15+certLen], emit) {
+					return
 				}
 			}
 		} else if entryType == 1 && len(data) >= 47 { // precert_entry
 			tbsLen := int(data[44])<<16 | int(data[45])<<8 | int(data[46])
-			if len(data) >= 47+tbsLen {
-				if names := fastExtractDomainsFromTBS(data[47 : 47+tbsLen]); len(names) > 0 {
-					return names
+			if tbsLen > 0 && len(data) >= 47+tbsLen {
+				if fastExtractDomainsFromTBS(data[47:47+tbsLen], emit) {
+					return
 				}
 			}
 		}
@@ -350,38 +436,25 @@ func extractRawDomainNames(data []byte) []string {
 		if entryType == 0 { // x509_entry
 			certLen := int(data[10])<<16 | int(data[11])<<8 | int(data[12])
 			if certLen > 0 && len(data) >= 13+certLen {
-				if names := fastExtractDomainsFromCert(data[13 : 13+certLen]); len(names) > 0 {
-					return names
+				if fastExtractDomainsFromCert(data[13:13+certLen], emit) {
+					return
 				}
 			}
 		} else if entryType == 1 && len(data) >= 45 { // precert_entry
 			tbsLen := int(data[42])<<16 | int(data[43])<<8 | int(data[44])
 			if tbsLen > 0 && len(data) >= 45+tbsLen {
-				if names := fastExtractDomainsFromTBS(data[45 : 45+tbsLen]); len(names) > 0 {
-					return names
+				if fastExtractDomainsFromTBS(data[45:45+tbsLen], emit) {
+					return
 				}
 			}
 		}
 	}
 
 	// 3. Try raw X.509 Certificate DER
-	if names := fastExtractDomainsFromCert(data); len(names) > 0 {
-		return names
+	if fastExtractDomainsFromCert(data, emit) {
+		return
 	}
 
 	// 4. Try raw TBSCertificate DER
-	if names := fastExtractDomainsFromTBS(data); len(names) > 0 {
-		return names
-	}
-
-	// 5. Fallback: plaintext domains (line separated)
-	var plainNames []string
-	lines := bytes.Split(data, []byte("\n"))
-	for _, l := range lines {
-		s := strings.TrimSpace(string(l))
-		if s != "" && !strings.Contains(s, " ") {
-			plainNames = append(plainNames, s)
-		}
-	}
-	return plainNames
+	_ = fastExtractDomainsFromTBS(data, emit)
 }

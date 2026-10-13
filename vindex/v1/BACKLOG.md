@@ -7,7 +7,7 @@ This backlog consolidates open architectural refinements, documentation alignmen
 | Milestone | Status | Scope & Backlog Items | Spec / Workboard |
 | :--- | :--- | :--- | :--- |
 | **M1: Core Storage, Recovery & Pipeline Hardening** | ✅ Complete | Orthogonal engine & storage fixes: `kvstore` (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`), `ingest` & WASM slab safety (`2.1.1`–`2.1.5`, `2.2.1`, `2.2.2`, `2.2.4`), `tree`/`coordinator` recovery & durability (`1.1.4`, `2.4.1`, `2.4.2`, `2.5.1`–`2.5.4`, `2.6.5`), and `auditor` (`2.7.1`–`2.7.4`). | [`docs/milestones/milestone-01-engine-hardening.md`](docs/milestones/milestone-01-engine-hardening.md) |
-| **M2: True Prefix Lookups & Two-Endpoint Read Protocol** | 🚧 In Progress | Variable-length `[]byte` MPT keys (`filippo.io/torchwood/mpt`), `/vindex/v1/keys/{key...}` + `/vindex/v1/entries/{key...}` split, server-side eTLD+1 & `maxPrefixKeys` guardrails, reversed-label trailing-dot CT/MTC mappers, and client verification (`1.1.0`, `1.1.1`, `2.2.3`, `2.6.1`–`2.6.3`). | [`docs/milestones/milestone-02-prefix-lookups.md`](docs/milestones/milestone-02-prefix-lookups.md) ([`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md)) |
+| **M2: True Prefix Lookups & Two-Endpoint Read Protocol** | ✅ Complete | Variable-length `[]byte` MPT keys (`filippo.io/torchwood/mpt`), `/vindex/v1/keys/{key...}` + `/vindex/v1/entries/{key...}` split, server-side eTLD+1 & `maxPrefixKeys` guardrails, reversed-label trailing-dot CT/MTC mappers, and client verification (`1.1.0`, `1.1.1`, `2.2.3`, `2.6.1`–`2.6.3`). | [`docs/milestones/milestone-02-prefix-lookups.md`](docs/milestones/milestone-02-prefix-lookups.md) ([`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md)) |
 | **M3: Package Decoupling & C2SP `tlog-vindex` Spec Alignment** | 📋 Planned | Split `internal/mpt` vs `internal/publish` (`1.2.1`, `2.6.4`), extract `mapfn/host` (`1.2.2`) and shared `wire/` (`1.2.3`), isolate `internal/mtc` (`1.2.4`), and align all Type A/B docs (`1.3.1`–`1.3.7`). | TBD (`milestone-03`) |
 
 > **Performance Commit Policy**: Every performance improvement (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`, etc.) MUST include unit tests and Go benchmarks (`go test -bench=... -benchmem`), and cite the **before/after performance scores (`ns/op`, `B/op`, `allocs/op`) directly in the commit message**.
@@ -23,7 +23,7 @@ It is organized into three categories:
 
 ### 1.1 Protocol & Read-Path Architecture Refinements
 
-- [ ] **1.1.0 Major Design Overhaul: True Prefix Lookups & Two-Endpoint Read Protocol**
+- [x] **1.1.0 Major Design Overhaul: True Prefix Lookups & Two-Endpoint Read Protocol**
   - **Design Doc**: [`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md)
   - **Affected Components**: `go.mod` (`filippo.io/torchwood/mpt`), [`internal/tree`](internal/tree/README.md), [`internal/kvstore`](internal/kvstore/README.md), [`internal/server`](internal/server/README.md), [`client`](client/README.md), [`cmd/mapfn-ct`](cmd/mapfn-ct/main.go), [`internal/mtc`](internal/mtc/README.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
   - **Summary**: Upgrade `filippo.io/torchwood/mpt` from fixed 32-byte hashed keys to native variable-length `[]byte` keys (`<= 1024` bytes) with prefix scanning (`Tree.Scan`), subtree proofs (`ProvePrefix` / `VerifyPrefix`), and point proofs (`ProveLookup` / `VerifyLookup`):
@@ -34,7 +34,7 @@ It is organized into three categories:
       2. `GET /vindex/v1/entries/{key...}?before=X[&limit=Y]` (Pebble only, zero MPT locks): Hashes `{key}` internally (`SHA256(key)`) and returns `prefix-compact-range-v1` + `indices-v1`.
     - **Server-Side Prefix Guardrails**: Move eTLD+1 Public Suffix List validation out of the WASM `MapFn` and into `GET /vindex/v1/keys/{key...}?prefix=true`, paired with a `maxPrefixKeys` scan cardinality cap.
 
-- [ ] **1.1.1 Zero-MPT Continuation & The "Map of Logs" API (`before != nil`)** *(Resolved by [`1.1.0` / `docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md))*
+- [x] **1.1.1 Zero-MPT Continuation & The "Map of Logs" API (`before != nil`)** *(Resolved by [`1.1.0` / `docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md))*
   - **Affected Components**: [`internal/server`](internal/server/README.md), [`client`](client/README.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
   - **Current Behavior**: Every query to `/vindex/v1/lookup/{keyhash}` acquires an MPT read lock (`mptMgr.RLock()`), retrieves serving state, and formats an Output Log checkpoint, Output Log leaf, Output Log inclusion proof, and MPT inclusion/non-inclusion proof alongside returned indices.
   - **Problem**: VIndex is a **Map of Logs** where `Map` commits to `KeyHash -> MiniLogRoot` at tip and `MiniLog` is an append-only RFC 6962 Merkle log of occurrence indices. On Page 1 (`before == nil`), the client authenticates `MiniLogRoot` against `MapRoot` via the MPT proof and computes `expectedMiniLogRoot` for the remaining prefix from `prefix-compact-range-v1`. On Page 2+ (`before = next_before`), the client verifies continuity purely against the previous page's `expectedMiniLogRoot`:
@@ -153,7 +153,7 @@ It is organized into three categories:
   - **Bug**: When a WASM guest traps or faults during pipeline ingestion (`WASMRunner.MapBundle`), `r.hadErr` is set to `true` and `WASMRunner.Close` destroys the faulted instance without returning a replacement to `h.pool` (permanently depleting a worker slot from the pool on each fault), while direct `WASMHost.MapLeaf`/`MapBundle` calls respawn a fresh replacement instance. Above the pipeline, `Coordinator.Run` and `Engine.Start` log a warning and retry on the next tick instead of halting the daemon.
   - **Fix**: Propagate a fatal/unrecoverable error sentinel on WASM execution traps and terminate the daemon to uphold the deterministic `HALT` invariant (and ensure pool capacity is never silently leaked).
 
-- [ ] **2.2.3 Ecosystem WASM Plugin Bugs (`ct`, `mtc`, `sumdb`)**
+- [x] **2.2.3 Ecosystem WASM Plugin Bugs (`ct`, `mtc`, `sumdb`)**
   - **Location**: [`mapfn/examples/ct/main.go`](mapfn/examples/ct/main.go), [`mapfn/examples/mtc/main.go`](mapfn/examples/mtc/main.go), [`mapfn/examples/sumdb/main.go`](mapfn/examples/sumdb/main.go)
   - **Bugs**:
     1. **Missing IDNA Punycode Conversion (`ct/main.go:102-111`, `mtc/main.go:221-241`)**: Neither plugin converts IDNs to Punycode (`idna.Lookup.ToASCII`); non-ASCII labels are emitted as raw bytes.
@@ -239,19 +239,19 @@ It is organized into three categories:
 
 ### 2.6 Read Serving & Client SDK (`internal/server/` & `client/`)
 
-- [ ] **2.6.1 Unverified MPT Proof & SubRoot When Calling `Client.Lookup` / `Verifier.VerifyResponse` with `before != nil`**
+- [x] **2.6.1 Unverified MPT Proof & SubRoot When Calling `Client.Lookup` / `Verifier.VerifyResponse` with `before != nil`**
   - **Location**: [`client/client.go:318-323`](client/client.go#L318-L323) (`Verifier.VerifyResponse`), [`client/client.go:475-507`](client/client.go#L475-L507) (`Client.Lookup`)
   - **Bug**: `VerifyResponse` only calls `tree.Verify(mapRoot, keyHash, computedMiniLogRoot, true, mptProofBytes)` when `before == nil`. Direct calls to `Client.Lookup` or `VerifyResponse` with `before != nil` perform **neither** MPT verification nor compact-range continuity verification against a preceding page, accepting arbitrary fabricated `indices-v1` and `prefix-compact-range-v1` payloads.
   - **Fix**: Require callers of paginated verification to supply the expected `MiniLogRoot` from the prior page's prefix compact range (or verify `expectedMiniLogRoot` inside `VerifyResponse` when `before != nil`).
 
-- [ ] **2.6.2 Truncation / Omission Vulnerability in `Client.LookupAll` and `computeMiniLogRoot`**
+- [x] **2.6.2 Truncation / Omission Vulnerability in `Client.LookupAll` and `computeMiniLogRoot`**
   - **Location**: [`client/client.go:538-567`](client/client.go#L538-L567) (`Client.LookupAll`), [`client/client.go:364-376`](client/client.go#L364-L376) (`computeMiniLogRoot`)
   - **Bug**:
     1. `LookupAll` breaks out of the backward pagination loop as soon as `resp.NextBefore == nil` (`client.go:564`) without asserting `resp.PrefixCoveredSz == 0 && len(resp.PrefixHashes) == 0`. A malicious server can return a valid `prefix-compact-range-v1` (passing `MiniLogRoot` verification) while omitting `<next_before>` from `— indices-v1 —`, causing `LookupAll` to return truncated history without error.
     2. In `computeMiniLogRoot` (`client.go:364-376`), if `prefixCoveredSize > 0` with `len(prefixHashes) == 0` (or `prefixCoveredSize == 0` with `len(prefixHashes) > 0`), it silently falls back to `rf.NewEmptyRange(0)` instead of returning a malformed proof error.
   - **Fix**: In `LookupAll`, return an error if `resp.NextBefore == nil && (resp.PrefixCoveredSz > 0 || len(resp.PrefixHashes) > 0)`, and require `resp.Indices[0] == *resp.NextBefore` when `NextBefore != nil`. In `computeMiniLogRoot`, reject mismatched `(prefixCoveredSize == 0) != (len(prefixHashes) == 0)`.
 
-- [ ] **2.6.3 Unverified Fallback & Linear SHA-256 Acceptance in `VIndexClient.Lookup`**
+- [x] **2.6.3 Unverified Fallback & Linear SHA-256 Acceptance in `VIndexClient.Lookup`**
   - **Location**: [`client/client.go:679-690`](client/client.go#L679-L690) (`VerifyLookupResponse`), [`client/client.go:726-738`](client/client.go#L726-L738) (`VIndexClient.Lookup`)
   - **Bug**: On *any* error from `c.client.Lookup`—including a cryptographic proof failure—`VIndexClient.Lookup` falls back to `GET /lookup/{keyhash}` (legacy JSON) and `VerifyLookupResponse`, which further falls back to accepting a plain linear `sha256` hash over raw 8-byte indices if RFC 6962 compact range verification fails.
   - **Fix**: Remove the legacy JSON endpoint fallback and linear SHA-256 hash fallback from `client/client.go`, and have `VIndexClient.Lookup` call `c.client.LookupAll`.

@@ -18,7 +18,6 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -26,7 +25,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/transparency-dev/incubator/vindex/v1/client"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/mtc"
@@ -44,6 +42,7 @@ var (
 	cosignerID   = flag.String("cosigner_id", "44363.48.9", "Cosigner ID for MTCVerifier")
 	logID        = flag.String("log_id", "44363.48.8", "Log ID for MTCVerifier")
 	domain       = flag.String("domain", "", "Domain name to search and verify")
+	prefixQuery  = flag.Bool("prefix", false, "Perform a prefix subtree lookup (?prefix=true) for all subdomains under --domain")
 	inLogURL     = flag.String("in_log_url", "", "Base URL of Input Log for dereferencing pointers (optional)")
 	dereference  = flag.Bool("dereference", false, "Dereference and print original leaves from Input Log")
 )
@@ -66,11 +65,9 @@ func run(ctx context.Context) error {
 		return errors.New("--vindex_url must be specified")
 	}
 
-	searchDomain := strings.ToLower(*domain)
-	if strings.HasPrefix(searchDomain, "*.") {
-		searchDomain = searchDomain[2:]
-	} else if strings.HasPrefix(searchDomain, "*") {
-		searchDomain = searchDomain[1:]
+	searchKey, ok := mtc.CanonicalizeDomain(*domain)
+	if !ok {
+		return fmt.Errorf("invalid domain %q", *domain)
 	}
 
 	var outVerifier note.Verifier
@@ -113,13 +110,30 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
 
-	keyHash := sha256.Sum256([]byte(searchDomain))
-	resp, err := cli.LookupAll(ctx, keyHash, 10000)
+	if *prefixQuery {
+		pResp, err := cli.LookupPrefixAll(ctx, searchKey, 10000)
+		if err != nil {
+			return fmt.Errorf("prefix lookup verification failed: %w", err)
+		}
+		fmt.Printf("Domain Prefix:  %s\n", *domain)
+		fmt.Printf("Canonical Key:  %s\n", searchKey)
+		fmt.Printf("Matched Keys:   %d\n", len(pResp.Results))
+		fmt.Printf("Map Root:       %x\n", pResp.MapRoot)
+		fmt.Printf("Output Log Size:%d\n", pResp.OutputLogSize)
+		fmt.Printf("Input Log Size: %d\n", pResp.InputLogSize)
+		for _, kr := range pResp.Results {
+			fmt.Printf("  Key %s (%x): %v\n", kr.Key, kr.MiniLogRoot, kr.Indices)
+		}
+		return nil
+	}
+
+	resp, err := cli.LookupAllKey(ctx, searchKey, 10000)
 	if err != nil {
 		return fmt.Errorf("lookup verification failed: %w", err)
 	}
 
-	fmt.Printf("Domain:         %s\n", searchDomain)
+	fmt.Printf("Domain:         %s\n", *domain)
+	fmt.Printf("Canonical Key:  %s\n", searchKey)
 	fmt.Printf("Key Hash:       %x\n", resp.KeyHash)
 	fmt.Printf("Exists:         %v\n", resp.Exists)
 	fmt.Printf("Map Root:       %x\n", resp.MapRoot)

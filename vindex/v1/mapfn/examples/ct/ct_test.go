@@ -97,22 +97,24 @@ func TestMapCTLeaf_X509Certificate(t *testing.T) {
 	}
 
 	expectedDomains := []string{
-		"example.com",
-		"foo.bar.example.com",
-		"bar.example.com",
-		"sub.example.org",
-		"example.org",
+		"com.example.",
+		"com.example.bar.foo.",
+		"org.example.sub.*.",
 	}
 
+	if len(domains) != len(expectedDomains) {
+		t.Errorf("got %d domains %v, want %d %v", len(domains), domains, len(expectedDomains), expectedDomains)
+	}
 	for _, d := range expectedDomains {
 		if !domainMap[d] {
-			t.Errorf("expected domain %q in mapped entries", d)
+			t.Errorf("expected domain %q in mapped entries, got %v", d, domains)
 		}
 	}
 }
 
-func TestMapCTLeaf_EffectiveTLDPlusOne(t *testing.T) {
-	certDer := generateTestCert(t, "deep.sub.service.co.uk", nil)
+func TestMapCTLeaf_MultiLabelTLD_And_IDNA(t *testing.T) {
+	// Subject.CommonName is marshaled as UTF8String by x509.CreateCertificate, allowing IDN test input.
+	certDer := generateTestCert(t, "*.münchen.de.", []string{"deep.sub.service.co.uk.", "MAPS.GOOGLE.COM"})
 	var domains []string
 	MapCTLeaf(certDer, func(key []byte) {
 		domains = append(domains, string(key))
@@ -123,38 +125,46 @@ func TestMapCTLeaf_EffectiveTLDPlusOne(t *testing.T) {
 	}
 
 	expectedDomains := []string{
-		"deep.sub.service.co.uk",
-		"sub.service.co.uk",
-		"service.co.uk", // eTLD+1
+		"de.xn--mnchen-3ya.*.",
+		"uk.co.service.sub.deep.",
+		"com.google.maps.",
 	}
 
+	if len(domains) != len(expectedDomains) {
+		t.Errorf("got %d domains %v, want %d %v", len(domains), domains, len(expectedDomains), expectedDomains)
+	}
 	for _, d := range expectedDomains {
 		if !domainMap[d] {
-			t.Errorf("expected domain %q in mapped entries", d)
+			t.Errorf("expected domain %q in mapped entries, got %v", d, domains)
 		}
-	}
-
-	// Verify "co.uk" (public suffix) is NOT included as a sub-root
-	if domainMap["co.uk"] {
-		t.Errorf("unexpected public suffix 'co.uk' found in mapped entries")
 	}
 }
 
-func TestMapCTLeaf_PlaintextFallback(t *testing.T) {
+func TestMapCTLeaf_NoPlaintextFallback(t *testing.T) {
 	plain := []byte("alpha.example.com\n*.beta.example.com\n")
 	var domains []string
 	MapCTLeaf(plain, func(key []byte) {
 		domains = append(domains, string(key))
 	})
-	domainMap := make(map[string]bool)
-	for _, d := range domains {
-		domainMap[d] = true
+	if len(domains) != 0 {
+		t.Errorf("expected 0 keys for non-ASN.1 plaintext input, got %v", domains)
 	}
+}
 
-	for _, d := range []string{"alpha.example.com", "beta.example.com", "example.com"} {
-		if !domainMap[d] {
-			t.Errorf("expected %q in mapped entries", d)
-		}
+func TestMapCTLeaf_LargeSANOverflow(t *testing.T) {
+	var sans []string
+	for i := 0; i < 100; i++ {
+		sans = append(sans, fmt.Sprintf("host-%03d.long-subdomain-segment.example.com", i))
+	}
+	certDer := generateTestCert(t, "", sans)
+	leaf := buildRFC6962Leaf(0, certDer)
+
+	var domains []string
+	MapCTLeaf(leaf, func(key []byte) {
+		domains = append(domains, string(key))
+	})
+	if len(domains) != 100 {
+		t.Fatalf("expected 100 domains, got %d", len(domains))
 	}
 }
 
@@ -300,5 +310,26 @@ func TestMapCTLeaf_GoldenDataset(t *testing.T) {
 		t.Logf("Case %d [%s]: %d domains emitted: %v", tc.Index, tc.EntryType, len(domains), domains)
 	}
 }
+
+func BenchmarkMapCTLeaf(b *testing.B) {
+	var cases []goldenCase
+	if err := json.Unmarshal(goldenLeavesJSON, &cases); err != nil {
+		b.Fatalf("failed to unmarshal golden_leaves.json: %v", err)
+	}
+	if len(cases) == 0 {
+		b.Fatal("empty golden dataset")
+	}
+	leaf, err := hex.DecodeString(cases[0].LeafHex)
+	if err != nil {
+		b.Fatalf("failed to decode hex: %v", err)
+	}
+
+	b.ReportAllocs()
+	emitSink := func(key []byte) {}
+	for b.Loop() {
+		MapCTLeaf(leaf, emitSink)
+	}
+}
+
 
 
