@@ -218,4 +218,31 @@ func TestManagedTileCache_InMemoryBounded(t *testing.T) {
 	}
 }
 
+func TestManagedTileCache_CorruptFileTreatedAsCacheMiss(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewManagedTileCache(dir, 16)
+	if err != nil {
+		t.Fatalf("NewManagedTileCache failed: %v", err)
+	}
+
+	b0 := &LeafBundle{BundleIdx: 0, StartLeafIdx: 0, Leaves: [][]byte{[]byte("leaf0")}}
+	if err := cache.PutBundle(b0); err != nil {
+		t.Fatalf("PutBundle failed: %v", err)
+	}
+
+	// Corrupt the bundle file on disk (truncated header)
+	p0 := filepath.Join(dir, "000000", "bundle_0000000000000000.dat")
+	if err := os.WriteFile(p0, []byte("short"), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if _, err := cache.GetBundle(0); !errors.Is(err, ErrBundleNotFound) {
+		t.Fatalf("expected ErrBundleNotFound on corrupt bundle file, got: %v", err)
+	}
+	if _, err := os.Stat(p0); !os.IsNotExist(err) {
+		t.Fatalf("expected corrupt bundle file to be removed, got stat err: %v", err)
+	}
+}
+
+
 

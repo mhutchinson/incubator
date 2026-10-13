@@ -45,10 +45,14 @@ func runTestCmd(ctx context.Context, args []string) error {
 	inputStr := fs.String("input", "", "Literal string input payload.")
 	inputFile := fs.String("input_file", "", "Path to file containing input leaf payload.")
 	inputHex := fs.String("hex", "", "Hex-encoded input leaf payload.")
+	bundleSize := fs.Int("bundle_size", 256, "Number of leaves per bundle execution (defaults to 256).")
 	format := fs.String("format", "plain", "Output format: plain or json.")
 
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *bundleSize <= 0 {
+		*bundleSize = 256
 	}
 
 	if *wasmPath == "" {
@@ -102,10 +106,19 @@ func runTestCmd(ctx context.Context, args []string) error {
 	}
 	defer func() { _ = host.Close(ctx) }()
 
-	entries, err := host.MapLeaf(ctx, inputBytes)
-	if err != nil {
-		return fmt.Errorf("MapLeaf execution failed: %w", err)
+	bundle := make([][]byte, *bundleSize)
+	for i := range bundle {
+		bundle[i] = inputBytes
 	}
+
+	bundleResults, err := host.MapBundle(ctx, bundle)
+	if err != nil {
+		return fmt.Errorf("MapBundle execution failed: %w", err)
+	}
+	if len(bundleResults) != *bundleSize {
+		return fmt.Errorf("MapBundle returned %d leaf results, want %d", len(bundleResults), *bundleSize)
+	}
+	entries := bundleResults[0]
 
 	if *format == "json" {
 		out := testJSONOutput{

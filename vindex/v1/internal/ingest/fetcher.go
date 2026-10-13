@@ -34,6 +34,8 @@ import (
 	"filippo.io/sunlight"
 	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
+	"github.com/transparency-dev/merkle/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera/api"
 	"github.com/transparency-dev/tessera/api/layout"
 	tclient "github.com/transparency-dev/tessera/client"
@@ -200,24 +202,55 @@ func (tc leafBundleCache) get(i uint64) []byte {
 	return nil
 }
 
+type upperTileKey struct {
+	level uint64
+	index uint64
+	p     uint8
+}
+
 // TiledFetcher adapts a tlog-tiles or static-ct HTTP endpoint to the TileFetcher interface.
 type TiledFetcher struct {
-	mu         sync.Mutex
-	fetcher    tiledReader
-	verifier   note.Verifier
-	origin     string
-	cache      leafBundleCache
-	treeSize   uint64
-	baseURL    *url.URL
-	httpClient *http.Client
-	isStaticCT bool
+	mu              sync.Mutex
+	fetcher         tiledReader
+	verifier        note.Verifier
+	origin          string
+	cache           leafBundleCache
+	treeSize        uint64
+	treeHash        [32]byte
+	allowUnverified bool
+	baseURL         *url.URL
+	httpClient      *http.Client
+	isStaticCT      bool
+
+	upperTileMu   sync.Mutex
+	upperTileSize uint64
+	upperTileHash [32]byte
+	upperTiles    map[upperTileKey][]byte
 }
 
 // SetTreeSize sets the current tree size used for partial tile fetching.
 func (f *TiledFetcher) SetTreeSize(size uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.treeSize != size {
+		f.treeHash = [32]byte{}
+	}
 	f.treeSize = size
+}
+
+// SetTreeState sets both the target tree size and expected checkpoint root hash for tile verification.
+func (f *TiledFetcher) SetTreeState(size uint64, hash [32]byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.treeSize = size
+	f.treeHash = hash
+}
+
+// SetAllowUnverifiedCheckpoints explicitly opts into accepting unsigned checkpoints (for local testing only).
+func (f *TiledFetcher) SetAllowUnverifiedCheckpoints(allow bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.allowUnverified = allow
 }
 
 // TreeSize returns the current tree size.
@@ -298,29 +331,38 @@ func (f *TiledFetcher) Checkpoint(ctx context.Context) (*Checkpoint, error) {
 		return nil, fmt.Errorf("failed to read checkpoint: %w", err)
 	}
 
+	f.mu.Lock()
+	verifier := f.verifier
+	allowUnverified := f.allowUnverified
+	f.mu.Unlock()
+
 	var cp *log.Checkpoint
-	if f.verifier != nil {
-		parsed, _, _, err := log.ParseCheckpoint(rawCP, f.origin, f.verifier)
+	if verifier != nil {
+		parsed, _, _, err := log.ParseCheckpoint(rawCP, f.origin, verifier)
 		if err != nil {
 			metrics.InputFetchErrorsTotal.Inc()
 			return nil, fmt.Errorf("failed to verify checkpoint signature: %w", err)
 		}
 		cp = parsed
-	} else {
+	} else if allowUnverified {
 		parsed, err := parseCheckpointHeaderOnly(rawCP)
 		if err != nil {
 			metrics.InputFetchErrorsTotal.Inc()
 			return nil, fmt.Errorf("failed to parse checkpoint header: %w", err)
 		}
 		cp = parsed
+	} else {
+		metrics.InputFetchErrorsTotal.Inc()
+		return nil, errors.New("checkpoint verification failed: nil verifier (call SetAllowUnverifiedCheckpoints(true) for local testing)")
 	}
-
-	f.mu.Lock()
-	f.treeSize = cp.Size
-	f.mu.Unlock()
 
 	var h [32]byte
 	copy(h[:], cp.Hash)
+
+	f.mu.Lock()
+	f.treeSize = cp.Size
+	f.treeHash = h
+	f.mu.Unlock()
 
 	return &Checkpoint{
 		Raw:    rawCP,
@@ -342,7 +384,7 @@ func (f *TiledFetcher) Leaf(ctx context.Context, idx uint64) ([]byte, error) {
 	bIdx := idx / layout.EntryBundleWidth
 
 	if f.isStaticCT {
-		bundle, err := f.fetchStaticCTBundle(ctx, bIdx, f.treeSize)
+		bundle, err := f.fetchStaticCTBundle(ctx, bIdx, f.treeSize, f.treeHash)
 		if err != nil {
 			metrics.InputFetchErrorsTotal.Inc()
 			return nil, fmt.Errorf("failed to fetch static-ct bundle for leaf %d: %w", idx, err)
@@ -376,6 +418,10 @@ func (f *TiledFetcher) Leaf(ctx context.Context, idx uint64) ([]byte, error) {
 	if err := verifyBundleWithTile(&bundle, tileData, startLeafIdx); err != nil {
 		metrics.InputFetchErrorsTotal.Inc()
 		return nil, fmt.Errorf("failed to authenticate entry bundle for leaf %d against tree tile: %w", idx, err)
+	}
+	if err := f.verifyTileAgainstTreeRoot(ctx, bIdx, startLeafIdx, len(bundle.Entries), tileData, f.treeSize, f.treeHash); err != nil {
+		metrics.InputFetchErrorsTotal.Inc()
+		return nil, fmt.Errorf("failed to authenticate tree tile for leaf %d against checkpoint root: %w", idx, err)
 	}
 
 	ti := idx % layout.EntryBundleWidth
@@ -411,6 +457,7 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 
 	f.mu.Lock()
 	treeSize := f.treeSize
+	treeHash := f.treeHash
 	f.mu.Unlock()
 
 	if treeSize > 0 {
@@ -435,7 +482,7 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 		bIdx := bIdx
 		g.Go(func() error {
 			if f.isStaticCT {
-				bundle, err := f.fetchStaticCTBundle(gCtx, bIdx, treeSize)
+				bundle, err := f.fetchStaticCTBundle(gCtx, bIdx, treeSize, treeHash)
 				if err != nil {
 					metrics.InputFetchErrorsTotal.Inc()
 					return fmt.Errorf("failed to fetch static-ct bundle %d: %w", bIdx, err)
@@ -505,6 +552,13 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 				metrics.InputFetchErrorsTotal.Inc()
 				return fmt.Errorf("failed to authenticate entry bundle %d against tree tile: %w", bIdx, err)
 			}
+			if err := f.verifyTileAgainstTreeRoot(gCtx, bIdx, bundleStartIdx, len(bundle.Entries), tileData, treeSize, treeHash); err != nil {
+				if bundlePBuf != nil {
+					bundlePBuf.Release()
+				}
+				metrics.InputFetchErrorsTotal.Inc()
+				return fmt.Errorf("failed to authenticate tree tile %d against checkpoint root: %w", bIdx, err)
+			}
 			bundles[bIdx-startBundle] = &LeafBundle{
 				BundleIdx:    bIdx,
 				StartLeafIdx: bundleStartIdx,
@@ -530,7 +584,74 @@ func (f *TiledFetcher) FetchTiles(ctx context.Context, startLeafIdx, count uint6
 	return bundles, nil
 }
 
-func (f *TiledFetcher) fetchStaticCTBundle(ctx context.Context, bIdx, treeSize uint64) (*LeafBundle, error) {
+func (f *TiledFetcher) readCachedTile(ctx context.Context, treeSize uint64, treeHash [32]byte, level, index uint64, p uint8) ([]byte, error) {
+	key := upperTileKey{level: level, index: index, p: p}
+	f.upperTileMu.Lock()
+	if f.upperTileSize != treeSize || f.upperTileHash != treeHash || f.upperTiles == nil {
+		f.upperTileSize = treeSize
+		f.upperTileHash = treeHash
+		f.upperTiles = make(map[upperTileKey][]byte)
+	}
+	if cached, ok := f.upperTiles[key]; ok {
+		f.upperTileMu.Unlock()
+		return cached, nil
+	}
+	f.upperTileMu.Unlock()
+
+	data, err := f.fetcher.ReadTile(ctx, level, index, p)
+	if err != nil {
+		return nil, err
+	}
+	cloned := bytes.Clone(data)
+
+	f.upperTileMu.Lock()
+	if f.upperTileSize == treeSize && f.upperTileHash == treeHash && f.upperTiles != nil {
+		f.upperTiles[key] = cloned
+	}
+	f.upperTileMu.Unlock()
+	return cloned, nil
+}
+
+func (f *TiledFetcher) verifyTileAgainstTreeRoot(ctx context.Context, bIdx, bundleStartIdx uint64, numLeaves int, tileData []byte, treeSize uint64, treeHash [32]byte) error {
+	if treeSize == 0 || treeHash == ([32]byte{}) || numLeaves == 0 {
+		return nil
+	}
+	lastOffset := numLeaves - 1
+	lastLeafIdx := bundleStartIdx + uint64(lastOffset)
+	if lastLeafIdx >= treeSize {
+		lastLeafIdx = treeSize - 1
+		lastOffset = int(lastLeafIdx - bundleStartIdx)
+	}
+	if (lastOffset+1)*32 > len(tileData) {
+		return fmt.Errorf("tile data length %d too short for leaf offset %d", len(tileData), lastOffset)
+	}
+	leafHash := tileData[lastOffset*32 : (lastOffset+1)*32]
+
+	pb, err := tclient.NewProofBuilder(ctx, treeSize, func(ctx context.Context, level, index uint64, p uint8) ([]byte, error) {
+		if level == 0 && index == bIdx {
+			wantLen := (lastOffset + 1) * 32
+			if len(tileData) > wantLen {
+				return tileData[:wantLen], nil
+			}
+			return tileData, nil
+		}
+		return f.readCachedTile(ctx, treeSize, treeHash, level, index, p)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create proof builder for tree size %d: %w", treeSize, err)
+	}
+
+	incProof, err := pb.InclusionProof(ctx, lastLeafIdx)
+	if err != nil {
+		return fmt.Errorf("failed to build inclusion proof for leaf %d (bundle %d): %w", lastLeafIdx, bIdx, err)
+	}
+	if err := proof.VerifyInclusion(rfc6962.DefaultHasher, lastLeafIdx, treeSize, leafHash, incProof, treeHash[:]); err != nil {
+		return fmt.Errorf("level-0 tile %d failed inclusion verification against checkpoint root %x: %w", bIdx, treeHash, err)
+	}
+	return nil
+}
+
+func (f *TiledFetcher) fetchStaticCTBundle(ctx context.Context, bIdx, treeSize uint64, treeHash [32]byte) (*LeafBundle, error) {
 	p := layout.PartialTileSize(0, bIdx, treeSize)
 	var tileData []byte
 	var tileRelease func()
@@ -563,6 +684,12 @@ func (f *TiledFetcher) fetchStaticCTBundle(ctx context.Context, bIdx, treeSize u
 			dataPBuf.Release()
 		}
 		return nil, err
+	}
+	if err := f.verifyTileAgainstTreeRoot(ctx, bIdx, lb.StartLeafIdx, len(lb.Leaves), tileData, treeSize, treeHash); err != nil {
+		if dataPBuf != nil {
+			dataPBuf.Release()
+		}
+		return nil, fmt.Errorf("failed to authenticate static-ct tree tile %d against checkpoint root: %w", bIdx, err)
 	}
 	lb.PooledBuf = dataPBuf
 	return lb, nil
@@ -663,18 +790,23 @@ func parseAndVerifyStaticCTBundle(dataTile, treeTile []byte, bIdx uint64) (*Leaf
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse static-ct leaf %d in bundle %d: %w", idx, bIdx, err)
 		}
+		if len(treeTile) < (idx+1)*32 {
+			return nil, fmt.Errorf("static-ct tree tile length %d mismatch: too short for leaf %d in bundle %d", len(treeTile), idx, bIdx)
+		}
 		rawLeaf := rest[:len(rest)-len(remaining)]
-		if len(treeTile) >= (idx+1)*32 {
-			mtl := leaf.MerkleTreeLeaf()
-			h := sha256.Sum256(append([]byte{0x00}, mtl...))
-			expected := treeTile[idx*32 : (idx+1)*32]
-			if !bytes.Equal(h[:], expected) {
-				return nil, fmt.Errorf("leaf %d in bundle %d hash mismatch against tree tile", idx, bIdx)
-			}
+		mtl := leaf.MerkleTreeLeaf()
+		h := sha256.Sum256(append([]byte{0x00}, mtl...))
+		expected := treeTile[idx*32 : (idx+1)*32]
+		if !bytes.Equal(h[:], expected) {
+			return nil, fmt.Errorf("leaf %d in bundle %d hash mismatch against tree tile", idx, bIdx)
 		}
 		leaves = append(leaves, rawLeaf)
 		rest = remaining
 		idx++
+	}
+	expectedTileLen := len(leaves) * 32
+	if len(treeTile) != expectedTileLen {
+		return nil, fmt.Errorf("static-ct tree tile length %d mismatch with leaf count %d in bundle %d (expected %d bytes)", len(treeTile), len(leaves), bIdx, expectedTileLen)
 	}
 	return &LeafBundle{
 		BundleIdx:    bIdx,

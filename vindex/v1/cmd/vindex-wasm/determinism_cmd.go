@@ -32,6 +32,7 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 	wasmPath := fs.String("wasm", "", "Path to compiled WASM plugin file (required).")
 	inputStr := fs.String("input", "vindex_determinism_test_leaf_payload", "Input leaf payload string.")
 	inputFile := fs.String("input_file", "", "Path to file containing input leaf payload.")
+	bundleSize := fs.Int("bundle_size", 256, "Number of leaves per bundle (defaults to 256).")
 	iterations := fs.Int("iterations", 100, "Number of map executions.")
 	concurrency := fs.Int("concurrency", 4, "Number of concurrent worker threads.")
 
@@ -44,6 +45,9 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 	}
 	if *iterations <= 0 {
 		return errors.New("--iterations must be greater than 0")
+	}
+	if *bundleSize <= 0 {
+		*bundleSize = 256
 	}
 	if *concurrency <= 0 {
 		*concurrency = 1
@@ -65,6 +69,11 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 		inputBytes = []byte(*inputStr)
 	}
 
+	bundle := make([][]byte, *bundleSize)
+	for i := range bundle {
+		bundle[i] = inputBytes
+	}
+
 	host, err := ingest.NewWASMHost(ctx, wasmBytes, *concurrency)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WASM host: %w", err)
@@ -72,9 +81,12 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 	defer func() { _ = host.Close(ctx) }()
 
 	// Baseline run
-	baseline, err := host.MapLeaf(ctx, inputBytes)
+	baseline, err := host.MapBundle(ctx, bundle)
 	if err != nil {
-		return fmt.Errorf("baseline MapLeaf failed: %w", err)
+		return fmt.Errorf("baseline MapBundle failed: %w", err)
+	}
+	if len(baseline) != *bundleSize {
+		return fmt.Errorf("baseline MapBundle returned %d leaves, want %d", len(baseline), *bundleSize)
 	}
 
 	var wg sync.WaitGroup
@@ -106,7 +118,7 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 			defer func() { _ = runner.Close(context.Background()) }()
 
 			for range taskChan {
-				res, err := runner.MapLeaf(ctx, inputBytes)
+				res, err := runner.MapBundle(ctx, bundle)
 				if err != nil {
 					atomic.AddInt64(&errCount, 1)
 					mismatchMu.Lock()
@@ -116,14 +128,25 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 					mismatchMu.Unlock()
 					return
 				}
-				if !equalEntries(baseline, res) {
+				if len(res) != len(baseline) {
 					atomic.AddInt64(&mismatchCount, 1)
 					mismatchMu.Lock()
 					if firstMismatchErr == nil {
-						firstMismatchErr = fmt.Errorf("determinism mismatch: baseline len %d != result len %d", len(baseline), len(res))
+						firstMismatchErr = fmt.Errorf("determinism bundle len mismatch: baseline %d != result %d", len(baseline), len(res))
 					}
 					mismatchMu.Unlock()
 					return
+				}
+				for i := range baseline {
+					if !equalEntries(baseline[i], res[i]) {
+						atomic.AddInt64(&mismatchCount, 1)
+						mismatchMu.Lock()
+						if firstMismatchErr == nil {
+							firstMismatchErr = fmt.Errorf("determinism mismatch at leaf %d: baseline len %d != result len %d", i, len(baseline[i]), len(res[i]))
+						}
+						mismatchMu.Unlock()
+						return
+					}
 				}
 			}
 		}()
@@ -135,8 +158,8 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 		return fmt.Errorf("FAIL: Determinism check failed with %d errors and %d mismatches: %v", errCount, mismatchCount, firstMismatchErr)
 	}
 
-	fmt.Printf("PASS: Verified determinism across %d executions (concurrency=%d, %d mapped entries per run) with bit-for-bit identical outputs.\n",
-		*iterations, *concurrency, len(baseline))
+	fmt.Printf("PASS: Verified determinism across %d bundle executions (%d leaves/bundle, concurrency=%d, %d mapped entries/leaf) with bit-for-bit identical outputs.\n",
+		*iterations, *bundleSize, *concurrency, len(baseline[0]))
 	return nil
 }
 

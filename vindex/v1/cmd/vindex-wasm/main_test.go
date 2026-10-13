@@ -191,6 +191,75 @@ func TestCLI_InspectCmd(t *testing.T) {
 	}
 }
 
+func buildStaticSlabWasm() []byte {
+	var buf bytes.Buffer
+	buf.Write([]byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00})
+
+	typeSec := []byte{
+		0x02,
+		0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e, // map_bundle: (i32, i32) -> i64
+		0x60, 0x00, 0x01, 0x7f, // input_buffer: () -> i32
+	}
+	writeSection(&buf, 1, typeSec)
+
+	funcSec := []byte{0x02, 0x00, 0x01}
+	writeSection(&buf, 3, funcSec)
+
+	memSec := []byte{0x01, 0x00, 0x01}
+	writeSection(&buf, 5, memSec)
+
+	var expSec bytes.Buffer
+	expSec.WriteByte(3)
+	expSec.WriteByte(6)
+	expSec.WriteString("memory")
+	expSec.WriteByte(0x02)
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(10)
+	expSec.WriteString("map_bundle")
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(12)
+	expSec.WriteString("input_buffer")
+	expSec.WriteByte(0x00)
+	expSec.WriteByte(0x01)
+	writeSection(&buf, 7, expSec.Bytes())
+
+	var codeSec bytes.Buffer
+	codeSec.Write(leb128U32(2))
+
+	var mapBody bytes.Buffer
+	mapBody.Write(leb128U32(0))
+	mapBody.WriteByte(0x42)
+	packed := (uint64(1024) << 32) | uint64(8)
+	mapBody.Write(leb128I64(int64(packed)))
+	mapBody.WriteByte(0x0b)
+	codeSec.Write(leb128U32(uint32(mapBody.Len())))
+	codeSec.Write(mapBody.Bytes())
+
+	var inBufBody bytes.Buffer
+	inBufBody.Write(leb128U32(0))
+	inBufBody.WriteByte(0x41)
+	inBufBody.Write(leb128I64(64))
+	inBufBody.WriteByte(0x0b)
+	codeSec.Write(leb128U32(uint32(inBufBody.Len())))
+	codeSec.Write(inBufBody.Bytes())
+
+	writeSection(&buf, 10, codeSec.Bytes())
+	return buf.Bytes()
+}
+
+func TestCLI_InspectCmd_InputBufferWithoutAllocate(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	wasmPath := filepath.Join(tmpDir, "slab.wasm")
+	if err := os.WriteFile(wasmPath, buildStaticSlabWasm(), 0o644); err != nil {
+		t.Fatalf("failed to write wasm file: %v", err)
+	}
+	if err := run(ctx, []string{"inspect", "--wasm=" + wasmPath}); err != nil {
+		t.Fatalf("inspect failed on input_buffer + map_bundle module: %v", err)
+	}
+}
+
 func TestCLI_DeterminismCmd(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()

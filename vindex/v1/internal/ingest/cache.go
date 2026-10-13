@@ -81,7 +81,12 @@ func (c *ManagedTileCache) GetBundle(bundleIdx uint64) (*LeafBundle, error) {
 			legacyPath := filepath.Join(c.cacheDir, fmt.Sprintf("bundle_%016d.dat", bundleIdx))
 			if lData, lPBuf, lErr := readPooledFile(legacyPath, globalBufferPool); lErr == nil {
 				defer lPBuf.Release()
-				return unmarshalBundle(lData, bundleIdx)
+				b, uErr := unmarshalBundle(lData, bundleIdx)
+				if uErr != nil {
+					_ = os.Remove(legacyPath)
+					return nil, ErrBundleNotFound
+				}
+				return b, nil
 			}
 			return nil, ErrBundleNotFound
 		}
@@ -89,7 +94,12 @@ func (c *ManagedTileCache) GetBundle(bundleIdx uint64) (*LeafBundle, error) {
 	}
 	defer pBuf.Release()
 
-	return unmarshalBundle(data, bundleIdx)
+	b, err := unmarshalBundle(data, bundleIdx)
+	if err != nil {
+		_ = os.Remove(bundlePath)
+		return nil, ErrBundleNotFound
+	}
+	return b, nil
 }
 
 var bundleMarshalPool = sync.Pool{
@@ -130,13 +140,30 @@ func (c *ManagedTileCache) PutBundle(bundle *LeafBundle) error {
 	bundlePath := c.bundlePath(bundle.BundleIdx)
 	shardDir := filepath.Dir(bundlePath)
 
-	if err := os.WriteFile(bundlePath, buf, 0o644); err != nil {
+	tmpFile, err := os.CreateTemp(shardDir, ".bundle_*.tmp")
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if err := os.MkdirAll(shardDir, 0o755); err != nil {
 				return fmt.Errorf("failed to create shard dir %q: %w", shardDir, err)
 			}
-			return os.WriteFile(bundlePath, buf, 0o644)
+			tmpFile, err = os.CreateTemp(shardDir, ".bundle_*.tmp")
 		}
+		if err != nil {
+			return err
+		}
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(buf); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, bundlePath); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
 	return nil
@@ -156,6 +183,9 @@ func (c *ManagedTileCache) DirSize() (int64, error) {
 			return err
 		}
 		if !d.IsDir() {
+			if strings.HasSuffix(d.Name(), ".tmp") {
+				return nil
+			}
 			info, err := d.Info()
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
@@ -176,8 +206,8 @@ func (c *ManagedTileCache) PruneBefore(watermark uint64) (int, error) {
 	defer c.mu.Unlock()
 
 	prunedCount := 0
-	for bIdx, b := range c.memory {
-		endIdx := b.StartLeafIdx + uint64(len(b.Leaves))
+	for bIdx := range c.memory {
+		endIdx := (bIdx + 1) * c.bundleSz
 		if endIdx <= watermark {
 			delete(c.memory, bIdx)
 			prunedCount++

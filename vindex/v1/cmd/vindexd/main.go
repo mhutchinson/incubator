@@ -54,6 +54,7 @@ var (
 	inputLogURL        = flag.String("input_log_url", "", "Base URL of the Input Log.")
 	inputLogOrigin     = flag.String("input_log_origin", "", "Expected origin string for Input Log checkpoints.")
 	inputLogPubKey     = flag.String("input_log_pubkey", "", "Public key or key file for Input Log checkpoint verification (standard note or mtc+<name>+<cosignerID>+<logID>+<pubKeyBase64>).")
+	insecureSkipVerify = flag.Bool("insecure_skip_verify", false, "Allow unverified Input Log checkpoints when --input_log_pubkey is unset (for local testing only).")
 	outputLogDir       = flag.String("output_log_dir", "", "Path for local Output Log storage.")
 	outputLogOrigin    = flag.String("output_log_origin", "", "Origin string for Output Log. If unset, defaults to signer name.")
 	outputLogSignerKey = flag.String("output_log_signer_key", "", "Note signer string or path to private key for signing Output Log checkpoints.")
@@ -300,11 +301,16 @@ func runPublisher(ctx context.Context) error {
 				return fmt.Errorf("failed to create input log verifier: %w", err)
 			}
 			inVerifier = v
+		} else if !*insecureSkipVerify {
+			return errors.New("--input_log_pubkey is required when --input_log_url is set (or set --insecure_skip_verify for local testing)")
 		}
 
 		tf, err := ingest.NewTiledFetcher(u, inVerifier, *inputLogOrigin, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create input log fetcher: %w", err)
+		}
+		if inVerifier == nil && *insecureSkipVerify {
+			tf.SetAllowUnverifiedCheckpoints(true)
 		}
 		switch strings.ToLower(*inputLogType) {
 		case "static-ct", "ct":

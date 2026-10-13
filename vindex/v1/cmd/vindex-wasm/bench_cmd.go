@@ -32,7 +32,8 @@ func runBenchCmd(ctx context.Context, args []string) error {
 	wasmPath := fs.String("wasm", "", "Path to compiled WASM plugin file (required).")
 	inputStr := fs.String("input", "github.com/example/benchmodule v1.2.3 h1:benchHash123456789=\n", "Benchmark input leaf payload.")
 	inputFile := fs.String("input_file", "", "Path to file containing input leaf payload.")
-	iterations := fs.Int("iterations", 1000, "Total number of map executions.")
+	bundleSize := fs.Int("bundle_size", 256, "Number of leaves per bundle (defaults to 256).")
+	iterations := fs.Int("iterations", 1000, "Total number of bundle executions.")
 	workers := fs.Int("workers", 4, "Number of concurrent worker goroutines and pool size.")
 
 	if err := fs.Parse(args); err != nil {
@@ -44,6 +45,9 @@ func runBenchCmd(ctx context.Context, args []string) error {
 	}
 	if *iterations <= 0 {
 		return errors.New("--iterations must be greater than 0")
+	}
+	if *bundleSize <= 0 {
+		*bundleSize = 256
 	}
 	if *workers <= 0 {
 		*workers = 1
@@ -65,6 +69,11 @@ func runBenchCmd(ctx context.Context, args []string) error {
 		inputBytes = []byte(*inputStr)
 	}
 
+	bundle := make([][]byte, *bundleSize)
+	for i := range bundle {
+		bundle[i] = inputBytes
+	}
+
 	host, err := ingest.NewWASMHost(ctx, wasmBytes, *workers)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WASM host: %w", err)
@@ -73,8 +82,8 @@ func runBenchCmd(ctx context.Context, args []string) error {
 
 	// Warmup
 	for i := 0; i < 10; i++ {
-		if _, err := host.MapLeaf(ctx, inputBytes); err != nil {
-			return fmt.Errorf("warmup MapLeaf failed: %w", err)
+		if _, err := host.MapBundle(ctx, bundle); err != nil {
+			return fmt.Errorf("warmup MapBundle failed: %w", err)
 		}
 	}
 
@@ -107,7 +116,7 @@ func runBenchCmd(ctx context.Context, args []string) error {
 
 			for idx := range taskChan {
 				t0 := time.Now()
-				_, err := runner.MapLeaf(ctx, inputBytes)
+				_, err := runner.MapBundle(ctx, bundle)
 				d := time.Since(t0)
 				if err != nil {
 					errMu.Lock()
@@ -144,15 +153,17 @@ func runBenchCmd(ctx context.Context, args []string) error {
 	maxLat := latencies[n-1]
 	meanLat := sum / time.Duration(n)
 
-	opsPerSec := float64(*iterations) / totalElapsed.Seconds()
-	mbPerSec := (float64(len(inputBytes)*(*iterations)) / (1024 * 1024)) / totalElapsed.Seconds()
+	totalLeaves := (*iterations) * (*bundleSize)
+	bundlesPerSec := float64(*iterations) / totalElapsed.Seconds()
+	leavesPerSec := float64(totalLeaves) / totalElapsed.Seconds()
+	mbPerSec := (float64(len(inputBytes)*totalLeaves) / (1024 * 1024)) / totalElapsed.Seconds()
 
 	fmt.Printf("--- WASM MapFn Benchmark Results ---\n")
-	fmt.Printf("Iterations:       %d\n", *iterations)
+	fmt.Printf("Bundle Iterations:%d (%d leaves/bundle, %d total leaves)\n", *iterations, *bundleSize, totalLeaves)
 	fmt.Printf("Workers (pool):   %d\n", *workers)
-	fmt.Printf("Input payload:    %d bytes\n", len(inputBytes))
+	fmt.Printf("Input payload:    %d bytes/leaf\n", len(inputBytes))
 	fmt.Printf("Total Elapsed:    %v\n", totalElapsed)
-	fmt.Printf("Throughput:       %.2f ops/sec (%.2f MB/s)\n", opsPerSec, mbPerSec)
+	fmt.Printf("Throughput:       %.2f leaves/sec (%.2f bundles/sec, %.2f MB/s)\n", leavesPerSec, bundlesPerSec, mbPerSec)
 	fmt.Printf("Latencies:\n")
 	fmt.Printf("  Min:  %v\n", minLat)
 	fmt.Printf("  Mean: %v\n", meanLat)

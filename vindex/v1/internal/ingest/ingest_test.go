@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/sunlight"
 	"github.com/transparency-dev/tessera/api"
 	"github.com/transparency-dev/tessera/api/layout"
 	"golang.org/x/mod/sumdb/tlog"
@@ -1057,5 +1059,153 @@ func BenchmarkVerifyBundleWithTile(b *testing.B) {
 		}
 	}
 }
+
+type checkpointMockReader struct {
+	mockTiledReader
+	rawCP []byte
+}
+
+func (r *checkpointMockReader) ReadCheckpoint(_ context.Context) ([]byte, error) {
+	return r.rawCP, nil
+}
+
+func TestTiledFetcher_Checkpoint_RequiresVerifierByDefault(t *testing.T) {
+	ctx := context.Background()
+	rootHash := sha256.Sum256([]byte("tree_root"))
+	rawCP := []byte(fmt.Sprintf("example.com/log\n10\n%s\n", base64.StdEncoding.EncodeToString(rootHash[:])))
+
+	reader := &checkpointMockReader{rawCP: rawCP}
+	fetcher := NewTiledFetcherWithReader(reader, nil, "example.com/log")
+
+	if _, err := fetcher.Checkpoint(ctx); err == nil {
+		t.Fatal("expected Checkpoint() with nil verifier to fail by default, got nil")
+	}
+
+	fetcher.SetAllowUnverifiedCheckpoints(true)
+	cp, err := fetcher.Checkpoint(ctx)
+	if err != nil {
+		t.Fatalf("Checkpoint() failed after SetAllowUnverifiedCheckpoints(true): %v", err)
+	}
+	if cp.Size != 10 || cp.Hash != rootHash {
+		t.Fatalf("unexpected checkpoint: %+v", cp)
+	}
+}
+
+func TestTiledFetcher_ForgedEntryAndLevel0TileRejectedAgainstCheckpointRoot(t *testing.T) {
+	ctx := context.Background()
+
+	// Attacker serves a forged leaf and a matching forged Level-0 hash tile,
+	// so verifyBundleWithTile passes, but the Level-0 tile does not match the signed checkpoint root.
+	forgedLeaf := []byte("forged_leaf_payload")
+	var bundleBuf []byte
+	bundleBuf = binary.BigEndian.AppendUint16(bundleBuf, uint16(len(forgedLeaf)))
+	bundleBuf = append(bundleBuf, forgedLeaf...)
+
+	forgedLeafHash := tlog.RecordHash(forgedLeaf)
+	forgedTileBuf := forgedLeafHash[:]
+
+	legitimateRoot := sha256.Sum256([]byte("legitimate_checkpoint_root"))
+
+	reader := &mockTiledReader{
+		readEntryBundleFn: func(_ context.Context, _ uint64, _ uint8) ([]byte, error) {
+			return bundleBuf, nil
+		},
+		readTileFn: func(_ context.Context, _, _ uint64, _ uint8) ([]byte, error) {
+			return forgedTileBuf, nil
+		},
+	}
+
+	fetcher := NewTiledFetcherWithReader(reader, nil, "test-origin")
+	fetcher.SetTreeState(1, legitimateRoot)
+
+	if _, err := fetcher.FetchTiles(ctx, 0, 1); err == nil {
+		t.Fatal("FetchTiles expected root verification failure for forged (entryBundle, level0Tile), got nil")
+	}
+	if _, err := fetcher.Leaf(ctx, 0); err == nil {
+		t.Fatal("Leaf expected root verification failure for forged (entryBundle, level0Tile), got nil")
+	}
+}
+
+func TestParseAndVerifyStaticCTBundle_TruncatedTreeTileRejected(t *testing.T) {
+	// Construct a valid 1-entry Static-CT data tile (x509_entry with leaf_index=0 extension):
+	// timestamp (8B) | entry_type=0 (2B) | cert_len=3 (3B) | cert (3B) | ext_len=8 (2B) | ext (8B) | fp_len=0 (2B)
+	dataTile := []byte{
+		0x00, 0x00, 0x01, 0x8b, 0xcf, 0xee, 0x58, 0x00, // timestamp
+		0x00, 0x00, // entry_type = 0 (x509_entry)
+		0x00, 0x00, 0x03, 0x30, 0x01, 0x00, // 3-byte dummy cert
+		0x00, 0x08, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, // leaf_index = 0 extension
+		0x00, 0x00, // 0 chain fingerprints
+	}
+	parsedLeaf, rest, err := sunlight.ReadTileLeaf(dataTile)
+	if err != nil || len(rest) != 0 {
+		t.Fatalf("sunlight.ReadTileLeaf failed: %v (rest=%d)", err, len(rest))
+	}
+	mtl := parsedLeaf.MerkleTreeLeaf()
+	validLeafHash := sha256.Sum256(append([]byte{0x00}, mtl...))
+
+	// 1. Valid 32-byte treeTile succeeds
+	lb, err := parseAndVerifyStaticCTBundle(dataTile, validLeafHash[:], 0)
+	if err != nil {
+		t.Fatalf("expected valid static-ct bundle to succeed, got: %v", err)
+	}
+	if len(lb.Leaves) != 1 {
+		t.Fatalf("expected 1 leaf, got %d", len(lb.Leaves))
+	}
+
+	// 2. Empty treeTile must be rejected (was previously bypassing verification)
+	if _, err := parseAndVerifyStaticCTBundle(dataTile, nil, 0); err == nil {
+		t.Fatal("expected error for empty static-ct treeTile, got nil")
+	}
+
+	// 3. Truncated 16-byte treeTile must be rejected
+	if _, err := parseAndVerifyStaticCTBundle(dataTile, validLeafHash[:16], 0); err == nil {
+		t.Fatal("expected error for truncated static-ct treeTile, got nil")
+	}
+
+	// 4. Oversized 64-byte treeTile for 1-leaf bundle must be rejected
+	oversized := append(validLeafHash[:], validLeafHash[:]...)
+	if _, err := parseAndVerifyStaticCTBundle(dataTile, oversized, 0); err == nil {
+		t.Fatal("expected error for oversized static-ct treeTile, got nil")
+	}
+}
+
+func TestManagedTileCache_PruneBefore_RetainsPartialBundleInMemory(t *testing.T) {
+	cache, err := NewManagedTileCache("", 16)
+	if err != nil {
+		t.Fatalf("NewManagedTileCache failed: %v", err)
+	}
+
+	// Bundle 0 has only 4 leaves [0..4), while bundleSize is 16 [0..16)
+	partial := &LeafBundle{
+		BundleIdx:    0,
+		StartLeafIdx: 0,
+		Leaves:       [][]byte{[]byte("l0"), []byte("l1"), []byte("l2"), []byte("l3")},
+	}
+	if err := cache.PutBundle(partial); err != nil {
+		t.Fatalf("PutBundle failed: %v", err)
+	}
+
+	// Pruning at watermark 4 must NOT evict partial bundle 0 because leaves [4..16) still belong to bundle 0
+	pruned, err := cache.PruneBefore(4)
+	if err != nil {
+		t.Fatalf("PruneBefore(4) failed: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("PruneBefore(4) pruned %d bundles, want 0 (partial bundle must be retained until full)", pruned)
+	}
+	if _, err := cache.GetBundle(0); err != nil {
+		t.Fatalf("expected partial bundle 0 to remain in cache at watermark 4, got: %v", err)
+	}
+
+	// Pruning at watermark 16 (full bundle boundary) evicts bundle 0
+	pruned, err = cache.PruneBefore(16)
+	if err != nil {
+		t.Fatalf("PruneBefore(16) failed: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("PruneBefore(16) pruned %d bundles, want 1", pruned)
+	}
+}
+
 
 

@@ -300,6 +300,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	// Initial synchronous catch-up
 	if e.fetcher != nil {
 		if err := e.coord.SyncOnce(ctx); err != nil {
+			if errors.Is(err, ingest.ErrWasmHalt) || errors.Is(err, ingest.ErrInvalidMemory) || errors.Is(err, ingest.ErrMalformedOutput) || errors.Is(err, ingest.ErrUnalignedOutput) || errors.Is(err, coordinator.ErrInvariantViolation) || errors.Is(err, coordinator.ErrRootMismatch) {
+				return fmt.Errorf("fatal initial sync error: %w", err)
+			}
 			klog.Warningf("Initial sync error: %v", err)
 		}
 	}
@@ -326,6 +329,11 @@ func (e *Engine) Start(ctx context.Context) error {
 					return
 				case <-ticker.C:
 					if err := e.coord.SyncOnce(bgCtx); err != nil {
+						if errors.Is(err, ingest.ErrWasmHalt) || errors.Is(err, ingest.ErrInvalidMemory) || errors.Is(err, ingest.ErrMalformedOutput) || errors.Is(err, ingest.ErrUnalignedOutput) || errors.Is(err, coordinator.ErrInvariantViolation) || errors.Is(err, coordinator.ErrRootMismatch) {
+							klog.Errorf("Fatal background sync error, halting engine: %v", err)
+							cancel()
+							return
+						}
 						klog.Warningf("Background sync error: %v", err)
 					}
 				}

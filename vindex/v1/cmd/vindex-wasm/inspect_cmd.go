@@ -60,7 +60,8 @@ func runInspectCmd(ctx context.Context, args []string) error {
 	exports := compiled.ExportedFunctions()
 	imports := compiled.ImportedFunctions()
 
-	hasAlloc := exports["allocate"] != nil || exports["malloc"] != nil
+	hasInputBuf := exports["input_buffer"] != nil
+	hasAlloc := hasInputBuf || exports["allocate"] != nil || exports["malloc"] != nil
 	hasMapBundle := exports["map_bundle"] != nil
 	hasMapLeaf := exports["map_leaf"] != nil
 	hasMap := hasMapBundle || hasMapLeaf
@@ -70,12 +71,14 @@ func runInspectCmd(ctx context.Context, args []string) error {
 	fmt.Printf("Module Size: %d bytes (%.2f KB)\n\n", len(wasmBytes), float64(len(wasmBytes))/1024.0)
 
 	fmt.Println("Required ABI Exports:")
-	if exports["allocate"] != nil {
+	if hasInputBuf {
+		fmt.Println("  [✓] input_buffer () -> i32 (static 4 MB input slab)")
+	} else if exports["allocate"] != nil {
 		fmt.Println("  [✓] allocate (i32) -> i32")
 	} else if exports["malloc"] != nil {
 		fmt.Println("  [✓] malloc (i32) -> i32 (fallback)")
 	} else {
-		fmt.Println("  [✗] allocate or malloc: MISSING")
+		fmt.Println("  [✗] input_buffer, allocate, or malloc: MISSING")
 	}
 
 	if hasMapBundle {

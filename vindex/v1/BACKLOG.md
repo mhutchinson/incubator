@@ -111,27 +111,27 @@ It is organized into three categories:
 
 ### 2.1 Ingestion & Tile Cache (`internal/ingest/`)
 
-- [ ] **2.1.1 Missing Merkle Tree Root Verification on Downloaded Tiles**
+- [x] **2.1.1 Missing Merkle Tree Root Verification on Downloaded Tiles**
   - **Location**: [`internal/ingest/fetcher.go:395-531`](internal/ingest/fetcher.go#L395-L531) (`TiledFetcher.FetchTiles`), [`fetcher.go:334-393`](internal/ingest/fetcher.go#L334-L393) (`TiledFetcher.Leaf`), [`fetcher.go:688-708`](internal/ingest/fetcher.go#L688-L708) (`verifyBundleWithTile`), [`fetcher.go:657-684`](internal/ingest/fetcher.go#L657-L684) (`parseAndVerifyStaticCTBundle`)
   - **Bug**: `FetchTiles` and `Leaf` only verify that entry bundle leaf hashes match the 32-byte entries in the downloaded Level-0 hash tile (`tile/0/...`). Neither `TiledFetcher` nor any caller fetches upper tree tiles (`level > 0`) or verifies an inclusion proof chaining the Level-0 tile to the signed `Checkpoint.Hash`. A MITM or malicious mirror serving a mutually consistent forged `(entryBundle, level0Tile)` pair passes ingestion undetected.
   - **Fix**: Verify Level-0 tile hashes against the target `Checkpoint.Hash` (e.g., via `tessera/client.ProofBuilder` or parent tile chain verification) before admitting bundles into the pipeline.
 
-- [ ] **2.1.2 Truncated Static-CT Tile Bypasses Leaf Hash Verification**
+- [x] **2.1.2 Truncated Static-CT Tile Bypasses Leaf Hash Verification**
   - **Location**: [`internal/ingest/fetcher.go:667`](internal/ingest/fetcher.go#L667) (`parseAndVerifyStaticCTBundle`)
   - **Bug**: Leaf hash comparison is guarded by `if len(treeTile) >= (idx+1)*32`. If the downloaded Static-CT Level-0 tile is truncated or empty, hash verification is silently skipped for all remaining leaves in the bundle.
   - **Fix**: Reject the bundle with an error if `len(treeTile) != len(leaves)*32` (matching `verifyBundleWithTile` at [`fetcher.go:689-692`](internal/ingest/fetcher.go#L689-L692)).
 
-- [ ] **2.1.3 Optional Checkpoint Signature Verification Bypass**
+- [x] **2.1.3 Optional Checkpoint Signature Verification Bypass**
   - **Location**: [`internal/ingest/fetcher.go:301-316`](internal/ingest/fetcher.go#L301-L316), [`fetcher.go:710-729`](internal/ingest/fetcher.go#L710-L729) (`TiledFetcher.Checkpoint`), [`cmd/vindexd/main.go:296-305`](cmd/vindexd/main.go#L296-L305)
   - **Bug**: When `--input_log_pubkey` is omitted (`f.verifier == nil`), `TiledFetcher.Checkpoint` silently falls back to `parseCheckpointHeaderOnly(rawCP)`, accepting unverified checkpoints without validating any origin signature.
   - **Fix**: Require a non-nil `note.Verifier` for upstream checkpoint ingestion (or require an explicit `--insecure_skip_verify` flag for local testing).
 
-- [ ] **2.1.4 Fire-and-Forget Asynchronous Tile Caching**
+- [x] **2.1.4 Fire-and-Forget Asynchronous Tile Caching**
   - **Location**: [`internal/ingest/pipeline.go:196-216`](internal/ingest/pipeline.go#L196-L216), [`pipeline.go:279-288`](internal/ingest/pipeline.go#L279-L288) (`IngestionPipeline.StreamBatches`)
   - **Bug**: Downloaded bundles are sent directly in-memory to `leafBundleChan` for WASM mapping while queued asynchronously to `cacheBundleChan`, where background workers ignore disk write errors (`_ = p.cache.PutBundle(b)` at `pipeline.go:205`). If a crash occurs after Pebble commit or if disk writes fail silently, Phase 2 crash recovery cannot replay from local disk.
   - **Fix**: Check and surface `PutBundle` errors, and ensure tiles required for recovery are durably written before advancing `KV_CP` / `Output_CP`.
 
-- [ ] **2.1.5 Premature In-Memory Partial-Bundle Pruning in `ManagedTileCache`**
+- [x] **2.1.5 Premature In-Memory Partial-Bundle Pruning in `ManagedTileCache`**
   - **Location**: [`internal/ingest/cache.go:179-185`](internal/ingest/cache.go#L179-L185) (`ManagedTileCache.PruneBefore`)
   - **Bug**: In-memory cache entries are evicted when `b.StartLeafIdx + uint64(len(b.Leaves)) <= watermark`, which evicts a partial bundle (e.g., 100 leaves) as soon as `watermark >= StartLeafIdx + 100`, even though subsequent syncs for `StartLeafIdx + 100 .. StartLeafIdx + 255` still require that bundle.
   - **Fix**: Align in-memory pruning with disk pruning (`(bIdx + 1) * c.bundleSz <= watermark` at [`cache.go:213-216`](internal/ingest/cache.go#L213-L216)).
@@ -140,7 +140,7 @@ It is organized into three categories:
 
 ### 2.2 Sandboxed Mapping & Guest SDK (`mapfn/` & `internal/ingest/wasm.go`)
 
-- [ ] **2.2.1 Silent Key Loss on 4 MB Slab Overflow or Dynamically Allocated Input Bundle**
+- [x] **2.2.1 Silent Key Loss on 4 MB Slab Overflow or Dynamically Allocated Input Bundle**
   - **Location**: [`mapfn/sdk/arena.go:36-46`](mapfn/sdk/arena.go#L36-L46) (`emitKey`), [`arena.go:63-76`](mapfn/sdk/arena.go#L63-L76) (`GetInputSlice`), [`arena.go:121-167`](mapfn/sdk/arena.go#L121-L167) (`ExecuteBundle`), [`internal/ingest/wasm.go:257`](internal/ingest/wasm.go#L257), [`wasm.go:280-294`](internal/ingest/wasm.go#L280-L294), [`wasm.go:311-322`](internal/ingest/wasm.go#L311-L322) (`wasmInstance.executeBundle`)
   - **Bug**:
     1. When emitted preimages for a 256-leaf bundle exceed the static 4 MB `outputBuf`, `emitKey` sets `emitOverflow = true` and `ExecuteBundle` returns `(0, 0)`.
@@ -148,7 +148,7 @@ It is organized into three categories:
     3. In `wasm.go:317`, `if outLen == 0` is treated as a valid empty key set (`return make([][]MappedEntry, len(leaves)), nil`), silently dropping 100% of keys for the 256-leaf bundle instead of raising a fatal error.
   - **Fix**: Use distinct non-zero error sentinel return codes (or trap/panic in the guest) on input/output slab overflow, and treat `(outPtr == 0, outLen == 0)` in `wasm.go` as a fatal execution error (since a valid 0-key response still has a `4 + 4*LeafCount` header where `outLen >= 8`).
 
-- [ ] **2.2.2 WASM Runtime Traps Leak Pool Slots / Respawn Instead of Triggering Fatal Halt**
+- [x] **2.2.2 WASM Runtime Traps Leak Pool Slots / Respawn Instead of Triggering Fatal Halt**
   - **Location**: [`internal/ingest/wasm.go:841-860`](internal/ingest/wasm.go#L841-L860), [`wasm.go:895-899`](internal/ingest/wasm.go#L895-L899) (`WASMRunner.MapBundle`, `WASMRunner.Close`), [`wasm.go:558-574`](internal/ingest/wasm.go#L558-L574) (`WASMHost.MapLeaf`), [`wasm.go:637-653`](internal/ingest/wasm.go#L637-L653) (`WASMHost.MapBundle`), [`internal/coordinator/coordinator.go:1027-1044`](internal/coordinator/coordinator.go#L1027-L1044) (`Coordinator.Run`), [`vindex.go:302-304`](vindex.go#L302-L304), [`vindex.go:328-330`](vindex.go#L328-L330) (`Engine.Start`)
   - **Bug**: When a WASM guest traps or faults during pipeline ingestion (`WASMRunner.MapBundle`), `r.hadErr` is set to `true` and `WASMRunner.Close` destroys the faulted instance without returning a replacement to `h.pool` (permanently depleting a worker slot from the pool on each fault), while direct `WASMHost.MapLeaf`/`MapBundle` calls respawn a fresh replacement instance. Above the pipeline, `Coordinator.Run` and `Engine.Start` log a warning and retry on the next tick instead of halting the daemon.
   - **Fix**: Propagate a fatal/unrecoverable error sentinel on WASM execution traps and terminate the daemon to uphold the deterministic `HALT` invariant (and ensure pool capacity is never silently leaked).
@@ -162,7 +162,7 @@ It is organized into three categories:
     4. **SumDB Missing `module.EscapePath` (`sumdb/main.go:58, 78-91`)**: Emits the raw `modPath` token (`line[:modEnd]`) directly without canonicalizing or validating via `golang.org/x/mod/module.EscapePath` (which encodes uppercase characters as `!` followed by lowercase).
   - **Fix**: Implement `idna.Lookup.ToASCII` (or reject non-ASCII per RFC 5280), add Subject CN extraction and trailing-dot stripping and remove silent span truncation in `mtc`, remove the plaintext fallback on binary CT leaves, and enforce `module.EscapePath` canonicalization in `sumdb`.
 
-- [ ] **2.2.4 `cmd/vindex-wasm` Subcommands Only Test Single-Leaf `MapLeaf` Instead of 256-Leaf `MapBundle`**
+- [x] **2.2.4 `cmd/vindex-wasm` Subcommands Only Test Single-Leaf `MapLeaf` Instead of 256-Leaf `MapBundle`**
   - **Location**: [`cmd/vindex-wasm/bench_cmd.go:76, 110`](cmd/vindex-wasm/bench_cmd.go#L76), [`cmd/vindex-wasm/determinism_cmd.go:75, 109`](cmd/vindex-wasm/determinism_cmd.go#L75), [`cmd/vindex-wasm/test_cmd.go:105`](cmd/vindex-wasm/test_cmd.go#L105), [`cmd/vindex-wasm/inspect_cmd.go:63, 72-79, 103`](cmd/vindex-wasm/inspect_cmd.go#L63)
   - **Bug**: `bench`, `determinism`, and `test` call `host.MapLeaf` (1-leaf bundle) rather than `host.MapBundle` (256-leaf bundle), and `inspect` fails if a `map_bundle` module omits legacy `allocate`/`malloc` exports.
   - **Fix**: Update `bench`, `determinism`, and `test` to exercise 256-leaf `MapBundle` calls, and accept `input_buffer` + `map_bundle` in `inspect`.

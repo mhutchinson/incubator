@@ -31,6 +31,7 @@ func TestStaticCTLiveFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTiledFetcher failed: %v", err)
 	}
+	tf.SetAllowUnverifiedCheckpoints(true)
 	if !tf.IsStaticCT() {
 		t.Fatalf("expected IsStaticCT() = true for ParcelYard")
 	}

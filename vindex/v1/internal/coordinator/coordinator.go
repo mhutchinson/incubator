@@ -1019,12 +1019,24 @@ func (c *Coordinator) streamAndIndex(
 	return g.Wait()
 }
 
+func isFatalSyncError(err error) bool {
+	return errors.Is(err, ingest.ErrWasmHalt) ||
+		errors.Is(err, ingest.ErrInvalidMemory) ||
+		errors.Is(err, ingest.ErrMalformedOutput) ||
+		errors.Is(err, ingest.ErrUnalignedOutput) ||
+		errors.Is(err, ErrInvariantViolation) ||
+		errors.Is(err, ErrRootMismatch)
+}
+
 // Run executes startup recovery and enters the periodic ingestion polling loop until ctx is canceled.
 func (c *Coordinator) Run(ctx context.Context, pollInterval time.Duration) error {
 	if err := c.Recover(ctx); err != nil {
 		return fmt.Errorf("startup recovery failed: %w", err)
 	}
 	if err := c.SyncOnce(ctx); err != nil {
+		if isFatalSyncError(err) {
+			return fmt.Errorf("fatal initial sync error: %w", err)
+		}
 		klog.Warningf("Initial sync error: %v", err)
 	}
 
@@ -1040,6 +1052,9 @@ func (c *Coordinator) Run(ctx context.Context, pollInterval time.Duration) error
 			return nil
 		case <-ticker.C:
 			if err := c.SyncOnce(ctx); err != nil {
+				if isFatalSyncError(err) {
+					return fmt.Errorf("fatal sync error: %w", err)
+				}
 				klog.Warningf("Sync error: %v", err)
 			}
 		}

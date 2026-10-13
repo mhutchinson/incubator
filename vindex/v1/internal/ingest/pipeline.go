@@ -188,32 +188,9 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 
 	var (
 		fetchWg sync.WaitGroup
-		cacheWg sync.WaitGroup
 		mapWg   sync.WaitGroup
 		reseqWg sync.WaitGroup
 	)
-
-	cacheBundleChan := make(chan *LeafBundle, chanCap*2)
-	if p.cache != nil {
-		for c := 0; c < 8; c++ {
-			cacheWg.Add(1)
-			go func() {
-				defer cacheWg.Done()
-				for {
-					select {
-					case <-pipeCtx.Done():
-						return
-					case b, ok := <-cacheBundleChan:
-						if !ok {
-							return
-						}
-						_ = p.cache.PutBundle(b)
-						b.Release()
-					}
-				}
-			}()
-		}
-	}
 
 	// Stage 1: TileFetcher & Cache
 	numFetchWorkers := p.FetchWorkers()
@@ -275,20 +252,21 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 							recordError(fmt.Errorf("fetch tiles [%d, %d) returned 0 bundles", currIdx, currIdx+count))
 							return
 						}
-						for _, b := range bundles {
+						for i, b := range bundles {
 							if p.cache != nil {
-								b.Retain()
-								select {
-								case cacheBundleChan <- b:
-								case <-pipeCtx.Done():
-									b.Release()
-									b.Release()
+								if err := p.cache.PutBundle(b); err != nil {
+									for _, rem := range bundles[i:] {
+										rem.Release()
+									}
+									recordError(fmt.Errorf("failed to cache bundle %d: %w", b.BundleIdx, err))
 									return
 								}
 							}
 							select {
 							case <-pipeCtx.Done():
-								b.Release()
+								for _, rem := range bundles[i:] {
+									rem.Release()
+								}
 								return
 							case leafBundleChan <- b:
 							}
@@ -318,9 +296,6 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 	go func() {
 		fetchWg.Wait()
 		close(leafBundleChan)
-		if p.cache != nil {
-			close(cacheBundleChan)
-		}
 	}()
 
 	// Stage 2: MapWorkerPool
@@ -534,9 +509,6 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 		fetchWg.Wait()
 		mapWg.Wait()
 		reseqWg.Wait()
-		if p.cache != nil {
-			cacheWg.Wait()
-		}
 		cancelPipe()
 
 		errMu.Lock()

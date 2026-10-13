@@ -165,24 +165,13 @@ func (h *WASMHost) instantiateInstance(ctx context.Context) (*wasmInstance, erro
 	resetFn := mod.ExportedFunction("reset")
 
 	// staticInPtr is a performance optimization (NOT a functional requirement).
-	// If the guest exports "input_buffer" or uses a static arena allocator (verified by checking
-	// if consecutive allocations across reset() return identical pointers), we reuse this address
-	// directly. This bypasses the host-guest allocate() invocation on every bundle, boosting
-	// mapping throughput by ~3.6x (742k vs 206k ops/sec on 8 workers).
-	// Functional fallback: guests without a static arena dynamically invoke allocate() per bundle.
+	// If the guest exports "input_buffer", we write packed bundle inputs directly to that static
+	// arena address, bypassing host-guest allocate() invocations on every bundle.
+	// Guests without "input_buffer" dynamically invoke allocate() per leaf/bundle and reset() after.
 	var staticInPtr uint32
 	if inBufFn := mod.ExportedFunction("input_buffer"); inBufFn != nil {
 		if res, err := inBufFn.Call(ctx); err == nil && len(res) > 0 && res[0] != 0 {
 			staticInPtr = uint32(res[0])
-		}
-	} else if allocFn != nil && resetFn != nil {
-		// Probe if the guest uses a static arena allocator.
-		p1, err1 := allocFn.Call(ctx, 64)
-		_, _ = resetFn.Call(ctx)
-		p2, err2 := allocFn.Call(ctx, 64)
-		_, _ = resetFn.Call(ctx)
-		if err1 == nil && err2 == nil && len(p1) > 0 && len(p2) > 0 && p1[0] != 0 && p1[0] == p2[0] {
-			staticInPtr = uint32(p1[0])
 		}
 	}
 
@@ -254,43 +243,40 @@ func (inst *wasmInstance) executeBundle(ctx context.Context, leaves [][]byte) ([
 				payloadLen += len(l)
 			}
 			totalLen := headerLen + payloadLen
-			if totalLen <= 4*1024*1024 {
-				inPtr = inst.staticInPtr
-				inputLen = uint32(totalLen)
-				destSlice, ok := inst.mem.Read(inPtr, inputLen)
-				if !ok {
-					return nil, fmt.Errorf("%w: failed to read guest buffer at ptr %d len %d", ErrInvalidMemory, inPtr, totalLen)
-				}
-				binary.LittleEndian.PutUint32(destSlice[0:4], uint32(n))
-				var currentOffset uint32
-				binary.LittleEndian.PutUint32(destSlice[4:8], 0)
-				payloadDst := destSlice[headerLen:]
-				var writePos int
-				for i, l := range leaves {
-					copy(payloadDst[writePos:], l)
-					writePos += len(l)
-					currentOffset += uint32(len(l))
-					binary.LittleEndian.PutUint32(destSlice[4+(i+1)*4:4+(i+2)*4], currentOffset)
-				}
+			if totalLen > 4*1024*1024 {
+				return nil, fmt.Errorf("%w: bundle input size %d exceeds 4 MB static slab capacity", ErrWasmHalt, totalLen)
+			}
+			inPtr = inst.staticInPtr
+			inputLen = uint32(totalLen)
+			destSlice, ok := inst.mem.Read(inPtr, inputLen)
+			if !ok {
+				return nil, fmt.Errorf("%w: failed to read guest buffer at ptr %d len %d", ErrInvalidMemory, inPtr, totalLen)
+			}
+			binary.LittleEndian.PutUint32(destSlice[0:4], uint32(n))
+			var currentOffset uint32
+			binary.LittleEndian.PutUint32(destSlice[4:8], 0)
+			payloadDst := destSlice[headerLen:]
+			var writePos int
+			for i, l := range leaves {
+				copy(payloadDst[writePos:], l)
+				writePos += len(l)
+				currentOffset += uint32(len(l))
+				binary.LittleEndian.PutUint32(destSlice[4+(i+1)*4:4+(i+2)*4], currentOffset)
 			}
 		}
 
 		if inputLen == 0 {
 			packedInput := inst.packBundle(leaves)
-			if inst.staticInPtr != 0 && len(packedInput) <= 4*1024*1024 {
-				inPtr = inst.staticInPtr
-			} else {
-				if inst.allocFn == nil {
-					return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
-				}
-				res, err := inst.allocFn.Call(ctx, uint64(len(packedInput)))
-				if err != nil {
-					return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
-				}
-				inPtr = uint32(res[0])
-				if inPtr == 0 {
-					return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
-				}
+			if inst.allocFn == nil {
+				return nil, fmt.Errorf("%w: guest module must export 'allocate' or 'malloc'", ErrWasmHalt)
+			}
+			res, err := inst.allocFn.Call(ctx, uint64(len(packedInput)))
+			if err != nil {
+				return nil, fmt.Errorf("%w: allocate failed: %v", ErrWasmHalt, err)
+			}
+			inPtr = uint32(res[0])
+			if inPtr == 0 {
+				return nil, fmt.Errorf("%w: guest allocator returned null pointer (0)", ErrInvalidMemory)
 			}
 
 			if !inst.mem.Write(inPtr, packedInput) {
@@ -311,14 +297,8 @@ func (inst *wasmInstance) executeBundle(ctx context.Context, leaves [][]byte) ([
 		packed := callRes[0]
 		outPtr := uint32(packed >> 32)
 		outLen := uint32(packed & 0xFFFFFFFF)
-		if outLen == 0 {
-			if cap(inst.resultsBuf) < n {
-				inst.resultsBuf = make([][]MappedEntry, n)
-			} else {
-				inst.resultsBuf = inst.resultsBuf[:n]
-				clear(inst.resultsBuf)
-			}
-			return inst.resultsBuf, nil
+		if outPtr == 0 || outLen == 0 {
+			return nil, fmt.Errorf("%w: map_bundle returned (ptr=%d, len=%d): output slab overflow or invalid input", ErrWasmHalt, outPtr, outLen)
 		}
 
 		outBuf, ok := inst.mem.Read(outPtr, outLen)
@@ -529,6 +509,41 @@ func (inst *wasmInstance) executeLeaf(ctx context.Context, leaf []byte) ([]Mappe
 	return entries, nil
 }
 
+func (h *WASMHost) replenishInstance(oldInst *wasmInstance, reason string) {
+	if oldInst != nil && oldInst.mod != nil {
+		_ = oldInst.mod.Close(context.Background())
+	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+
+	newInst, instErr := h.instantiateInstance(context.Background())
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		if newInst != nil && newInst.mod != nil {
+			_ = newInst.mod.Close(context.Background())
+		}
+		return
+	}
+	if instErr != nil {
+		h.closed = true
+		h.haltErr = fmt.Errorf("%w: %s: %v", ErrWasmHalt, reason, instErr)
+		return
+	}
+	select {
+	case h.pool <- newInst:
+	default:
+		if newInst.mod != nil {
+			_ = newInst.mod.Close(context.Background())
+		}
+	}
+}
+
 // MapLeaf executes the WASM map_leaf/map_bundle export against leaf payload and returns sorted, deduplicated entries.
 func (h *WASMHost) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, error) {
 	h.mu.Lock()
@@ -556,26 +571,15 @@ func (h *WASMHost) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, err
 	var modErr error
 	defer func() {
 		if modErr != nil {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			if h.closed {
-				_ = inst.mod.Close(context.Background())
-				return
-			}
-			_ = inst.mod.Close(context.Background())
-			newInst, instErr := h.instantiateInstance(context.Background())
-			if instErr != nil {
-				h.closed = true
-				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance: %v", ErrWasmHalt, instErr)
-				return
-			}
-			h.pool <- newInst
+			h.replenishInstance(inst, "failed to replenish worker instance")
 			return
 		}
 
-		var resetErr error
 		if inst.resetFn != nil && inst.staticInPtr == 0 {
-			_, resetErr = inst.resetFn.Call(context.Background())
+			if _, resetErr := inst.resetFn.Call(context.Background()); resetErr != nil {
+				h.replenishInstance(inst, "failed to replenish worker instance after reset failure")
+				return
+			}
 		}
 
 		h.mu.Lock()
@@ -584,19 +588,6 @@ func (h *WASMHost) MapLeaf(ctx context.Context, leaf []byte) ([]MappedEntry, err
 			_ = inst.mod.Close(context.Background())
 			return
 		}
-
-		if resetErr != nil {
-			_ = inst.mod.Close(context.Background())
-			newInst, instErr := h.instantiateInstance(context.Background())
-			if instErr != nil {
-				h.closed = true
-				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance after reset failure: %v", ErrWasmHalt, instErr)
-				return
-			}
-			h.pool <- newInst
-			return
-		}
-
 		h.pool <- inst
 	}()
 
@@ -635,26 +626,15 @@ func (h *WASMHost) MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEn
 	var modErr error
 	defer func() {
 		if modErr != nil {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			if h.closed {
-				_ = inst.mod.Close(context.Background())
-				return
-			}
-			_ = inst.mod.Close(context.Background())
-			newInst, instErr := h.instantiateInstance(context.Background())
-			if instErr != nil {
-				h.closed = true
-				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance: %v", ErrWasmHalt, instErr)
-				return
-			}
-			h.pool <- newInst
+			h.replenishInstance(inst, "failed to replenish worker instance")
 			return
 		}
 
-		var resetErr error
 		if inst.resetFn != nil && inst.staticInPtr == 0 {
-			_, resetErr = inst.resetFn.Call(context.Background())
+			if _, resetErr := inst.resetFn.Call(context.Background()); resetErr != nil {
+				h.replenishInstance(inst, "failed to replenish worker instance after reset failure")
+				return
+			}
 		}
 
 		h.mu.Lock()
@@ -663,19 +643,6 @@ func (h *WASMHost) MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEn
 			_ = inst.mod.Close(context.Background())
 			return
 		}
-
-		if resetErr != nil {
-			_ = inst.mod.Close(context.Background())
-			newInst, instErr := h.instantiateInstance(context.Background())
-			if instErr != nil {
-				h.closed = true
-				h.haltErr = fmt.Errorf("%w: failed to replenish worker instance after reset failure: %v", ErrWasmHalt, instErr)
-				return
-			}
-			h.pool <- newInst
-			return
-		}
-
 		h.pool <- inst
 	}()
 
@@ -793,10 +760,11 @@ func (h *WASMHost) Close(ctx context.Context) error {
 // WASMRunner is a dedicated, unshared WASM execution environment bound to a single worker.
 // It executes mapping calls lock-free without instance pool or mutex contention.
 type WASMRunner struct {
-	host   *WASMHost
-	inst   *wasmInstance
-	closed bool
-	hadErr bool
+	host     *WASMHost
+	inst     *wasmInstance
+	fromPool bool
+	closed   bool
+	hadErr   bool
 }
 
 // NewRunner creates a dedicated WASMRunner from the host.
@@ -814,8 +782,10 @@ func (h *WASMHost) NewRunner(ctx context.Context) (*WASMRunner, error) {
 	h.mu.Unlock()
 
 	var inst *wasmInstance
+	var fromPool bool
 	select {
 	case inst = <-h.pool:
+		fromPool = true
 	default:
 		var err error
 		inst, err = h.instantiateInstance(ctx)
@@ -825,8 +795,9 @@ func (h *WASMHost) NewRunner(ctx context.Context) (*WASMRunner, error) {
 	}
 
 	return &WASMRunner{
-		host: h,
-		inst: inst,
+		host:     h,
+		inst:     inst,
+		fromPool: fromPool,
 	}, nil
 }
 
@@ -893,10 +864,15 @@ func (r *WASMRunner) Close(ctx context.Context) error {
 	}
 
 	if r.hadErr {
+		var closeErr error
 		if r.inst.mod != nil {
-			return r.inst.mod.Close(ctx)
+			closeErr = r.inst.mod.Close(ctx)
+			r.inst.mod = nil
 		}
-		return nil
+		if r.fromPool {
+			r.host.replenishInstance(nil, "failed to replenish runner instance")
+		}
+		return closeErr
 	}
 
 	r.host.mu.Lock()

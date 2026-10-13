@@ -1444,5 +1444,54 @@ func TestDecodeBundleOutputInto_KeyLenOverflow(t *testing.T) {
 	}
 }
 
+func TestWASMHost_MapBundle_ZeroLenSlabOverflowFailsFast(t *testing.T) {
+	ctx := context.Background()
+
+	// map_bundle returning (0, 0) signals a 4 MB output slab overflow or invalid input slab.
+	wasmBytes := assembleMapBundleWasm(nil, 0)
+	host, err := NewWASMHost(ctx, wasmBytes, 1)
+	if err != nil {
+		t.Fatalf("NewWASMHost failed: %v", err)
+	}
+	defer func() { _ = host.Close(ctx) }()
+
+	_, err = host.MapBundle(ctx, [][]byte{[]byte("leaf0")})
+	if err == nil {
+		t.Fatal("expected ErrWasmHalt when map_bundle returns (0, 0), got nil")
+	}
+	if !errors.Is(err, ErrWasmHalt) {
+		t.Fatalf("expected ErrWasmHalt, got: %v", err)
+	}
+}
+
+func TestWASMRunner_TrapReplenishesPoolSlot(t *testing.T) {
+	ctx := context.Background()
+
+	// Assemble a module where map_leaf traps on unreachable (0x00)
+	wasmBytes := assembleWasm([]byte{0x00}, nil, 0)
+	host, err := NewWASMHost(ctx, wasmBytes, 1)
+	if err != nil {
+		t.Fatalf("NewWASMHost failed: %v", err)
+	}
+	defer func() { _ = host.Close(ctx) }()
+
+	runner, err := host.NewRunner(ctx)
+	if err != nil {
+		t.Fatalf("NewRunner failed: %v", err)
+	}
+	if _, err := runner.MapLeaf(ctx, []byte("trap")); !errors.Is(err, ErrWasmHalt) {
+		t.Fatalf("expected ErrWasmHalt on trap, got: %v", err)
+	}
+	if err := runner.Close(ctx); err != nil {
+		t.Fatalf("runner.Close failed: %v", err)
+	}
+
+	// Verify pool slot was replenished in host.pool
+	if got := len(host.pool); got != 1 {
+		t.Fatalf("expected host.pool len = 1 after runner trap Close(), got %d", got)
+	}
+}
+
+
 
 
