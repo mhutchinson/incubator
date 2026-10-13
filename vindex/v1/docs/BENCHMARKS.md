@@ -418,18 +418,19 @@ Detailed profiling of the running process revealed the exact failure mechanism:
      }
      ```
    - `readFile()` executes sequentially on a **single thread**. It reads all 89 GB from disk, computes a full SHA-256 digest over every frame, and replays each mutation into the memory span.
-   - At realistic NVMe read and single-core SHA-256 hashing throughput (~30–50 MB/s under concurrent Pebble startup background compactions), replaying 89 GB of patch frames requires **~45 to 55 minutes** of wall time.
+   - Furthermore, leaf insertions record disk-backed leaf values with an odd offset tag (`off&1 != 0`). During `replay`, `pmem.Open` executed **over 22 million synchronous POSIX `pwrite` syscalls** (`m.disk.WriteAt(patch[:count], m.diskOff+int64(off))`) to rewrite 52 GB of leaf data back into `mpt.disk`—even though `mpt.disk` was already durably synced before shutdown. User-space CPU (SHA-256 and varint decoding) accounted for only ~18% (~9.5 minutes) of wall time; the remaining **~82% (~45 minutes)** was spent blocked in kernel sleep (`ext4_block_write_beg`).
+   - Replaying 89 GB of uncompacted patch frames and redundant leaf writes required **~45 to 55 minutes** of wall time.
 
 3. **Impact on Time-to-Serve SLO**:
    - **Expected**: < 500 ms (Phase 1 O(1) tip equality assertion).
    - **Observed**: ~45–50 minutes of single-threaded journal verification before port `:8080` is opened.
-   - **Root Cause**: Cold startup time is $O(\text{JournalSize})$ rather than $O(1)$ due to uncompacted mutation frames in the Torchwood persistence layer.
+   - **Root Cause**: Cold startup time is `O(JournalSize)` rather than `O(1)` due to uncompacted mutation frames and redundant disk writes in the Torchwood persistence layer.
 
-### 5.3 Architectural Analysis & Mitigations
+### 5.3 Architectural Follow-Ups & Upstream Mitigations
 
-For detailed root cause profiling (including the 22M redundant `pwrite` syscalls in `pmem.go`) and the proposed architectural solutions (compaction API, decoupled serving startup, and pipelined replay), see the design discussion:
+For the tracked engineering mitigations (asynchronous serving startup in `vindexd`) and upstream `filippo.io/torchwood` issues (suppressing redundant `pwrite` syscalls on clean `mpt.disk`, exposing `tree.Compact()`, and pipelining journal replay), see:
 
-👉 **[DESIGN_DISCUSSIONS.md §4: MPT Cold-Start Replay Pathology & Decoupled State Trie Lifecycle](./DESIGN_DISCUSSIONS.md#4-mpt-cold-start-replay-pathology--decoupled-state-trie-lifecycle)**
+👉 **[BACKLOG.md: §1.1.4 & §3.1–3.3](../BACKLOG.md#3-upstream-library-issues-to-raise--investigate)**
 
 ---
 
