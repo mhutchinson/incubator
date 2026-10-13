@@ -32,13 +32,15 @@ import (
 
 var (
 	vindexURL    = flag.String("vindex_url", "http://localhost:8080", "Base URL of the VIndex server.")
-	key          = flag.String("key", "", "Key string to search.")
+	key          = flag.String("key", "", "Canonical key or prefix string to search.")
+	prefixQuery  = flag.Bool("prefix", false, "Treat --key as a prefix query (?prefix=true).")
 	keyHashHex   = flag.String("key_hash", "", "32-byte hex encoded key hash to search.")
 	outLogOrigin = flag.String("out_log_origin", "", "Expected origin for Output Log.")
 	outLogPubKey = flag.String("out_log_pubkey", "", "Public key or key file for Output Log checkpoint verification.")
 	inLogOrigin  = flag.String("in_log_origin", "", "Expected origin for Input Log.")
 	inLogPubKey  = flag.String("in_log_pubkey", "", "Public key or key file for Input Log checkpoint verification (standard note or mtc+...).")
 	before       = flag.Uint64("before", 0, "Upper bound Input Log index (exclusive) for lookup.")
+	subRootHex   = flag.String("sub_root", "", "Expected 32-byte hex Mini-Log SubRoot for manual continuation queries (--before > 0).")
 	limitCount   = flag.Uint64("limit", 10000, "Maximum number of indices to return per page.")
 	fetchAll     = flag.Bool("all", false, "Fetch all matching indices across pages.")
 	inLogURL     = flag.String("in_log_url", "", "Base URL of Input Log for dereferencing pointers.")
@@ -58,6 +60,9 @@ func main() {
 func run(ctx context.Context) error {
 	var keyHash [sha256.Size]byte
 	if *keyHashHex != "" {
+		if *prefixQuery {
+			return errors.New("--prefix cannot be combined with --key_hash; use --key")
+		}
 		b, err := hex.DecodeString(*keyHashHex)
 		if err != nil || len(b) != sha256.Size {
 			return fmt.Errorf("invalid 32-byte hex --key_hash: %q", *keyHashHex)
@@ -99,16 +104,66 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
 
+	if *prefixQuery {
+		if *fetchAll {
+			resp, err := cli.LookupPrefixAll(ctx, *key, *limitCount)
+			if err != nil {
+				return fmt.Errorf("prefix lookup verification failed: %w", err)
+			}
+			fmt.Printf("Prefix:         %s\n", resp.Prefix)
+			fmt.Printf("Matching Keys:  %d\n", len(resp.Results))
+			fmt.Printf("Map Root:       %x\n", resp.MapRoot)
+			fmt.Printf("Output Log Size:%d\n", resp.OutputLogSize)
+			fmt.Printf("Input Log Size: %d\n", resp.InputLogSize)
+			for _, kr := range resp.Results {
+				fmt.Printf("  Key %s (%x): %d occurrences %v\n", kr.Key, kr.MiniLogRoot, len(kr.Indices), kr.Indices)
+			}
+			return nil
+		}
+		keysResp, err := cli.LookupPrefix(ctx, *key)
+		if err != nil {
+			return fmt.Errorf("prefix keys verification failed: %w", err)
+		}
+		fmt.Printf("Prefix:         %s\n", keysResp.QueryKey)
+		fmt.Printf("Matching Keys:  %d\n", len(keysResp.Keys))
+		fmt.Printf("Map Root:       %x\n", keysResp.MapRoot)
+		fmt.Printf("Output Log Size:%d\n", keysResp.OutputLogSize)
+		fmt.Printf("Input Log Size: %d\n", keysResp.InputLogSize)
+		for _, kv := range keysResp.Keys {
+			fmt.Printf("  Key: %s SubRoot: %x\n", kv.Key, kv.SubRoot)
+		}
+		return nil
+	}
+
 	var beforePtr *uint64
+	var expectedSubRoots [][sha256.Size]byte
 	if *before > 0 {
 		beforePtr = before
+		if *subRootHex == "" {
+			return errors.New("--sub_root (32-byte hex expected Mini-Log SubRoot from previous page) is required when --before > 0; or use --all for automatic verified pagination")
+		}
+		srBytes, err := hex.DecodeString(*subRootHex)
+		if err != nil || len(srBytes) != sha256.Size {
+			return fmt.Errorf("invalid 32-byte hex --sub_root: %q", *subRootHex)
+		}
+		var sr [sha256.Size]byte
+		copy(sr[:], srBytes)
+		expectedSubRoots = append(expectedSubRoots, sr)
 	}
 
 	var resp *client.LookupResponse
-	if *fetchAll {
-		resp, err = cli.LookupAll(ctx, keyHash, *limitCount)
+	if *key != "" {
+		if *fetchAll {
+			resp, err = cli.LookupAllKey(ctx, *key, *limitCount)
+		} else {
+			resp, err = cli.LookupKey(ctx, *key, beforePtr, *limitCount, expectedSubRoots...)
+		}
 	} else {
-		resp, err = cli.Lookup(ctx, keyHash, beforePtr, *limitCount)
+		if *fetchAll {
+			resp, err = cli.LookupAll(ctx, keyHash, *limitCount)
+		} else {
+			resp, err = cli.Lookup(ctx, keyHash, beforePtr, *limitCount, expectedSubRoots...)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("lookup verification failed: %w", err)
@@ -132,7 +187,8 @@ func run(ctx context.Context) error {
 	}
 
 	if resp.NextBefore != nil {
-		fmt.Printf("Next before offset: %d (use --all to fetch all pages)\n", *resp.NextBefore)
+		nextSR, _ := resp.NextExpectedSubRoot()
+		fmt.Printf("Next before offset: %d --sub_root=%x (or use --all to fetch all pages)\n", *resp.NextBefore, nextSR)
 	}
 
 	if *dereference && *inLogURL != "" && inVerifier != nil {

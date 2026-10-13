@@ -201,8 +201,9 @@ func (l *testSumDBInputLog) InclusionProof(_ context.Context, idx, treeSize uint
 type sumdbMapper struct{}
 
 func (m *sumdbMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	kh := sha256.Sum256([]byte("golang.org/x/text"))
-	return []ingest.MappedEntry{{KeyHash: kh}}, nil
+	const key = "golang.org/x/text"
+	kh := sha256.Sum256([]byte(key))
+	return []ingest.MappedEntry{{Key: key, KeyHash: kh}}, nil
 }
 
 func (m *sumdbMapper) Close(_ context.Context) error { return nil }

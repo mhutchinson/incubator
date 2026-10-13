@@ -277,11 +277,18 @@ func TestStress_DifferentialLookupAndPagination(t *testing.T) {
 
 		var collected []uint64
 		var before *uint64
+		var expectedSubRoot [32]byte
 		steps := 0
 
 		for {
 			steps++
-			resp, err := cli.Lookup(ctx, keyHeavy, before, pageSize)
+			var resp *client.LookupResponse
+			var err error
+			if before == nil {
+				resp, err = cli.Lookup(ctx, keyHeavy, nil, pageSize)
+			} else {
+				resp, err = cli.Lookup(ctx, keyHeavy, before, pageSize, expectedSubRoot)
+			}
 			if err != nil {
 				t.Fatalf("step %d failed: %v", steps, err)
 			}
@@ -311,6 +318,12 @@ func TestStress_DifferentialLookupAndPagination(t *testing.T) {
 				t.Fatalf("step %d: NextBefore=%d != first index of page=%d", steps, *resp.NextBefore, resp.Indices[0])
 			}
 
+			nextSub, err := resp.NextExpectedSubRoot()
+			if err != nil {
+				t.Fatalf("step %d: NextExpectedSubRoot failed: %v", steps, err)
+			}
+			expectedSubRoot = nextSub
+
 			// All indices in the next page must be strictly less than NextBefore
 			before = resp.NextBefore
 		}
@@ -321,7 +334,8 @@ func TestStress_DifferentialLookupAndPagination(t *testing.T) {
 
 		// A subsequent query with before=0 must return 0 indices and NextBefore=nil
 		zero := uint64(0)
-		respZero, err := cli.Lookup(ctx, keyHeavy, &zero, 10)
+		emptySubRoot := sha256.Sum256(nil)
+		respZero, err := cli.Lookup(ctx, keyHeavy, &zero, 10, emptySubRoot)
 		if err != nil {
 			t.Fatalf("Lookup before=0 failed: %v", err)
 		}
@@ -335,9 +349,10 @@ func TestStress_DifferentialLookupAndPagination(t *testing.T) {
 
 	// 4. Edge Cases: boundary values, overflows, empty results
 	t.Run("EdgeCases", func(t *testing.T) {
-		// before = 1
+		emptySubRoot := sha256.Sum256(nil)
+		// before = 1 (keyHeavy has no entries at index 0)
 		one := uint64(1)
-		resp1, err := cli.Lookup(ctx, keyHeavy, &one, 10)
+		resp1, err := cli.Lookup(ctx, keyHeavy, &one, 10, emptySubRoot)
 		if err != nil {
 			t.Fatalf("Lookup before=1 failed: %v", err)
 		}
@@ -347,9 +362,13 @@ func TestStress_DifferentialLookupAndPagination(t *testing.T) {
 			}
 		}
 
-		// before = math.MaxUint64
+		// before = math.MaxUint64 (clamped to InputLogSize on server)
+		respKey1Base, err := cli.Lookup(ctx, key1, nil, 10)
+		if err != nil {
+			t.Fatalf("Lookup key1 base failed: %v", err)
+		}
 		maxU64 := uint64(math.MaxUint64)
-		respMax, err := cli.Lookup(ctx, key1, &maxU64, 10)
+		respMax, err := cli.Lookup(ctx, key1, &maxU64, 10, respKey1Base.MiniLogRoot)
 		if err != nil {
 			t.Fatalf("Lookup before=MaxUint64 failed: %v", err)
 		}

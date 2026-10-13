@@ -449,7 +449,11 @@ type modData struct {
 }
 
 func queryIndex(ctx context.Context, cli *client.Client, inLogCli *client.InputLogClient, modName string) (map[string]modData, error) {
-	resp, err := cli.LookupAllKey(ctx, modName, 10000)
+	escapedMod, err := module.EscapePath(modName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to escape module path %q: %w", modName, err)
+	}
+	resp, err := cli.LookupAllKey(ctx, escapedMod, 10000)
 	if err != nil {
 		return nil, fmt.Errorf("failed to look up key: %w", err)
 	}

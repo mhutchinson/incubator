@@ -273,25 +273,41 @@ func TestAdv_M3_ClientProofVerification_AdversarialTampering(t *testing.T) {
 	realTS := httptest.NewServer(mux)
 	defer realTS.Close()
 
-	// Capture authentic response
+	// Capture authentic responses from /vindex/v1/keys/ and /vindex/v1/entries/
 	hexKey := hex.EncodeToString(key[:])
-	resp, err := realTS.Client().Get(realTS.URL + "/vindex/lookup/" + hexKey)
+	keysResp, err := realTS.Client().Get(realTS.URL + "/vindex/v1/keys/" + hexKey)
 	if err != nil {
-		t.Fatalf("GET lookup failed: %v", err)
+		t.Fatalf("GET keys lookup failed: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	authenticBodyBytes, err := io.ReadAll(resp.Body)
+	defer func() { _ = keysResp.Body.Close() }()
+	authenticKeysBytes, err := io.ReadAll(keysResp.Body)
 	if err != nil {
-		t.Fatalf("ReadAll failed: %v", err)
+		t.Fatalf("ReadAll keys failed: %v", err)
 	}
-	authenticBody := string(authenticBodyBytes)
+	authenticKeysBody := string(authenticKeysBytes)
 
-	// Proxy test server that allows tampering with response body
-	var tamperedBody string
+	entriesResp, err := realTS.Client().Get(realTS.URL + "/vindex/v1/entries/" + hexKey + "?before=1&limit=10")
+	if err != nil {
+		t.Fatalf("GET entries lookup failed: %v", err)
+	}
+	defer func() { _ = entriesResp.Body.Close() }()
+	authenticEntriesBytes, err := io.ReadAll(entriesResp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll entries failed: %v", err)
+	}
+	authenticEntriesBody := string(authenticEntriesBytes)
+
+	// Proxy test server that allows tampering with response bodies
+	var tamperedKeysBody string
+	var tamperedEntriesBody string
 	proxyTS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(tamperedBody))
+		if strings.HasPrefix(r.URL.Path, "/vindex/v1/entries/") {
+			_, _ = w.Write([]byte(tamperedEntriesBody))
+			return
+		}
+		_, _ = w.Write([]byte(tamperedKeysBody))
 	}))
 	defer proxyTS.Close()
 
@@ -305,15 +321,17 @@ func TestAdv_M3_ClientProofVerification_AdversarialTampering(t *testing.T) {
 		t.Fatalf("client.NewClient failed: %v", err)
 	}
 
-	// 1. Baseline verification with authentic body
-	tamperedBody = authenticBody
+	// 1. Baseline verification with authentic bodies
+	tamperedKeysBody = authenticKeysBody
+	tamperedEntriesBody = authenticEntriesBody
 	if _, err := cli.Lookup(ctx, key, nil, 10); err != nil {
 		t.Fatalf("baseline authentic lookup failed: %v", err)
 	}
 
 	// 2. Tampered output log checkpoint signature
 	t.Run("TamperedOutputLogCheckpoint", func(t *testing.T) {
-		tamperedBody = strings.Replace(authenticBody, h.outVerifier.Name(), "fake.signer.name", 1)
+		tamperedKeysBody = strings.Replace(authenticKeysBody, h.outVerifier.Name(), "fake.signer.name", 1)
+		tamperedEntriesBody = authenticEntriesBody
 		_, err := cli.Lookup(ctx, key, nil, 10)
 		if err == nil {
 			t.Fatal("expected error for tampered output log checkpoint, got nil")
@@ -328,7 +346,8 @@ func TestAdv_M3_ClientProofVerification_AdversarialTampering(t *testing.T) {
 		// Replace map root with bogus hex in output log leaf section
 		bogusRoot := hex.EncodeToString(make([]byte, 32))
 		hexExpectedRoot := hex.EncodeToString(expectedRoot[:])
-		tamperedBody = strings.Replace(authenticBody, hexExpectedRoot, bogusRoot, 1)
+		tamperedKeysBody = strings.Replace(authenticKeysBody, hexExpectedRoot, bogusRoot, 1)
+		tamperedEntriesBody = authenticEntriesBody
 		_, err := cli.Lookup(ctx, key, nil, 10)
 		if err == nil {
 			t.Fatal("expected error for tampered map root in leaf, got nil")
@@ -342,7 +361,8 @@ func TestAdv_M3_ClientProofVerification_AdversarialTampering(t *testing.T) {
 	// 4. Tampered indices (value changed from 0 to 999)
 	t.Run("TamperedIndices", func(t *testing.T) {
 		// Replace index 0 with 999
-		tamperedBody = strings.Replace(authenticBody, "\n0\n", "\n999\n", 1)
+		tamperedKeysBody = authenticKeysBody
+		tamperedEntriesBody = strings.Replace(authenticEntriesBody, "\n0\n", "\n999\n", 1)
 		_, err := cli.Lookup(ctx, key, nil, 10)
 		if err == nil {
 			t.Fatal("expected error for tampered index value, got nil")
@@ -355,7 +375,7 @@ func TestAdv_M3_ClientProofVerification_AdversarialTampering(t *testing.T) {
 
 	// 5. Tampered MPT proof
 	t.Run("TamperedMPTProof", func(t *testing.T) {
-		lines := strings.Split(authenticBody, "\n")
+		lines := strings.Split(authenticKeysBody, "\n")
 		found := false
 		for i, l := range lines {
 			if strings.Contains(l, "mpt-proof-v1") && i+1 < len(lines) {
@@ -367,7 +387,8 @@ func TestAdv_M3_ClientProofVerification_AdversarialTampering(t *testing.T) {
 		if !found {
 			t.Fatal("failed to find mpt-proof-v1 section in authentic body")
 		}
-		tamperedBody = strings.Join(lines, "\n")
+		tamperedKeysBody = strings.Join(lines, "\n")
+		tamperedEntriesBody = authenticEntriesBody
 		_, err := cli.Lookup(ctx, key, nil, 10)
 		if err == nil {
 			t.Fatal("expected error for tampered MPT proof, got nil")

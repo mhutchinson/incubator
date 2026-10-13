@@ -95,7 +95,7 @@ func (m *testOutputLog) InclusionProof(_ context.Context, leafIdx, treeSize uint
 	return proof, nil
 }
 
-func setupTestEnvironment(t *testing.T, chunkSize uint64) (*server.ReadServer, *kvstore.DB, *tree.Manager, *tree.OutputPublisher, *kvstore.KVIndexer) {
+func setupTestEnvironment(t testing.TB, chunkSize uint64) (*server.ReadServer, *kvstore.DB, *tree.Manager, *tree.OutputPublisher, *kvstore.KVIndexer) {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := kvstore.Open(dir, &pebble.Options{})
@@ -254,8 +254,18 @@ func TestClient_PaginationContinuation(t *testing.T) {
 		t.Fatalf("Page 1 NextBefore = %v, want 300", page1.NextBefore)
 	}
 
+	// Backlog 2.6.1: Calling Lookup with before != nil without expectedSubRoot must fail
+	if _, err := cli.Lookup(ctx, key, page1.NextBefore, 20); err == nil {
+		t.Fatal("expected error when calling Lookup with before != nil and no expectedSubRoot, got nil")
+	}
+
+	page1NextRoot, err := page1.NextExpectedSubRoot()
+	if err != nil {
+		t.Fatalf("page1.NextExpectedSubRoot failed: %v", err)
+	}
+
 	// Page 2: before=300, limit=20 -> returns [100..280], nextBefore=100
-	page2, err := cli.Lookup(ctx, key, page1.NextBefore, 20)
+	page2, err := cli.Lookup(ctx, key, page1.NextBefore, 20, page1NextRoot)
 	if err != nil {
 		t.Fatalf("Page 2 lookup failed: %v", err)
 	}
@@ -266,8 +276,13 @@ func TestClient_PaginationContinuation(t *testing.T) {
 		t.Fatalf("Page 2 NextBefore = %v, want 100", page2.NextBefore)
 	}
 
+	page2NextRoot, err := page2.NextExpectedSubRoot()
+	if err != nil {
+		t.Fatalf("page2.NextExpectedSubRoot failed: %v", err)
+	}
+
 	// Page 3: before=100, limit=20 -> returns remaining 10 items [0..90], nextBefore=nil
-	page3, err := cli.Lookup(ctx, key, page2.NextBefore, 20)
+	page3, err := cli.Lookup(ctx, key, page2.NextBefore, 20, page2NextRoot)
 	if err != nil {
 		t.Fatalf("Page 3 lookup failed: %v", err)
 	}
@@ -589,11 +604,15 @@ func TestClient_CheckpointsAndSecondaryEndpoints(t *testing.T) {
 	const chunkSize = kvstore.ChunkSize
 	srv, _, _, pub, idxer := setupTestEnvironment(t, chunkSize)
 
-	key := sha256.Sum256([]byte("secondary_test_key"))
+	keyStr := "secondary_test_key"
+	key := sha256.Sum256([]byte(keyStr))
 	batch := &ingest.MappedBatch{
 		Count: 100,
 		KeyMap: map[[32]byte][]uint64{
 			key: {5, 15, 25},
+		},
+		CanonicalKeys: map[[32]byte]string{
+			key: keyStr,
 		},
 	}
 	res, err := idxer.IndexBatch(ctx, batch, nil)
@@ -601,9 +620,9 @@ func TestClient_CheckpointsAndSecondaryEndpoints(t *testing.T) {
 		t.Fatalf("IndexBatch failed: %v", err)
 	}
 	rawInCP := []byte("example.com/input\n100\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
-	_, err = pub.PublishBatch(ctx, res.ModifiedSubRoots, &log.Checkpoint{Origin: "example.com/input", Size: 100}, rawInCP)
+	_, err = pub.PublishKeyBatch(ctx, res.ModifiedKeySubRoots, &log.Checkpoint{Origin: "example.com/input", Size: 100}, rawInCP)
 	if err != nil {
-		t.Fatalf("PublishBatch failed: %v", err)
+		t.Fatalf("PublishKeyBatch failed: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -632,22 +651,22 @@ func TestClient_CheckpointsAndSecondaryEndpoints(t *testing.T) {
 	}
 
 	// 3. LookupKey and LookupAllKey
-	respKey, err := cli.LookupKey(ctx, "secondary_test_key", nil, 100)
+	respKey, err := cli.LookupKey(ctx, keyStr, nil, 100)
 	if err != nil || !respKey.Exists || len(respKey.Indices) != 3 {
 		t.Fatalf("LookupKey failed: %v, resp: %+v", err, respKey)
 	}
 
-	respAllKey, err := cli.LookupAllKey(ctx, "secondary_test_key", 10)
+	respAllKey, err := cli.LookupAllKey(ctx, keyStr, 10)
 	if err != nil || !respAllKey.Exists || len(respAllKey.Indices) != 3 {
 		t.Fatalf("LookupAllKey failed: %v, resp: %+v", err, respAllKey)
 	}
 
-	// 4. VIndexClient and VerifyLookupResponse
+	// 4. VIndexClient
 	vClient, err := NewVIndexClient(ts.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("NewVIndexClient failed: %v", err)
 	}
-	indices, rawCPRes, err := vClient.Lookup(ctx, "secondary_test_key")
+	indices, rawCPRes, err := vClient.Lookup(ctx, keyStr)
 	if err != nil || len(indices) != 3 {
 		t.Fatalf("vClient.Lookup failed: %v, indices: %v", err, indices)
 	}
@@ -664,61 +683,245 @@ func TestClient_CheckpointsAndSecondaryEndpoints(t *testing.T) {
 	}
 }
 
-func TestVerifyLookupResponse_Cases(t *testing.T) {
-	inSKey, inVKey, _ := note.GenerateKey(rand.Reader, "input.test")
-	inSigner, _ := note.NewSigner(inSKey)
-	inVerifier, _ := note.NewVerifier(inVKey)
+func TestClient_PrefixLookupAndTwoSidedSoundness(t *testing.T) {
+	ctx := context.Background()
+	const chunkSize = kvstore.ChunkSize
+	srv, _, _, pub, idxer := setupTestEnvironment(t, chunkSize)
 
-	outSKey, outVKey, _ := note.GenerateKey(rand.Reader, "output.test")
-	outSigner, _ := note.NewSigner(outSKey)
-	outVerifier, _ := note.NewVerifier(outVKey)
+	kApex := "com.google."
+	kMail := "com.google.mail."
+	kDocs := "com.google.docs."
+	kWild := "com.google.*."
+	kSibling := "com.googleapis.www."
 
-	keyHash := sha256.Sum256([]byte("legacy_key"))
-	indices := []uint64{1, 2, 3}
-	miniRoot, _ := computeMiniLogRoot(nil, 0, indices)
+	khApex := sha256.Sum256([]byte(kApex))
+	khMail := sha256.Sum256([]byte(kMail))
+	khDocs := sha256.Sum256([]byte(kDocs))
+	khWild := sha256.Sum256([]byte(kWild))
+	khSibling := sha256.Sum256([]byte(kSibling))
 
-	mpt := tree.NewMem()
-	_, _ = mpt.Commit(map[[32]byte][32]byte{keyHash: miniRoot})
-	proof, _, _, _ := mpt.Prove(keyHash)
-
-	rawInCP, _ := note.Sign(&note.Note{Text: "input.test\n100\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n"}, inSigner)
-
-	mptRoot := mpt.Root()
-	outLeaf := []byte(hex.EncodeToString(mptRoot[:]) + "\n" + string(rawInCP))
-	outLeafHash := leafHash(outLeaf)
-
-	rawOutCP, _ := note.Sign(&note.Note{Text: "output.test\n1\n" + base64.StdEncoding.EncodeToString(outLeafHash[:]) + "\n"}, outSigner)
-
-	validLegacy := LegacyLookupResponse{
-		OutputLogCP:    rawOutCP,
-		OutputLogLeaf:  outLeaf,
-		OutputLogProof: nil,
-		IndexValue:     indices,
-		IndexProof:     proof,
+	batch := &ingest.MappedBatch{
+		Count: 100,
+		KeyMap: map[[32]byte][]uint64{
+			khApex:    {1, 10},
+			khMail:    {2, 20, 30},
+			khDocs:    {3},
+			khWild:    {4, 40},
+			khSibling: {99},
+		},
+		CanonicalKeys: map[[32]byte]string{
+			khApex:    kApex,
+			khMail:    kMail,
+			khDocs:    kDocs,
+			khWild:    kWild,
+			khSibling: kSibling,
+		},
 	}
-
-	// 1. Valid verification
-	gotIndices, gotInCP, err := VerifyLookupResponse(keyHash, validLegacy, inVerifier, outVerifier, "input.test")
+	res, err := idxer.IndexBatch(ctx, batch, nil)
 	if err != nil {
-		t.Fatalf("VerifyLookupResponse failed: %v", err)
+		t.Fatalf("IndexBatch failed: %v", err)
 	}
-	if len(gotIndices) != 3 || len(gotInCP) == 0 {
-		t.Fatalf("unexpected result: indices=%v, cp=%s", gotIndices, string(gotInCP))
-	}
-
-	// 2. Tampered output log checkpoint
-	tamperedLegacy := validLegacy
-	tamperedLegacy.OutputLogCP = []byte("output.test\n1\nAAAA\n\n— bad sig\n")
-	if _, _, err := VerifyLookupResponse(keyHash, tamperedLegacy, inVerifier, outVerifier, "input.test"); err == nil {
-		t.Error("expected error for tampered output log checkpoint, got nil")
+	rawInCP := []byte("example.com/input\n100\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	_, err = pub.PublishKeyBatch(ctx, res.ModifiedKeySubRoots, &log.Checkpoint{Origin: "example.com/input", Size: 100}, rawInCP)
+	if err != nil {
+		t.Fatalf("PublishKeyBatch failed: %v", err)
 	}
 
-	// 3. Malformed output leaf
-	tamperedLegacy = validLegacy
-	tamperedLegacy.OutputLogLeaf = []byte("short")
-	if _, _, err := VerifyLookupResponse(keyHash, tamperedLegacy, inVerifier, outVerifier, "input.test"); err == nil {
-		t.Error("expected error for malformed output leaf, got nil")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cli, err := New(ts.URL, VerifierConfig{
+		OutputLogOrigin: "example.com/output",
+		InputLogOrigin:  "example.com/input",
+	}, ts.Client())
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	// 1. LookupPrefixAll("com.google.") -> must return 4 keys in ascending order and exclude "com.googleapis.www."
+	prefixResp, err := cli.LookupPrefixAll(ctx, "com.google.", 10)
+	if err != nil {
+		t.Fatalf("LookupPrefixAll failed: %v", err)
+	}
+	if len(prefixResp.Results) != 4 {
+		t.Fatalf("expected 4 matched keys, got %d: %+v", len(prefixResp.Results), prefixResp.Results)
+	}
+	wantOrder := []string{kApex, kWild, kDocs, kMail}
+	for i, wantKey := range wantOrder {
+		if prefixResp.Results[i].Key != wantKey {
+			t.Errorf("Result[%d].Key = %q, want %q", i, prefixResp.Results[i].Key, wantKey)
+		}
+	}
+	if len(prefixResp.Results[3].Indices) != 3 || prefixResp.Results[3].Indices[2] != 30 {
+		t.Errorf("unexpected indices for %s: %v", kMail, prefixResp.Results[3].Indices)
+	}
+
+	// 2. Non-existent prefix ("com.nonexistent.") -> verified empty subtree
+	emptyPrefixResp, err := cli.LookupPrefixAll(ctx, "com.nonexistent.", 10)
+	if err != nil {
+		t.Fatalf("LookupPrefixAll(com.nonexistent.) failed: %v", err)
+	}
+	if len(emptyPrefixResp.Results) != 0 {
+		t.Fatalf("expected 0 results for nonexistent prefix, got %d", len(emptyPrefixResp.Results))
+	}
+
+	// 3. Adversarial two-sided soundness check: if a buggy/malicious server returns a broader prefix proof
+	// (e.g. proof for "com." including "com.googleapis.www.") when the client queried "com.google.",
+	// VerifyKeysResponse MUST reject it because "com.googleapis.www." fails HasPrefix("com.google.").
+	req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.?prefix=true", nil)
+	w := httptest.NewRecorder()
+	// Temporarily bypass prefix policy on srv to generate a raw "com." response
+	srv.SetPrefixPolicy(nil)
+	srv.HandleKeys(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HandleKeys(com.) failed: %d", w.Code)
+	}
+	if _, err := cli.verifier.VerifyKeysResponse(ctx, "com.google.", true, w.Body.Bytes()); err == nil {
+		t.Fatal("VerifyKeysResponse must reject broader subtree containing keys outside query prefix")
 	}
 }
+
+func TestClient_EntriesTruncationAndCompactRangeValidation(t *testing.T) {
+	ctx := context.Background()
+	verifier := NewVerifier(VerifierConfig{})
+
+	indices := []uint64{10, 20}
+	subRoot, err := computeMiniLogRoot(nil, 0, indices)
+	if err != nil {
+		t.Fatalf("computeMiniLogRoot failed: %v", err)
+	}
+
+	// 1. Valid single-page entries response
+	validBody := "— indices-v1 —\n10\n20\n"
+	if _, err := verifier.VerifyEntriesResponse(ctx, 100, subRoot, []byte(validBody)); err != nil {
+		t.Fatalf("expected valid entries response to pass, got: %v", err)
+	}
+
+	// 1b. Zero expectedSubRoot must be rejected by VerifyEntriesResponse (Backlog 2.6.1)
+	if _, err := verifier.VerifyEntriesResponse(ctx, 100, [32]byte{}, []byte(validBody)); err == nil {
+		t.Fatal("expected VerifyEntriesResponse to reject zero expectedSubRoot")
+	}
+
+	// 2. Truncated page: prefix-compact-range-v1 present with covered_size > 0, but next_before omitted from indices-v1 (Backlog 2.6.2)
+	dummyHash := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	truncatedBody := fmt.Sprintf("— prefix-compact-range-v1 1 —\n%s\n\n— indices-v1 —\n10\n20\n", dummyHash)
+	if _, err := verifier.VerifyEntriesResponse(ctx, 100, subRoot, []byte(truncatedBody)); err == nil || !strings.Contains(err.Error(), "truncated response") {
+		t.Fatalf("expected truncated response error when next_before is omitted with non-empty prefix range, got: %v", err)
+	}
+
+	// 3. Mismatched coveredSize > 0 with 0 hashes (Backlog 2.6.2)
+	mismatchedBody := "— prefix-compact-range-v1 5 —\n\n— indices-v1 10 —\n10\n20\n"
+	if _, err := verifier.VerifyEntriesResponse(ctx, 100, subRoot, []byte(mismatchedBody)); err == nil || !strings.Contains(err.Error(), "mismatched prefix-compact-range-v1") {
+		t.Fatalf("expected mismatched prefix-compact-range-v1 error, got: %v", err)
+	}
+
+	// 4. next_before does not match first index in indices-v1 (Backlog 2.6.2)
+	wrongNextBefore := fmt.Sprintf("— prefix-compact-range-v1 1 —\n%s\n\n— indices-v1 9 —\n10\n20\n", dummyHash)
+	if _, err := verifier.VerifyEntriesResponse(ctx, 100, subRoot, []byte(wrongNextBefore)); err == nil || !strings.Contains(err.Error(), "must equal first returned index") {
+		t.Fatalf("expected next_before mismatch error, got: %v", err)
+	}
+
+	// 5. Total entries (coveredSize + len(indices)) > before
+	overflowBody := fmt.Sprintf("— prefix-compact-range-v1 99 —\n%s\n\n— indices-v1 10 —\n10\n20\n", dummyHash)
+	if _, err := verifier.VerifyEntriesResponse(ctx, 100, subRoot, []byte(overflowBody)); err == nil || !strings.Contains(err.Error(), "exceed upperBound") {
+		t.Fatalf("expected exceed upperBound error, got: %v", err)
+	}
+}
+
+func BenchmarkClient_VerifyKeysAndEntries(b *testing.B) {
+	ctx := context.Background()
+	srv, _, _, pub, idxer := setupTestEnvironment(b, 64)
+
+	kApex := "com.google."
+	kMail := "com.google.mail."
+	kDocs := "com.google.docs."
+	kWild := "com.google.*."
+
+	khApex := sha256.Sum256([]byte(kApex))
+	khMail := sha256.Sum256([]byte(kMail))
+	khDocs := sha256.Sum256([]byte(kDocs))
+	khWild := sha256.Sum256([]byte(kWild))
+
+	var mailIndices []uint64
+	for i := uint64(0); i < 128; i++ {
+		mailIndices = append(mailIndices, i*10+1)
+	}
+
+	batch := &ingest.MappedBatch{
+		Count: 2000,
+		KeyMap: map[[32]byte][]uint64{
+			khApex: {1, 10},
+			khMail: mailIndices,
+			khDocs: {3},
+			khWild: {4, 40},
+		},
+		CanonicalKeys: map[[32]byte]string{
+			khApex: kApex,
+			khMail: kMail,
+			khDocs: kDocs,
+			khWild: kWild,
+		},
+	}
+	res, err := idxer.IndexBatch(ctx, batch, nil)
+	if err != nil {
+		b.Fatalf("IndexBatch failed: %v", err)
+	}
+	rawInCP := []byte("example.com/input\n2000\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	if _, err := pub.PublishKeyBatch(ctx, res.ModifiedKeySubRoots, &log.Checkpoint{Origin: "example.com/input", Size: 2000}, rawInCP); err != nil {
+		b.Fatalf("PublishKeyBatch failed: %v", err)
+	}
+
+	wPoint := httptest.NewRecorder()
+	srv.HandleKeys(wPoint, httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.mail.", nil))
+	pointBytes := wPoint.Body.Bytes()
+
+	wPrefix := httptest.NewRecorder()
+	srv.HandleKeys(wPrefix, httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.?prefix=true", nil))
+	prefixBytes := wPrefix.Body.Bytes()
+
+	wEntries := httptest.NewRecorder()
+	srv.HandleEntries(wEntries, httptest.NewRequest(http.MethodGet, "/vindex/v1/entries/com.google.mail.?before=2000&limit=64", nil))
+	entriesBytes := wEntries.Body.Bytes()
+
+	verifier := NewVerifier(VerifierConfig{
+		OutputLogOrigin: "example.com/output",
+		InputLogOrigin:  "example.com/input",
+	})
+	keysResp, err := verifier.VerifyKeysResponse(ctx, kMail, false, pointBytes)
+	if err != nil {
+		b.Fatalf("VerifyKeysResponse failed: %v", err)
+	}
+	mailSubRoot := keysResp.Keys[0].SubRoot
+
+	b.Run("VerifyKeysResponse_Point", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := verifier.VerifyKeysResponse(ctx, kMail, false, pointBytes); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("VerifyKeysResponse_Prefix4Keys", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := verifier.VerifyKeysResponse(ctx, kApex, true, prefixBytes); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("VerifyEntriesResponse_ZeroMPTContinuation", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := verifier.VerifyEntriesResponse(ctx, 2000, mailSubRoot, entriesBytes); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 
 
