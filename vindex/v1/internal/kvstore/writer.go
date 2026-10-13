@@ -160,6 +160,114 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 		return nil, fmt.Errorf("failed to read persisted kv_size: %w", err)
 	}
 
+	pBatch := idx.db.NewBatch()
+	defer func() {
+		_ = pBatch.Close()
+		if retErr != nil {
+			idx.ClearCache()
+		}
+	}()
+
+	modifiedSubRoots, newCachedEntries, newKVSize, err := idx.buildBatchMutations(ctx, pBatch, persistedKVSize, batch, targetSize)
+	if err != nil {
+		return nil, err
+	}
+
+	if newKVSize > persistedKVSize {
+		var szBuf [8]byte
+		binary.BigEndian.PutUint64(szBuf[:], newKVSize)
+		if err := pBatch.Set(KeyMetaKVSize, szBuf[:], nil); err != nil {
+			return nil, fmt.Errorf("failed to set metadata kv_size: %w", err)
+		}
+
+		// Performance optimization: use pebble.NoSync for intermediate catch-up batches
+		// to avoid blocking on synchronous disk fsync() every 256 leaves. Durability is enforced
+		// via pebble.Sync on the final catch-up boundary (newKVSize == targetSize) and steady-state commits.
+		syncOption := pebble.Sync
+		if targetSize > 0 && newKVSize < targetSize {
+			syncOption = pebble.NoSync
+		} else if len(rawTargetCP) > 0 {
+			if err := pBatch.Set(KeyMetaKVCheckpoint, rawTargetCP, nil); err != nil {
+				return nil, fmt.Errorf("failed to set metadata kv_checkpoint: %w", err)
+			}
+		}
+
+		applyStart := time.Now()
+		if err := idx.db.Pebble().Apply(pBatch, syncOption); err != nil {
+			return nil, fmt.Errorf("failed to commit indexing batch: %w", err)
+		}
+		metrics.PebbleApplyDurationSeconds.Observe(time.Since(applyStart).Seconds())
+
+		if len(idx.currentCache)+len(newCachedEntries) > maxGenChunkCacheSize {
+			idx.previousCache = idx.currentCache
+			idx.currentCache = make(map[[sha256.Size]byte]activeChunkEntry, maxGenChunkCacheSize)
+		}
+		for k, v := range newCachedEntries {
+			idx.currentCache[k] = v
+		}
+	} else if len(rawTargetCP) > 0 && targetSize > 0 && newKVSize == targetSize {
+		if err := idx.db.SetMetadata(KeyMetaKVCheckpoint, rawTargetCP); err != nil {
+			return nil, fmt.Errorf("failed to set metadata kv_checkpoint: %w", err)
+		}
+	}
+
+	idx.lastModifiedSubs = modifiedSubRoots
+	return &IndexResult{
+		NewKVSize:        newKVSize,
+		ModifiedSubRoots: modifiedSubRoots,
+	}, nil
+}
+
+// StageMappedBatch stages chunk mutations for batch into stagedBatch without applying them to the underlying DB.
+// This allows callers (such as the auditor) to predict and verify the resulting MPT root hash before committing
+// any chunk or watermark mutations to Pebble. If verification subsequently fails, the caller must discard
+// stagedBatch and call ClearCache().
+func (idx *KVIndexer) StageMappedBatch(ctx context.Context, stagedBatch *pebble.Batch, persistedKVSize uint64, batch *ingest.MappedBatch, targetSize uint64) (res *IndexResult, retErr error) {
+	if batch == nil {
+		return &IndexResult{NewKVSize: persistedKVSize, ModifiedSubRoots: make(map[[32]byte][32]byte)}, nil
+	}
+	defer func() {
+		if retErr != nil {
+			idx.ClearCache()
+		}
+	}()
+
+	modifiedSubRoots, newCachedEntries, newKVSize, err := idx.buildBatchMutations(ctx, stagedBatch, persistedKVSize, batch, targetSize)
+	if err != nil {
+		return nil, err
+	}
+
+	if newKVSize > persistedKVSize {
+		if stagedBatch != nil && stagedBatch.Indexed() && len(idx.currentCache)+len(newCachedEntries) > maxGenChunkCacheSize {
+			idx.previousCache = idx.currentCache
+			idx.currentCache = make(map[[sha256.Size]byte]activeChunkEntry, maxGenChunkCacheSize)
+		}
+		for k, v := range newCachedEntries {
+			idx.currentCache[k] = v
+		}
+	}
+
+	idx.lastModifiedSubs = modifiedSubRoots
+	return &IndexResult{
+		NewKVSize:        newKVSize,
+		ModifiedSubRoots: modifiedSubRoots,
+	}, nil
+}
+
+func (idx *KVIndexer) newBatchOrDBIter(pBatch *pebble.Batch) (*pebble.Iterator, error) {
+	if pBatch != nil && pBatch.Indexed() {
+		return pBatch.NewIter(nil)
+	}
+	return idx.db.NewIter(nil)
+}
+
+func (idx *KVIndexer) buildBatchMutations(
+	ctx context.Context,
+	pBatch *pebble.Batch,
+	persistedKVSize uint64,
+	batch *ingest.MappedBatch,
+	targetSize uint64,
+) (map[[sha256.Size]byte][sha256.Size]byte, map[[sha256.Size]byte]activeChunkEntry, uint64, error) {
 	keys := make([][sha256.Size]byte, 0, len(batch.KeyMap))
 	for k := range batch.KeyMap {
 		keys = append(keys, k)
@@ -178,15 +286,7 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 		}
 	}
 
-	pBatch := idx.db.NewBatch()
-	defer func() {
-		_ = pBatch.Close()
-		if retErr != nil {
-			idx.ClearCache()
-		}
-	}()
-
-	modifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+	modifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte, len(keys))
 	newCachedEntries := make(map[[sha256.Size]byte]activeChunkEntry, len(keys))
 
 	newKVSize := batch.EndLeafIdx
@@ -198,42 +298,44 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 
 	const parallelThreshold = 32
 	const minKeysPerWorker = 16
-	if idx.numWorkers <= 1 || len(keys) < parallelThreshold {
-		iter, err := idx.db.NewIter(nil)
+	if idx.numWorkers <= 1 || len(keys) < parallelThreshold || (pBatch != nil && pBatch.Indexed()) {
+		iter, err := idx.newBatchOrDBIter(pBatch)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create iterator: %w", err)
+			return nil, nil, 0, fmt.Errorf("failed to create iterator: %w", err)
 		}
-		defer func() { _ = iter.Close() }()
 		getIter := func() (*pebble.Iterator, error) { return iter, nil }
 
 		var prefixBuf [33]byte
+		idx.marshalBuf = idx.marshalBuf[:0]
+		idx.writesBuf = idx.writesBuf[:0]
 
 		for _, keyHash := range keys {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				_ = iter.Close()
+				return nil, nil, 0, ctx.Err()
 			default:
 			}
 
-			idx.marshalBuf = idx.marshalBuf[:0]
-			idx.writesBuf = idx.writesBuf[:0]
 			res, newBuf, err := idx.processKey(
 				keyHash, batch.KeyMap[keyHash], persistedKVSize, newKVSize, targetSize,
 				batch.StartLeafIdx, idx.marshalBuf, &idx.writesBuf, &prefixBuf, getIter,
 			)
 			if err != nil {
-				return nil, err
+				_ = iter.Close()
+				return nil, nil, 0, err
 			}
 			idx.marshalBuf = newBuf
 			modifiedSubRoots[keyHash] = res.subRoot
 			if res.hasCache {
 				newCachedEntries[keyHash] = res.cached
 			}
-			for j := range idx.writesBuf {
-				w := &idx.writesBuf[j]
-				if err := pBatch.Set(w.key[:], w.val, nil); err != nil {
-					return nil, fmt.Errorf("failed to set chunk: %w", err)
-				}
+		}
+		_ = iter.Close()
+		for j := range idx.writesBuf {
+			w := &idx.writesBuf[j]
+			if err := pBatch.Set(w.key[:], w.val, nil); err != nil {
+				return nil, nil, 0, fmt.Errorf("failed to set chunk: %w", err)
 			}
 		}
 	} else {
@@ -307,7 +409,7 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 		}
 
 		if err := g.Wait(); err != nil {
-			return nil, err
+			return nil, nil, 0, err
 		}
 
 		for i := range results {
@@ -321,55 +423,13 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 			for j := range wWrites {
 				w := &wWrites[j]
 				if err := pBatch.Set(w.key[:], w.val, nil); err != nil {
-					return nil, fmt.Errorf("failed to set chunk: %w", err)
+					return nil, nil, 0, fmt.Errorf("failed to set chunk: %w", err)
 				}
 			}
 		}
 	}
 
-	if newKVSize > persistedKVSize {
-		var szBuf [8]byte
-		binary.BigEndian.PutUint64(szBuf[:], newKVSize)
-		if err := pBatch.Set(KeyMetaKVSize, szBuf[:], nil); err != nil {
-			return nil, fmt.Errorf("failed to set metadata kv_size: %w", err)
-		}
-
-		// Performance optimization: use pebble.NoSync for intermediate catch-up batches
-		// to avoid blocking on synchronous disk fsync() every 256 leaves. Durability is enforced
-		// via pebble.Sync on the final catch-up boundary (newKVSize == targetSize) and steady-state commits.
-		syncOption := pebble.Sync
-		if targetSize > 0 && newKVSize < targetSize {
-			syncOption = pebble.NoSync
-		} else if len(rawTargetCP) > 0 {
-			if err := pBatch.Set(KeyMetaKVCheckpoint, rawTargetCP, nil); err != nil {
-				return nil, fmt.Errorf("failed to set metadata kv_checkpoint: %w", err)
-			}
-		}
-
-		applyStart := time.Now()
-		if err := idx.db.Pebble().Apply(pBatch, syncOption); err != nil {
-			return nil, fmt.Errorf("failed to commit indexing batch: %w", err)
-		}
-		metrics.PebbleApplyDurationSeconds.Observe(time.Since(applyStart).Seconds())
-
-		if len(idx.currentCache)+len(newCachedEntries) > maxGenChunkCacheSize {
-			idx.previousCache = idx.currentCache
-			idx.currentCache = make(map[[sha256.Size]byte]activeChunkEntry, maxGenChunkCacheSize)
-		}
-		for k, v := range newCachedEntries {
-			idx.currentCache[k] = v
-		}
-	} else if len(rawTargetCP) > 0 && targetSize > 0 && newKVSize == targetSize {
-		if err := idx.db.SetMetadata(KeyMetaKVCheckpoint, rawTargetCP); err != nil {
-			return nil, fmt.Errorf("failed to set metadata kv_checkpoint: %w", err)
-		}
-	}
-
-	idx.lastModifiedSubs = modifiedSubRoots
-	return &IndexResult{
-		NewKVSize:        newKVSize,
-		ModifiedSubRoots: modifiedSubRoots,
-	}, nil
+	return modifiedSubRoots, newCachedEntries, newKVSize, nil
 }
 
 type chunkMutation struct {
@@ -494,6 +554,10 @@ func (idx *KVIndexer) processKey(
 
 	for _, leafIdx := range unpersisted {
 		targetChunkNum := leafIdx / idx.chunkSize
+		rel := uint16(leafIdx % idx.chunkSize)
+		if targetChunkNum < currChunkNum || (targetChunkNum == currChunkNum && len(rec.RelativeIndices) > 0 && rel <= rec.RelativeIndices[len(rec.RelativeIndices)-1]) {
+			continue
+		}
 		if targetChunkNum > currChunkNum {
 			if len(rec.RelativeIndices) > 0 {
 				start := len(marshalBuf)
@@ -511,7 +575,7 @@ func (idx *KVIndexer) processKey(
 				RelativeIndices: nil,
 			}
 		}
-		rec.RelativeIndices = append(rec.RelativeIndices, uint16(leafIdx%idx.chunkSize))
+		rec.RelativeIndices = append(rec.RelativeIndices, rel)
 		var b [8]byte
 		binary.BigEndian.PutUint64(b[:], leafIdx)
 		runningRange.Append(LeafHash(b[:]))

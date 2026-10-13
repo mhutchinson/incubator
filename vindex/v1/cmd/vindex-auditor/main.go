@@ -49,6 +49,8 @@ var (
 	listenAddr      = flag.String("listen_addr", ":8080", "HTTP Read Server address for mirror lookups.")
 	metricsAddr     = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
 	chunkSize       = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
+	commitBatchSize = flag.Uint64("commit_batch_size", 4096, "Number of leaves accumulated per batch commit.")
+	tileCacheDir    = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval    = flag.Duration("poll_interval", 10*time.Second, "Polling interval for new Output Log checkpoints.")
 	oneShot         = flag.Bool("oneshot", false, "Run verification once against log tip and exit.")
 )
@@ -109,12 +111,14 @@ func run(ctx context.Context) error {
 		MapFn:           leafMapper,
 		DBPath:          *dbPath,
 		MPTDir:          *mptDir,
+		TileCacheDir:    *tileCacheDir,
 		ServeMirror:     *serveMirror,
 		FailClosed:      *failClosed,
 		ListenAddr:      *listenAddr,
 		MetricsAddr:     *metricsAddr,
 		PollInterval:    *pollInterval,
-		CommitBatchSize: *chunkSize,
+		ChunkSize:       *chunkSize,
+		CommitBatchSize: *commitBatchSize,
 	}
 
 	v, err := auditor.New(cfg)

@@ -324,9 +324,9 @@ func TestStress_MirrorServing_ConcurrentTransitions(t *testing.T) {
 	// Run under concurrent traffic in post-mismatch halted state
 	time.Sleep(250 * time.Millisecond)
 
-	// Direct endpoint assertions in Phase 3
+	// Direct endpoint assertions in Phase 3: /healthz stays 200 OK (liveness), /readyz and lookup return 503
 	respHealth, err := ts.Client().Get(ts.URL + "/healthz")
-	if err != nil || respHealth.StatusCode != http.StatusServiceUnavailable {
+	if err != nil || respHealth.StatusCode != http.StatusOK {
 		t.Fatalf("Phase 3 /healthz check failed: code=%v, err=%v", respHealth.StatusCode, err)
 	}
 	_ = respHealth.Body.Close()

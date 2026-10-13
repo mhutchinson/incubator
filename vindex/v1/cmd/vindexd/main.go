@@ -72,6 +72,7 @@ var (
 	metricsAddr        = flag.String("metrics_addr", ":9090", "Prometheus metrics scrape address.")
 	pathPrefix         = flag.String("path_prefix", "", "Base URL path prefix to host vindex endpoints under (e.g. '/indices/sumdb' or 'indices/sumdb'). Defaults to empty (root).")
 	chunkSize          = flag.Uint64("chunk_size", 65536, "Logical chunk size.")
+	commitBatchSize    = flag.Uint64("commit_batch_size", 4096, "Number of leaves accumulated per batch commit.")
 	tileCacheDir       = flag.String("tile_cache_dir", "", "Path for local tile cache directory.")
 	pollInterval         = flag.Duration("poll_interval", 10*time.Second, "Ingestion polling interval.")
 	disableReaper        = flag.Bool("disable_reaper", false, "Disable background tile cache reaper to keep tiles cached indefinitely.")
@@ -224,6 +225,9 @@ func runPublisher(ctx context.Context) error {
 		return fmt.Errorf("failed to open Pebble DB at %q: %w", *dbPath, err)
 	}
 	defer func() { _ = db.Close() }()
+	if *chunkSize > 0 {
+		db.SetChunkSize(*chunkSize)
+	}
 
 	// 2. Start Metrics & Read HTTP Servers immediately so /healthz (200 OK) and /readyz (503 JSON)
 	// respond while MPT mmap files are opening and 3-phase crash recovery is running.
@@ -393,7 +397,11 @@ func runPublisher(ctx context.Context) error {
 	} else if resBudget.CoarseCheckpointInterval > 0 {
 		coord.SetCoarseCheckpointInterval(resBudget.CoarseCheckpointInterval)
 	}
-	coord.SetCommitBatchSize(resBudget.CommitBatchSize)
+	if isFlagPassed("commit_batch_size") && *commitBatchSize > 0 {
+		coord.SetCommitBatchSize(*commitBatchSize)
+	} else {
+		coord.SetCommitBatchSize(resBudget.CommitBatchSize)
+	}
 	readSrv.SetReadyChecker(coord.ReadinessCheck)
 
 	klog.Info("Running 3-phase startup recovery...")
@@ -488,13 +496,15 @@ func runAuditor(ctx context.Context) error {
 		MapFn:           leafMapper,
 		DBPath:          *dbPath,
 		MPTDir:          *mptDir,
+		TileCacheDir:    *tileCacheDir,
 		ServeMirror:     *serveMirror,
 		FailClosed:      *failClosed,
 		ListenAddr:      *listenAddr,
 		MetricsAddr:     *metricsAddr,
 		PathPrefix:      *pathPrefix,
 		PollInterval:    *pollInterval,
-		CommitBatchSize: *chunkSize,
+		ChunkSize:       *chunkSize,
+		CommitBatchSize: *commitBatchSize,
 	}
 
 	v, err := auditor.New(cfg)

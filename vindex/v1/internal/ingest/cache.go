@@ -63,6 +63,9 @@ func (c *ManagedTileCache) bundlePath(bundleIdx uint64) string {
 
 // GetBundle retrieves a LeafBundle from memory or disk cache.
 func (c *ManagedTileCache) GetBundle(bundleIdx uint64) (*LeafBundle, error) {
+	if c == nil {
+		return nil, ErrBundleNotFound
+	}
 	if c.cacheDir == "" {
 		c.mu.RLock()
 		b, ok := c.memory[bundleIdx]
@@ -111,7 +114,7 @@ var bundleMarshalPool = sync.Pool{
 
 // PutBundle stores a LeafBundle on disk (or in memory if cacheDir is not configured).
 func (c *ManagedTileCache) PutBundle(bundle *LeafBundle) error {
-	if bundle == nil {
+	if c == nil || bundle == nil {
 		return nil
 	}
 

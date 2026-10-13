@@ -278,19 +278,15 @@ func TestVerifier_MirrorServing_RootMismatchWithdrawsServing(t *testing.T) {
 		t.Fatalf("expected ErrRootMismatch, got: %v", err)
 	}
 
-	// 4. In fail-closed mode, assert all endpoints return 503:
-	// - /healthz returns 503
+	// 4. In fail-closed mode, assert /healthz stays 200 OK (liveness) while /readyz and lookup return 503:
+	// - /healthz returns 200 OK
 	respHealth, err := ts.Client().Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz failed: %v", err)
 	}
 	defer func() { _ = respHealth.Body.Close() }()
-	if respHealth.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("post-mismatch /healthz status = %d, want 503", respHealth.StatusCode)
-	}
-	healthBody, _ := io.ReadAll(respHealth.Body)
-	if !strings.Contains(string(healthBody), "verifier root hash mismatch") {
-		t.Fatalf("/healthz body missing mismatch message: %s", string(healthBody))
+	if respHealth.StatusCode != http.StatusOK {
+		t.Fatalf("post-mismatch /healthz status = %d, want 200", respHealth.StatusCode)
 	}
 
 	// - /readyz returns 503
@@ -301,6 +297,10 @@ func TestVerifier_MirrorServing_RootMismatchWithdrawsServing(t *testing.T) {
 	defer func() { _ = respReadyPost.Body.Close() }()
 	if respReadyPost.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("post-mismatch /readyz status = %d, want 503", respReadyPost.StatusCode)
+	}
+	readyBody, _ := io.ReadAll(respReadyPost.Body)
+	if !strings.Contains(string(readyBody), "verifier root hash mismatch") {
+		t.Fatalf("/readyz body missing mismatch message: %s", string(readyBody))
 	}
 
 	// - /vindex/lookup/{keyhash} returns 503

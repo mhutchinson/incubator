@@ -143,8 +143,9 @@ type Config struct {
 	MapFn ingest.LeafMapper
 
 	// Storage paths (use empty string or ":memory:" for in-memory operation)
-	DBPath string
-	MPTDir string
+	DBPath       string
+	MPTDir       string
+	TileCacheDir string
 
 	// Operational settings
 	ServeMirror     bool
@@ -153,6 +154,7 @@ type Config struct {
 	MetricsAddr     string
 	PathPrefix      string
 	PollInterval    time.Duration
+	ChunkSize       uint64
 	CommitBatchSize uint64
 
 	// Optional dependency injection (for tests and custom clients)
@@ -162,6 +164,7 @@ type Config struct {
 	OutputLogClient   OutputLogSource
 	InputLogFetcher   ingest.TileFetcher
 	Fetcher           ingest.TileFetcher
+	TileCache         *ingest.ManagedTileCache
 	DB                *kvstore.DB
 	MPTMgr            *tree.Manager
 }
@@ -234,6 +237,14 @@ func (f *NoCheckpointFetcher) Checkpoint(_ context.Context) (*ingest.Checkpoint,
 
 func (f *NoCheckpointFetcher) SetTreeSize(size uint64) {
 	if sizer, ok := f.TileFetcher.(interface{ SetTreeSize(uint64) }); ok {
+		sizer.SetTreeSize(size)
+	}
+}
+
+func (f *NoCheckpointFetcher) SetTreeState(size uint64, hash [32]byte) {
+	if stater, ok := f.TileFetcher.(interface{ SetTreeState(uint64, [32]byte) }); ok {
+		stater.SetTreeState(size, hash)
+	} else if sizer, ok := f.TileFetcher.(interface{ SetTreeSize(uint64) }); ok {
 		sizer.SetTreeSize(size)
 	}
 }
@@ -357,6 +368,10 @@ func New(cfg Config) (*Verifier, error) {
 		v.ownsDB = true
 	}
 
+	if cfg.ChunkSize > 0 {
+		v.db.SetChunkSize(cfg.ChunkSize)
+	}
+
 	// 3. Initialize MPT Manager (mmap disk or in-memory)
 	if cfg.MPTMgr != nil {
 		v.mptMgr = cfg.MPTMgr
@@ -453,24 +468,31 @@ func New(cfg Config) (*Verifier, error) {
 	// Wrap raw fetcher to enforce Sourcing Invariant (R1)
 	v.inputFetcher = WrapNoCheckpointFetcher(rawFetcher)
 
-	// 8. Setup Ingestion Pipeline
-	v.pipeline = ingest.NewPipeline(v.inputFetcher, nil, v.cfg.MapFn, 0)
+	// 8. Setup TileCache & Ingestion Pipeline
+	var tileCache ingest.TileCache
+	if cfg.TileCache != nil {
+		tileCache = cfg.TileCache
+	} else if cfg.TileCacheDir != "" {
+		tc, err := ingest.NewManagedTileCache(cfg.TileCacheDir, 0)
+		if err != nil {
+			_ = v.Close()
+			return nil, fmt.Errorf("failed to initialize tile cache at %q: %w", cfg.TileCacheDir, err)
+		}
+		tileCache = tc
+	}
+	v.pipeline = ingest.NewPipeline(v.inputFetcher, tileCache, v.cfg.MapFn, 0)
 
 	// 9. Reset baseline Prometheus metrics
 	metrics.ResetVerifierRootMismatch()
 
 	// 10. Setup Mirror Serving if requested (R3)
+	// /healthz remains a liveness probe (HTTP 200 OK) so halted pods stay alive to serve
+	// Prometheus metrics and /readyz diagnostic JSON instead of entering CrashLoopBackOff.
 	if cfg.ServeMirror {
 		v.publisher = tree.NewOutputPublisher(v.db, v.mptMgr, nil, nil)
 		v.readServer = server.NewReadServer(v.db, v.mptMgr, v.publisher, v.db.ChunkSize())
 		v.readServer.SetPathPrefix(cfg.PathPrefix)
 		v.readServer.SetReadyChecker(v.HealthCheck)
-		v.readServer.SetHealthChecker(func() error {
-			if v.cfg.FailClosed {
-				return v.HealthCheck()
-			}
-			return nil
-		})
 	}
 
 	return v, nil
@@ -514,7 +536,9 @@ func (v *Verifier) handleRootMismatch(leafIdx, targetInputSize uint64, localRoot
 	}
 
 	if v.cfg.FailClosed && v.publisher != nil {
+		v.mptMgr.Lock()
 		v.publisher.SetServingState(nil)
+		v.mptMgr.Unlock()
 	}
 
 	v.stateMu.Lock()
@@ -594,6 +618,15 @@ func (v *Verifier) VerifyOnce(ctx context.Context) error {
 			if err != nil {
 				return v.halt(fmt.Errorf("leaf %d format corrupted during mirror rehydration: %w", lastIdx, err))
 			}
+			canonicalLeaf := tree.FormatOutputLogLeaf(committedMapRoot, rawInCP)
+			leafHash := rfc6962.DefaultHasher.HashLeaf(canonicalLeaf)
+			proofBytes := make([][]byte, len(proofHashes))
+			for i := range proofHashes {
+				proofBytes[i] = proofHashes[i][:]
+			}
+			if err := proof.VerifyInclusion(rfc6962.DefaultHasher, lastIdx, outCP.Size, leafHash, proofBytes, outCP.Hash); err != nil {
+				return v.halt(fmt.Errorf("%w for leaf %d during mirror rehydration: %v", ErrInclusionFailed, lastIdx, err))
+			}
 			var inCP *log.Checkpoint
 			if v.inputLogVerifier != nil {
 				origin := v.cfg.InputLogOrigin
@@ -608,6 +641,13 @@ func (v *Verifier) VerifyOnce(ctx context.Context) error {
 			} else {
 				inCP = inCPHeader
 			}
+			if v.lastVerifiedRoot != ([sha256.Size]byte{}) && committedMapRoot != v.lastVerifiedRoot {
+				return v.handleRootMismatch(lastIdx, inCP.Size, v.lastVerifiedRoot, committedMapRoot)
+			}
+			if inCP.Size != v.verifiedInputSize {
+				return v.halt(fmt.Errorf("%w: rehydrated leaf %d input size %d != verified input size %d", ErrMonotonicityBroken, lastIdx, inCP.Size, v.verifiedInputSize))
+			}
+			v.mptMgr.Lock()
 			v.publisher.SetServingState(&tree.ServingState{
 				OutputLogIndex: lastIdx,
 				OutputLogSize:  v.verifiedOutputSize,
@@ -619,194 +659,234 @@ func (v *Verifier) VerifyOnce(ctx context.Context) error {
 				InputLogSize:   inCP.Size,
 				MapRoot:        committedMapRoot,
 			})
+			v.mptMgr.Unlock()
 		}
 		return nil
 	}
 
 	// 2. Sequentially verify each OutputLog leaf [v.verifiedOutputSize .. outCP.Size)
 	for leafIdx := v.verifiedOutputSize; leafIdx < outCP.Size; leafIdx++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		// Fetch leaf data and inclusion proof
-		leafData, err := v.outputLog.GetLeaf(ctx, leafIdx)
-		if err != nil {
-			return fmt.Errorf("failed to fetch output log leaf %d: %w", leafIdx, err)
-		}
-		proofHashes, err := v.outputLog.InclusionProof(ctx, leafIdx, outCP.Size)
-		if err != nil {
-			return fmt.Errorf("failed to fetch inclusion proof for output leaf %d: %w", leafIdx, err)
-		}
-
-		// Parse leaf payload
-		committedMapRoot, inCPHeader, rawInCP, err := tree.ParseOutputLogLeaf(leafData)
-		if err != nil {
-			return v.halt(fmt.Errorf("leaf %d format corrupted: %w", leafIdx, err))
-		}
-
-		// Verify RFC 6962 leaf inclusion proof against OutputLog tree root
-		canonicalLeaf := tree.FormatOutputLogLeaf(committedMapRoot, rawInCP)
-		leafHash := rfc6962.DefaultHasher.HashLeaf(canonicalLeaf)
-		proofBytes := make([][]byte, len(proofHashes))
-		for i := range proofHashes {
-			proofBytes[i] = proofHashes[i][:]
-		}
-		if err := proof.VerifyInclusion(rfc6962.DefaultHasher, leafIdx, outCP.Size, leafHash, proofBytes, outCP.Hash); err != nil {
-			return v.halt(fmt.Errorf("%w for leaf %d: %v", ErrInclusionFailed, leafIdx, err))
-		}
-
-		// Verify embedded InputLog Checkpoint signature with note.Verifier
-		var inCP *log.Checkpoint
-		if v.inputLogVerifier != nil {
-			origin := v.cfg.InputLogOrigin
-			if origin == "" {
-				origin = v.inputLogVerifier.Name()
-			}
-			parsed, _, _, err := log.ParseCheckpoint(rawInCP, origin, v.inputLogVerifier)
-			if err != nil {
-				return v.halt(fmt.Errorf("%w: embedded input log checkpoint signature invalid in leaf %d: %v", ErrCheckpointFailed, leafIdx, err))
-			}
-			inCP = parsed
-		} else {
-			inCP = inCPHeader
-		}
-
-		targetInputSize := inCP.Size
-		if targetInputSize < v.verifiedInputSize {
-			return v.halt(fmt.Errorf("%w: leaf %d target size %d < verified size %d", ErrMonotonicityBroken, leafIdx, targetInputSize, v.verifiedInputSize))
-		}
-
-		// 3. Ingest input leaves strictly up to targetInputSize (R1: zero calls to InputLog checkpoint)
-		allModifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
-		if targetInputSize > v.verifiedInputSize {
-			if sizer, ok := v.inputFetcher.(interface{ SetTreeSize(uint64) }); ok {
-				sizer.SetTreeSize(targetInputSize)
-			}
-
-			batchChan, errChan := v.pipeline.StreamBatches(ctx, v.verifiedInputSize, targetInputSize)
-
-			var pendingBatch *ingest.MappedBatch
-			flush := func() error {
-				if pendingBatch == nil || pendingBatch.EndLeafIdx <= pendingBatch.StartLeafIdx {
-					return nil
-				}
-				res, err := v.indexer.IndexMappedBatch(ctx, pendingBatch, rawInCP, targetInputSize)
-				if err != nil {
-					return fmt.Errorf("indexing error [%d, %d): %w", pendingBatch.StartLeafIdx, pendingBatch.EndLeafIdx, err)
-				}
-				for k, subRoot := range res.ModifiedSubRoots {
-					allModifiedSubRoots[k] = subRoot
-				}
-				pendingBatch = nil
-				return nil
-			}
-
-			for batch := range batchChan {
-				if batch.EndLeafIdx == 0 && batch.Count > 0 {
-					batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
-				}
-				if pendingBatch == nil {
-					pendingBatch = &ingest.MappedBatch{
-						BundleIdx:    batch.BundleIdx,
-						StartLeafIdx: batch.StartLeafIdx,
-						EndLeafIdx:   batch.EndLeafIdx,
-						Count:        batch.Count,
-						KeyMap:       make(map[[32]byte][]uint64),
-					}
-					for k, indices := range batch.KeyMap {
-						pendingBatch.KeyMap[k] = append([]uint64(nil), indices...)
-					}
-				} else {
-					pendingBatch.Merge(batch)
-				}
-				if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= v.commitBatchSize {
-					if err := flush(); err != nil {
-						return err
-					}
-				}
-			}
-			if err := <-errChan; err != nil {
-				return fmt.Errorf("input streaming failed for leaf %d [%d, %d): %w", leafIdx, v.verifiedInputSize, targetInputSize, err)
-			}
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-
-		// 4. Predict local MPT root without mutating tree state
-		var localMapRoot [sha256.Size]byte
-		if targetInputSize > v.verifiedInputSize {
-			predRoot, err := v.mptMgr.Predict(allModifiedSubRoots)
-			if err != nil {
-				return fmt.Errorf("MPT predict failed at leaf %d: %w", leafIdx, err)
-			}
-			localMapRoot = predRoot
-		} else {
-			localMapRoot = v.mptMgr.Root()
-		}
-
-		// 5. Cryptographic Root Hash Assertion (R2)
-		if localMapRoot != committedMapRoot {
-			return v.handleRootMismatch(leafIdx, targetInputSize, localMapRoot, committedMapRoot)
-		}
-
-		// 6. Match Path: commit MPT mutations now that root is cryptographically verified
-		if targetInputSize > v.verifiedInputSize {
-			if _, err := v.mptMgr.CommitWithVersion(allModifiedSubRoots, int64(targetInputSize)); err != nil {
-				return fmt.Errorf("MPT commit failed at leaf %d: %w", leafIdx, err)
-			}
-		}
-
-		// 6. Match Path: advance watermarks, persist state, update metrics
-		v.stateMu.Lock()
-		v.verifiedInputSize = targetInputSize
-		v.verifiedOutputSize = leafIdx + 1
-		v.lastVerifiedRoot = localMapRoot
-		v.lastVerifiedAt = time.Now().UTC()
-		v.stateMu.Unlock()
-
-		// Persist watermarks to Pebble
-		wb := v.db.Pebble().NewBatch()
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], v.verifiedOutputSize)
-		_ = wb.Set(KeyVerifierOutputWatermark, buf[:], nil)
-		binary.BigEndian.PutUint64(buf[:], v.verifiedInputSize)
-		_ = wb.Set(KeyVerifierInputWatermark, buf[:], nil)
-		_ = wb.Set(KeyVerifierLastRoot, localMapRoot[:], nil)
-		if err := wb.Commit(pebble.Sync); err != nil {
-			return fmt.Errorf("failed to commit verifier watermarks to Pebble: %w", err)
-		}
-
-		// Persist MPT changes to disk
-		if err := v.mptMgr.Persist(); err != nil {
-			return fmt.Errorf("failed to persist MPT: %w", err)
-		}
-
-		// Metrics updates
-		metrics.ResetVerifierRootMismatch()
-		metrics.OutputTreeSize.Set(float64(v.verifiedOutputSize))
-		metrics.ServingTreeSize.Set(float64(v.verifiedInputSize))
-		metrics.KVCommittedSize.Set(float64(v.verifiedInputSize))
-		metrics.IndexingLag.Set(0)
-
-		// Mirror serving ratchet if enabled (R3)
-		if v.cfg.ServeMirror && v.publisher != nil {
-			v.publisher.SetServingState(&tree.ServingState{
-				OutputLogIndex: leafIdx,
-				OutputLogSize:  v.verifiedOutputSize,
-				OutputLogCP:    outCP,
-				RawCheckpoint:  rawOutCP,
-				OutputLogProof: proofHashes,
-				InputLogCP:     inCP,
-				RawInputLogCP:  rawInCP,
-				InputLogSize:   targetInputSize,
-				MapRoot:        localMapRoot,
-			})
+		if err := v.verifyLeaf(ctx, leafIdx, outCP, rawOutCP); err != nil {
+			return err
 		}
 	}
+
+	return nil
+}
+
+func (v *Verifier) verifyLeaf(ctx context.Context, leafIdx uint64, outCP *log.Checkpoint, rawOutCP []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// Fetch leaf data and inclusion proof
+	leafData, err := v.outputLog.GetLeaf(ctx, leafIdx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch output log leaf %d: %w", leafIdx, err)
+	}
+	proofHashes, err := v.outputLog.InclusionProof(ctx, leafIdx, outCP.Size)
+	if err != nil {
+		return fmt.Errorf("failed to fetch inclusion proof for output leaf %d: %w", leafIdx, err)
+	}
+
+	// Parse leaf payload
+	committedMapRoot, inCPHeader, rawInCP, err := tree.ParseOutputLogLeaf(leafData)
+	if err != nil {
+		return v.halt(fmt.Errorf("leaf %d format corrupted: %w", leafIdx, err))
+	}
+
+	// Verify RFC 6962 leaf inclusion proof against OutputLog tree root
+	canonicalLeaf := tree.FormatOutputLogLeaf(committedMapRoot, rawInCP)
+	leafHash := rfc6962.DefaultHasher.HashLeaf(canonicalLeaf)
+	proofBytes := make([][]byte, len(proofHashes))
+	for i := range proofHashes {
+		proofBytes[i] = proofHashes[i][:]
+	}
+	if err := proof.VerifyInclusion(rfc6962.DefaultHasher, leafIdx, outCP.Size, leafHash, proofBytes, outCP.Hash); err != nil {
+		return v.halt(fmt.Errorf("%w for leaf %d: %v", ErrInclusionFailed, leafIdx, err))
+	}
+
+	// Verify embedded InputLog Checkpoint signature with note.Verifier
+	var inCP *log.Checkpoint
+	if v.inputLogVerifier != nil {
+		origin := v.cfg.InputLogOrigin
+		if origin == "" {
+			origin = v.inputLogVerifier.Name()
+		}
+		parsed, _, _, err := log.ParseCheckpoint(rawInCP, origin, v.inputLogVerifier)
+		if err != nil {
+			return v.halt(fmt.Errorf("%w: embedded input log checkpoint signature invalid in leaf %d: %v", ErrCheckpointFailed, leafIdx, err))
+		}
+		inCP = parsed
+	} else {
+		inCP = inCPHeader
+	}
+
+	targetInputSize := inCP.Size
+	if targetInputSize < v.verifiedInputSize {
+		return v.halt(fmt.Errorf("%w: leaf %d target size %d < verified size %d", ErrMonotonicityBroken, leafIdx, targetInputSize, v.verifiedInputSize))
+	}
+
+	// 3. Stage input leaves strictly up to targetInputSize into an uncommitted indexed Pebble batch.
+	// Forensic State Freeze Invariant (2.7.2): zero unverified chunk or watermark writes touch v.db
+	// until localMapRoot == committedMapRoot is cryptographically confirmed.
+	stagedBatch := v.db.Pebble().NewIndexedBatch()
+	leafCommitted := false
+	defer func() {
+		_ = stagedBatch.Close()
+		if !leafCommitted {
+			v.indexer.ClearCache()
+		}
+	}()
+
+	allModifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+	if targetInputSize > v.verifiedInputSize {
+		if stater, ok := v.inputFetcher.(interface{ SetTreeState(uint64, [32]byte) }); ok && len(inCP.Hash) == sha256.Size {
+			stater.SetTreeState(targetInputSize, [32]byte(inCP.Hash))
+		} else if sizer, ok := v.inputFetcher.(interface{ SetTreeSize(uint64) }); ok {
+			sizer.SetTreeSize(targetInputSize)
+		}
+
+		batchChan, errChan := v.pipeline.StreamBatches(ctx, v.verifiedInputSize, targetInputSize)
+
+		stagedKVSize := v.verifiedInputSize
+		var pendingBatch *ingest.MappedBatch
+		flush := func() error {
+			if pendingBatch == nil || pendingBatch.EndLeafIdx <= pendingBatch.StartLeafIdx {
+				return nil
+			}
+			res, err := v.indexer.StageMappedBatch(ctx, stagedBatch, stagedKVSize, pendingBatch, targetInputSize)
+			if err != nil {
+				return fmt.Errorf("indexing error [%d, %d): %w", pendingBatch.StartLeafIdx, pendingBatch.EndLeafIdx, err)
+			}
+			stagedKVSize = res.NewKVSize
+			for k, subRoot := range res.ModifiedSubRoots {
+				allModifiedSubRoots[k] = subRoot
+			}
+			pendingBatch = nil
+			return nil
+		}
+
+		for batch := range batchChan {
+			if batch.EndLeafIdx == 0 && batch.Count > 0 {
+				batch.EndLeafIdx = batch.StartLeafIdx + uint64(batch.Count)
+			}
+			if pendingBatch == nil {
+				pendingBatch = &ingest.MappedBatch{
+					BundleIdx:    batch.BundleIdx,
+					StartLeafIdx: batch.StartLeafIdx,
+					EndLeafIdx:   batch.EndLeafIdx,
+					Count:        batch.Count,
+					KeyMap:       make(map[[32]byte][]uint64),
+				}
+				for k, indices := range batch.KeyMap {
+					pendingBatch.KeyMap[k] = append([]uint64(nil), indices...)
+				}
+			} else {
+				pendingBatch.Merge(batch)
+			}
+			if pendingBatch.EndLeafIdx-pendingBatch.StartLeafIdx >= v.commitBatchSize {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+		if err := <-errChan; err != nil {
+			return fmt.Errorf("input streaming failed for leaf %d [%d, %d): %w", leafIdx, v.verifiedInputSize, targetInputSize, err)
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+	}
+
+	// 4. Predict local MPT root without mutating tree state
+	var localMapRoot [sha256.Size]byte
+	if targetInputSize > v.verifiedInputSize {
+		predRoot, err := v.mptMgr.Predict(allModifiedSubRoots)
+		if err != nil {
+			return fmt.Errorf("MPT predict failed at leaf %d: %w", leafIdx, err)
+		}
+		localMapRoot = predRoot
+	} else {
+		localMapRoot = v.mptMgr.Root()
+	}
+
+	// 5. Cryptographic Root Hash Assertion (R2)
+	if localMapRoot != committedMapRoot {
+		return v.handleRootMismatch(leafIdx, targetInputSize, localMapRoot, committedMapRoot)
+	}
+
+	// 6. Match Path: commit staged chunks to Pebble now that root is verified
+	nextOutputSize := leafIdx + 1
+	var buf [8]byte
+	if targetInputSize > v.verifiedInputSize {
+		binary.BigEndian.PutUint64(buf[:], targetInputSize)
+		_ = stagedBatch.Set(kvstore.KeyMetaKVSize, buf[:], nil)
+		if len(rawInCP) > 0 {
+			_ = stagedBatch.Set(kvstore.KeyMetaKVCheckpoint, rawInCP, nil)
+		}
+		if err := v.db.Pebble().Apply(stagedBatch, pebble.Sync); err != nil {
+			return fmt.Errorf("failed to commit verified chunks to Pebble: %w", err)
+		}
+	}
+
+	// 7. Match Path: commit MPT mutations and advance mirror ServingState atomically under mptMgr.Lock()
+	// so concurrent mirror readers never pair a stale ServingState with a mutated MPT (2.7.1).
+	v.mptMgr.Lock()
+	if targetInputSize > v.verifiedInputSize {
+		if _, err := v.mptMgr.CommitWithVersionLocked(allModifiedSubRoots, int64(targetInputSize)); err != nil {
+			v.mptMgr.Unlock()
+			return fmt.Errorf("MPT commit failed at leaf %d: %w", leafIdx, err)
+		}
+	}
+	if v.cfg.ServeMirror && v.publisher != nil {
+		v.publisher.SetServingState(&tree.ServingState{
+			OutputLogIndex: leafIdx,
+			OutputLogSize:  nextOutputSize,
+			OutputLogCP:    outCP,
+			RawCheckpoint:  rawOutCP,
+			OutputLogProof: proofHashes,
+			InputLogCP:     inCP,
+			RawInputLogCP:  rawInCP,
+			InputLogSize:   targetInputSize,
+			MapRoot:        localMapRoot,
+		})
+	}
+	v.mptMgr.Unlock()
+
+	// 8. Persist MPT changes to disk outside treeMu so mirror lookups are never blocked by msync
+	if err := v.mptMgr.Persist(); err != nil {
+		return fmt.Errorf("failed to persist MPT: %w", err)
+	}
+
+	// 9. Persist verifier watermarks only after both Pebble chunks and MPT are durable on disk
+	wmBatch := v.db.NewBatch()
+	defer func() { _ = wmBatch.Close() }()
+	binary.BigEndian.PutUint64(buf[:], nextOutputSize)
+	_ = wmBatch.Set(KeyVerifierOutputWatermark, buf[:], nil)
+	binary.BigEndian.PutUint64(buf[:], targetInputSize)
+	_ = wmBatch.Set(KeyVerifierInputWatermark, buf[:], nil)
+	_ = wmBatch.Set(KeyVerifierLastRoot, localMapRoot[:], nil)
+	if err := v.db.Pebble().Apply(wmBatch, pebble.Sync); err != nil {
+		return fmt.Errorf("failed to commit verifier watermarks to Pebble: %w", err)
+	}
+	leafCommitted = true
+
+	v.stateMu.Lock()
+	v.verifiedInputSize = targetInputSize
+	v.verifiedOutputSize = nextOutputSize
+	v.lastVerifiedRoot = localMapRoot
+	v.lastVerifiedAt = time.Now().UTC()
+	v.stateMu.Unlock()
+
+	// Metrics updates
+	metrics.ResetVerifierRootMismatch()
+	metrics.OutputTreeSize.Set(float64(nextOutputSize))
+	metrics.ServingTreeSize.Set(float64(targetInputSize))
+	metrics.KVCommittedSize.Set(float64(targetInputSize))
+	metrics.IndexingLag.Set(0)
 
 	return nil
 }

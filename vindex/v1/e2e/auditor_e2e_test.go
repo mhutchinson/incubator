@@ -771,14 +771,14 @@ func TestE2E_VerifiedMirrorServing(t *testing.T) {
 			t.Errorf("fail-closed lookup status = %d, want 503", resp.StatusCode)
 		}
 
-		// /healthz returns 503 in fail-closed mode
+		// /healthz remains 200 OK (liveness probe) in fail-closed mode while /readyz returns 503
 		respHealth, err := fcServer.Client().Get(fcServer.URL + "/healthz")
 		if err != nil {
 			t.Fatalf("GET /healthz failed: %v", err)
 		}
 		_ = respHealth.Body.Close()
-		if respHealth.StatusCode != http.StatusServiceUnavailable {
-			t.Errorf("fail-closed healthz = %d, want 503", respHealth.StatusCode)
+		if respHealth.StatusCode != http.StatusOK {
+			t.Errorf("fail-closed healthz = %d, want 200", respHealth.StatusCode)
 		}
 
 		// /readyz returns 503

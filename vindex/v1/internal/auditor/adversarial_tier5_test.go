@@ -234,8 +234,8 @@ func TestAdv_Tier5_ForgedOutputRoot_ContainmentAndMirrorRevocation(t *testing.T)
 	}
 
 	respHealth, _ := ts.Client().Get(ts.URL + "/healthz")
-	if respHealth.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("GET /healthz status = %d, want 503", respHealth.StatusCode)
+	if respHealth.StatusCode != http.StatusOK {
+		t.Errorf("GET /healthz status = %d, want 200 (liveness probe)", respHealth.StatusCode)
 	}
 	_ = respHealth.Body.Close()
 

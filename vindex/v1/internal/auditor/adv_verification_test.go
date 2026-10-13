@@ -268,19 +268,28 @@ func TestAdv_HealthCheckReadServerIntegration(t *testing.T) {
 	close(stopProbe)
 	wg.Wait()
 
-	// Step 5: Query /healthz AFTER mismatch — must return HTTP 503 Service Unavailable
-	resp3, err := http.Get(ts.URL + "/healthz")
+	// Step 5: Query /healthz and /readyz AFTER mismatch — /healthz stays 200 OK (liveness) while /readyz returns 503
+	respLiveness, err := http.Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz after mismatch failed: %v", err)
+	}
+	defer func() { _ = respLiveness.Body.Close() }()
+	if respLiveness.StatusCode != http.StatusOK {
+		t.Fatalf("after mismatch: /healthz status = %d, want 200 OK", respLiveness.StatusCode)
+	}
+
+	resp3, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatalf("GET /readyz after mismatch failed: %v", err)
 	}
 	defer func() { _ = resp3.Body.Close() }()
 	body3, _ := io.ReadAll(resp3.Body)
 
 	if resp3.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("after mismatch: /healthz status = %d, want 503 Service Unavailable", resp3.StatusCode)
+		t.Fatalf("after mismatch: /readyz status = %d, want 503 Service Unavailable", resp3.StatusCode)
 	}
-	if !strings.Contains(string(body3), "unhealthy: verifier root hash mismatch") {
-		t.Fatalf("after mismatch: /healthz body = %q, want error containing 'unhealthy: verifier root hash mismatch'", string(body3))
+	if !strings.Contains(string(body3), "verifier root hash mismatch") {
+		t.Fatalf("after mismatch: /readyz body = %q, want error containing 'verifier root hash mismatch'", string(body3))
 	}
 
 	// Direct HealthCheck() call must also return ErrRootMismatch

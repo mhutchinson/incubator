@@ -6,7 +6,7 @@ This backlog consolidates open architectural refinements, documentation alignmen
 
 | Milestone | Status | Scope & Backlog Items | Spec / Workboard |
 | :--- | :--- | :--- | :--- |
-| **M1: Core Storage, Recovery & Pipeline Hardening** | 🏃 Active | Orthogonal engine & storage fixes: `kvstore` (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`), `ingest` & WASM slab safety (`2.1.1`–`2.1.5`, `2.2.1`, `2.2.2`, `2.2.4`), `tree`/`coordinator` recovery & durability (`1.1.4`, `2.4.1`, `2.4.2`, `2.5.1`–`2.5.4`, `2.6.5`), and `auditor` (`2.7.1`–`2.7.4`). | [`docs/milestones/milestone-01-engine-hardening.md`](docs/milestones/milestone-01-engine-hardening.md) |
+| **M1: Core Storage, Recovery & Pipeline Hardening** | ✅ Complete | Orthogonal engine & storage fixes: `kvstore` (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`), `ingest` & WASM slab safety (`2.1.1`–`2.1.5`, `2.2.1`, `2.2.2`, `2.2.4`), `tree`/`coordinator` recovery & durability (`1.1.4`, `2.4.1`, `2.4.2`, `2.5.1`–`2.5.4`, `2.6.5`), and `auditor` (`2.7.1`–`2.7.4`). | [`docs/milestones/milestone-01-engine-hardening.md`](docs/milestones/milestone-01-engine-hardening.md) |
 | **M2: True Prefix Lookups & Two-Endpoint Read Protocol** | 📋 Planned | Variable-length `[]byte` MPT keys (`filippo.io/torchwood/mpt`), `/vindex/v1/keys/{key...}` + `/vindex/v1/entries/{key...}` split, server-side eTLD+1 & `maxPrefixKeys` guardrails, reversed-label trailing-dot CT/MTC mappers, and client verification (`1.1.0`, `1.1.1`, `2.2.3`, `2.6.1`–`2.6.3`). | [`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md) |
 | **M3: Package Decoupling & C2SP `tlog-vindex` Spec Alignment** | 📋 Planned | Split `internal/mpt` vs `internal/publish` (`1.2.1`, `2.6.4`), extract `mapfn/host` (`1.2.2`) and shared `wire/` (`1.2.3`), isolate `internal/mtc` (`1.2.4`), and align all Type A/B docs (`1.3.1`–`1.3.7`). | TBD (`milestone-03`) |
 
@@ -274,22 +274,22 @@ It is organized into three categories:
 
 ### 2.7 Independent Auditor & Verified Mirror (`internal/auditor/`)
 
-- [ ] **2.7.1 Reader Snapshot Isolation Race in Verified Mirror Mode (`--serve_mirror=true`)**
+- [x] **2.7.1 Reader Snapshot Isolation Race in Verified Mirror Mode (`--serve_mirror=true`)**
   - **Location**: [`internal/auditor/auditor.go:758-808`](internal/auditor/auditor.go#L758-L808) (`Auditor.VerifyOnce`), [`internal/server/server.go:344-352`](internal/server/server.go#L344-L352) (`ReadServer.HandleLookup`)
   - **Bug**: In `VerifyOnce`, `v.mptMgr.CommitWithVersion` mutates the in-memory MPT and releases `treeMu` at `auditor.go:758`, then performs synchronous Pebble watermark writes (`pebble.Sync` at `auditor.go:779`) and MPT disk `Persist()` (`fsync` at `auditor.go:784`), and only calls `v.publisher.SetServingState` at `auditor.go:797`. During that entire disk-sync window, concurrent `HandleLookup` requests on the mirror read the **old** `ServingState` (`MapRoot`, `InputLogSize`) while `s.mptMgr.ProveLocked` generates proofs from the **new** MPT state, returning corrupted responses that fail client verification.
   - **Fix**: Hold `v.mptMgr.Lock()` across `CommitKeyValsLocked` and `v.publisher.SetServingState(newState)` (matching `OutputPublisher.PublishBatch` in [`internal/tree/publisher.go:140-168`](internal/tree/publisher.go#L140-L168)), and run `v.mptMgr.Persist()` under `writeMu` outside `treeMu`.
 
-- [ ] **2.7.2 Premature Pebble Mutation Before Root Equality Assertion on Mismatch**
+- [x] **2.7.2 Premature Pebble Mutation Before Root Equality Assertion on Mismatch**
   - **Location**: [`internal/auditor/auditor.go:696-781`](internal/auditor/auditor.go#L696-L781) (`Auditor.VerifyOnce`)
   - **Bug**: `v.indexer.IndexMappedBatch` writes the new `'c'` chunks and updates `m_kv_size = targetInputSize` in Pebble at `auditor.go:696` **before** `v.mptMgr.Predict` (`auditor.go:742`) and the root equality assertion `localMapRoot != committedMapRoot` (`auditor.go:752`). When a root mismatch is detected, Pebble DB has already been mutated with the unverified batch's chunks and `m_kv_size`, violating the forensic state freeze invariant.
   - **Fix**: Keep `m_kv_size` aligned with `KeyVerifierInputWatermark`, or stage/verify predicted sub-roots before committing the watermark advancement in Pebble so a root mismatch leaves the verified database state intact.
 
-- [ ] **2.7.3 `--fail_closed=true` Fails `/healthz` Liveness Probe with HTTP 503**
+- [x] **2.7.3 `--fail_closed=true` Fails `/healthz` Liveness Probe with HTTP 503**
   - **Location**: [`internal/auditor/auditor.go:468-473`](internal/auditor/auditor.go#L468-L473) (`auditor.New`)
   - **Bug**: When `FailClosed` is true, `auditor.New` registers `v.HealthCheck()` on `SetHealthChecker`, causing `GET /healthz` to return `HTTP 503 Service Unavailable` when halted. This causes container orchestrators (e.g. Kubernetes liveness probes) to kill and restart the halted forensic container, whereas `/healthz` should remain `HTTP 200 OK` and only `/readyz`, `/syncz`, and `/lookup` (via `SetServingState(nil)`) should return `503`.
   - **Fix**: Do not wire `v.HealthCheck()` to `SetHealthChecker` on `/healthz`; rely on `SetReadyChecker` (`/readyz`, `/syncz`) and `SetServingState(nil)` (`/lookup`).
 
-- [ ] **2.7.4 Missing `ManagedTileCache` & Miswired `CommitBatchSize` in Auditor**
+- [x] **2.7.4 Missing `ManagedTileCache` & Miswired `CommitBatchSize` in Auditor**
   - **Location**: [`internal/auditor/auditor.go:457`](internal/auditor/auditor.go#L457), [`cmd/vindexd/main.go:473`](cmd/vindexd/main.go#L473), [`cmd/vindex-auditor/main.go:117`](cmd/vindex-auditor/main.go#L117)
   - **Bug**: `auditor.New` passes `nil` for the tile cache to `ingest.NewPipeline`, and both `cmd/vindexd` and `cmd/vindex-auditor` wire `CommitBatchSize: *chunkSize` (passing the 65,536 KV chunk size as the commit batch size instead of 4,096) without calling `db.SetChunkSize(*chunkSize)`.
   - **Fix**: Wire `ManagedTileCache` in `auditor.New`, separate `--commit_batch_size` (4,096) from `--chunk_size` (65,536), and call `db.SetChunkSize` on the auditor DB.

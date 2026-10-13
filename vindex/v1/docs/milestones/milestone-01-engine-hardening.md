@@ -1,6 +1,6 @@
 # Milestone 01: Core Storage, Recovery & Pipeline Hardening
 
-**Status**: 🏃 **Mid-Sprint (Active)**  
+**Status**: ✅ **Complete**  
 **Target Completion**: 2026-W42  
 **Epic**: Resolve all storage, ingestion, crash-recovery, and auditor correctness and performance bugs in [`BACKLOG.md`](../../BACKLOG.md) that are orthogonal to the [`PREFIX_LOOKUPS.md`](../PREFIX_LOOKUPS.md) key-format and two-endpoint overhaul, establishing a rock-solid, benchmark-verified engine baseline before Milestone 02.
 
@@ -37,18 +37,21 @@
 - [x] **01.3.4 Async Daemon Startup, Readiness JSON & Top-Level Wiring (`1.1.4`, `2.6.5`, `2.4.2`, `2.5.4`)**: Bind `:8080` immediately in `cmd/vindexd/main.go` before `tree.Open()` and `coord.Recover(ctx)`, serve structured status JSON on `/readyz` and `/syncz` during MPT initialization and Genesis Backfill, wire witness clients in `vindex.New` and `cmd/vindexd`, and eliminate the duplicate pipeline / ephemeral `memoryOutputLog` fallback in [`vindex.go`](../../vindex.go).
 
 ### Phase 01.4: Auditor & Verified Mirror Correctness (`internal/auditor/`, `cmd/vindex-auditor/`)
-- [ ] **01.4.1 Mirror Reader Snapshot Isolation (`2.7.1`)**: In [`internal/auditor/auditor.go`](../../internal/auditor/auditor.go) (`VerifyOnce`), hold `v.mptMgr.Lock()` across `CommitKeyValsLocked` and `v.publisher.SetServingState(newState)`, running `v.mptMgr.Persist()` outside `treeMu` so `--serve_mirror=true` readers never pair a stale `ServingState` with a mutated MPT.
-- [ ] **01.4.2 Forensic State Freeze on Root Mismatch (`2.7.2`)**: In [`internal/auditor/auditor.go`](../../internal/auditor/auditor.go), verify `localMapRoot == committedMapRoot` before advancing the verified Pebble watermark so a root mismatch leaves the verified database state untouched on disk.
-- [ ] **01.4.3 Liveness Probe & Cache/Batch Wiring (`2.7.3`, `2.7.4`)**: Keep `/healthz` returning `HTTP 200 OK` when halted under `--fail_closed=true` (returning `503` on `/readyz`, `/syncz`, and lookups), wire `ManagedTileCache` in `auditor.New`, and separate `--commit_batch_size` (`4096`) from `--chunk_size` (`65536`) in `cmd/vindexd` and `cmd/vindex-auditor`.
+- [x] **01.4.1 Mirror Reader Snapshot Isolation (`2.7.1`)**: In [`internal/auditor/auditor.go`](../../internal/auditor/auditor.go) (`VerifyOnce`), hold `v.mptMgr.Lock()` across `CommitKeyValsLocked` and `v.publisher.SetServingState(newState)`, running `v.mptMgr.Persist()` outside `treeMu` so `--serve_mirror=true` readers never pair a stale `ServingState` with a mutated MPT.
+- [x] **01.4.2 Forensic State Freeze on Root Mismatch (`2.7.2`)**: In [`internal/auditor/auditor.go`](../../internal/auditor/auditor.go), verify `localMapRoot == committedMapRoot` before advancing the verified Pebble watermark so a root mismatch leaves the verified database state untouched on disk.
+- [x] **01.4.3 Liveness Probe & Cache/Batch Wiring (`2.7.3`, `2.7.4`)**: Keep `/healthz` returning `HTTP 200 OK` when halted under `--fail_closed=true` (returning `503` on `/readyz`, `/syncz`, and lookups), wire `ManagedTileCache` in `auditor.New`, and separate `--commit_batch_size` (`4096`) from `--chunk_size` (`65536`) in `cmd/vindexd` and `cmd/vindex-auditor`.
 
 ### Phase 01.5: Verification Gate
-- [ ] **01.5.1 Automated Test Suite**: `go test -race ./...` passes cleanly across `vindex/v1/...`.
-- [ ] **01.5.2 Benchmark Suite Verification**: `go test -bench=. -benchmem ./internal/kvstore/...` passes with all before/after metrics recorded in commit messages.
+- [x] **01.5.1 Automated Test Suite**: `go test -race ./...` passes cleanly across `vindex/v1/...`.
+- [x] **01.5.2 Benchmark Suite Verification**: `go test -bench=. -benchmem ./internal/kvstore/...` passes with all before/after metrics recorded in commit messages.
 
 ---
 
 ## 3. Retrospective & Deliverables
-*(Populated upon milestone completion)*
-* **Shipped Commit**: TBD
-* **Completed Date**: TBD
-* **Key Wins & Deviations**: TBD
+* **Shipped Commits**:
+  * Phase 01.1: `d29db481` (`perf(vindex/v1/kvstore): chunk-aligned paging, O(1) GetSubRoot, SeekPrefixGE, and no phantom chunk 0 (M1 Phase 01.1)`)
+  * Phase 01.2: `bb29c5e3` (`fix(vindex/v1/ingest): verify tiles against checkpoint root, enforce verifier, durable tile cache, and WASM slab/trap halt (M1 Phase 01.2)`)
+  * Phase 01.3: `dc05668a` (`fix(vindex/v1/coordinator): durable MPT watermark, remove duplicate Phase3, sync backfill barrier, and async startup (M1 Phase 01.3)`)
+  * Phase 01.4 & 01.5: Auditor mirror snapshot isolation, forensic state freeze, `/healthz` liveness decoupling, and full verification gate.
+* **Completed Date**: 2026-10-13
+* **Key Wins & Deviations**: All 22 orthogonal storage, ingestion, WASM sandbox, crash-recovery, and auditor backlog items (`1.1.2`–`1.1.4`, `2.1.1`–`2.1.5`, `2.2.1`–`2.2.2`, `2.2.4`, `2.3.1`–`2.3.3`, `2.4.1`–`2.4.2`, `2.5.1`–`2.5.4`, `2.6.5`, `2.7.1`–`2.7.4`) resolved and verified.

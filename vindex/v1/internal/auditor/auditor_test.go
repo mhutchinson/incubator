@@ -142,6 +142,7 @@ type memoryInputLog struct {
 	signer              note.Signer
 	checkpointCallCount int
 	treeSize            uint64
+	treeHash            [32]byte
 	bundleSize          uint64
 }
 
@@ -149,6 +150,13 @@ func (l *memoryInputLog) SetTreeSize(size uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.treeSize = size
+}
+
+func (l *memoryInputLog) SetTreeState(size uint64, hash [32]byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.treeSize = size
+	l.treeHash = hash
 }
 
 func (l *memoryInputLog) AppendLeaf(leaf []byte) {
@@ -668,12 +676,20 @@ func TestVerifier_SourcingInvariant_NoInputLogCheckpointCalls(t *testing.T) {
 		t.Fatalf("VerifyOnce failed: %v", err)
 	}
 
-	// Assert zero calls to InputLog checkpoint endpoint
+	// Assert zero calls to InputLog checkpoint endpoint, and SetTreeState propagated the verified root hash
 	h.inLog.mu.Lock()
 	cpCalls := h.inLog.checkpointCallCount
+	gotTreeSize := h.inLog.treeSize
+	gotTreeHash := h.inLog.treeHash
 	h.inLog.mu.Unlock()
 	if cpCalls != 0 {
 		t.Fatalf("INVARIANT VIOLATION (R1): InputLog.Checkpoint was called %d times during sync (want 0)", cpCalls)
+	}
+	if gotTreeSize != 20 {
+		t.Fatalf("expected SetTreeState treeSize = 20, got %d", gotTreeSize)
+	}
+	if gotTreeHash == ([32]byte{}) {
+		t.Fatal("expected SetTreeState to propagate non-zero verified input log root hash")
 	}
 
 	// Assert that calling Checkpoint directly on the wrapped fetcher panics as guarded
@@ -777,21 +793,28 @@ func TestVerifier_HTTPHealthzHook(t *testing.T) {
 		t.Fatalf("expected ErrRootMismatch, got %v", err)
 	}
 
-	// 3. Verify /healthz degrades to 503 Service Unavailable
-	reqUnhealthy := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	// 3. Verify /healthz stays 200 OK (liveness probe) while /readyz degrades to 503 Service Unavailable
+	reqLiveness := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recLiveness := httptest.NewRecorder()
+	readServer.HandleHealthz(recLiveness, reqLiveness)
+	if recLiveness.Code != http.StatusOK {
+		t.Fatalf("after mismatch: /healthz (liveness) returned status %d, want 200 OK", recLiveness.Code)
+	}
+
+	reqUnhealthy := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	recUnhealthy := httptest.NewRecorder()
-	readServer.HandleHealthz(recUnhealthy, reqUnhealthy)
+	readServer.HandleReadyz(recUnhealthy, reqUnhealthy)
 	if recUnhealthy.Code != http.StatusServiceUnavailable {
-		t.Fatalf("after mismatch: /healthz returned status %d, want 503 Service Unavailable", recUnhealthy.Code)
+		t.Fatalf("after mismatch: /readyz returned status %d, want 503 Service Unavailable", recUnhealthy.Code)
 	}
 	body := recUnhealthy.Body.String()
 	if recUnhealthy.Body.Len() == 0 {
-		t.Fatal("expected non-empty error body from /healthz")
+		t.Fatal("expected non-empty error body from /readyz")
 	}
 	if !errors.Is(v.HealthCheck(), auditor.ErrRootMismatch) {
 		t.Errorf("HealthCheck() = %v, want ErrRootMismatch", v.HealthCheck())
 	}
-	t.Logf("Degraded /healthz response: %s", body)
+	t.Logf("Degraded /readyz response: %s", body)
 }
 
 // TestVerifier_PrometheusMetrics verifies that Prometheus metrics vindex_verifier_root_mismatch
@@ -1121,4 +1144,101 @@ func TestVerifier_Run_HaltOnInvariantError(t *testing.T) {
 		t.Fatal("Run() failed to return within deadline after cancel")
 	}
 }
+
+// TestVerifier_ForensicStateFreezeOnRootMismatch verifies that when a root mismatch is detected
+// on a new OutputLog leaf, zero unverified chunk records or KeyMetaKVSize watermarks are written
+// to the underlying Pebble database (Phase 01.4.2 / Backlog 2.7.2).
+func TestVerifier_ForensicStateFreezeOnRootMismatch(t *testing.T) {
+	ctx := context.Background()
+	h := newTestHarness(t)
+
+	for i := 0; i < 10; i++ {
+		h.inLog.AppendLeaf([]byte(fmt.Sprintf("forensic-leaf-%d", i)))
+	}
+	leaves5 := make([][]byte, 5)
+	for i := 0; i < 5; i++ {
+		leaves5[i] = []byte(fmt.Sprintf("forensic-leaf-%d", i))
+	}
+	root5 := computeExpectedMapRoot(t, leaves5, h.mapper)
+	signedInCP5, err := h.inLog.SignCheckpoint(5)
+	if err != nil {
+		t.Fatalf("SignCheckpoint(5) failed: %v", err)
+	}
+	if _, _, err := h.outLog.Append(ctx, tree.FormatOutputLogLeaf(root5, signedInCP5)); err != nil {
+		t.Fatalf("Append leaf 0 failed: %v", err)
+	}
+
+	db, err := kvstore.Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("kvstore.Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	tileCacheDir := t.TempDir()
+	cfg := auditor.Config{
+		InputLogVerifier:  h.inVerifier,
+		OutputLogVerifier: h.outVerifier,
+		OutputLogOrigin:   "example.com/test/outputlog",
+		InputLogOrigin:    "example.com/test/inputlog",
+		OutputLog:         h.outLog,
+		InputLogFetcher:   h.inLog,
+		MapFn:             h.mapper,
+		DB:                db,
+		MPTDir:            ":memory:",
+		TileCacheDir:      tileCacheDir,
+		ChunkSize:         1024,
+		CommitBatchSize:   2,
+	}
+	v, err := auditor.New(cfg)
+	if err != nil {
+		t.Fatalf("auditor.New failed: %v", err)
+	}
+	defer func() { _ = v.Close() }()
+
+	if db.ChunkSize() != 1024 {
+		t.Fatalf("db.ChunkSize() = %d, want 1024", db.ChunkSize())
+	}
+
+	// Verify honest leaf 0 (size 5)
+	if err := v.VerifyOnce(ctx); err != nil {
+		t.Fatalf("VerifyOnce leaf 0 failed: %v", err)
+	}
+	kvSizeAfterHonest, err := db.GetUint64(kvstore.KeyMetaKVSize)
+	if err != nil || kvSizeAfterHonest != 5 {
+		t.Fatalf("KeyMetaKVSize after honest leaf 0 = %d (err=%v), want 5", kvSizeAfterHonest, err)
+	}
+
+	// Append tampered leaf 1 claiming input size 10 with a forged root
+	forgedRoot := sha256.Sum256([]byte("forged-root-at-size-10"))
+	signedInCP10, err := h.inLog.SignCheckpoint(10)
+	if err != nil {
+		t.Fatalf("SignCheckpoint(10) failed: %v", err)
+	}
+	if _, _, err := h.outLog.Append(ctx, tree.FormatOutputLogLeaf(forgedRoot, signedInCP10)); err != nil {
+		t.Fatalf("Append leaf 1 failed: %v", err)
+	}
+
+	// VerifyOnce must fail with ErrRootMismatch
+	err = v.VerifyOnce(ctx)
+	if err == nil || !errors.Is(err, auditor.ErrRootMismatch) {
+		t.Fatalf("expected ErrRootMismatch, got %v", err)
+	}
+
+	// Forensic state freeze assertion: KeyMetaKVSize MUST still be 5, and unverified keys [5..10) MUST NOT exist in Pebble
+	kvSizeAfterMismatch, err := db.GetUint64(kvstore.KeyMetaKVSize)
+	if err != nil || kvSizeAfterMismatch != 5 {
+		t.Fatalf("forensic state freeze violated: KeyMetaKVSize mutated to %d (err=%v), want 5", kvSizeAfterMismatch, err)
+	}
+	for i := 5; i < 10; i++ {
+		kh := sha256.Sum256([]byte(fmt.Sprintf("forensic-leaf-%d", i)))
+		_, rec, exists, err := db.ActiveChunk(kh)
+		if err != nil {
+			t.Fatalf("ActiveChunk(%d) failed: %v", i, err)
+		}
+		if exists || rec != nil {
+			t.Fatalf("forensic state freeze violated: unverified leaf %d chunk persisted in Pebble: %+v", i, rec)
+		}
+	}
+}
+
 
