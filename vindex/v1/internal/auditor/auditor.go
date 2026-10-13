@@ -153,6 +153,8 @@ type Config struct {
 	ListenAddr      string
 	MetricsAddr     string
 	PathPrefix      string
+	PrefixPolicy    server.PrefixPolicy
+	MaxPrefixKeys   int
 	PollInterval    time.Duration
 	ChunkSize       uint64
 	CommitBatchSize uint64
@@ -492,6 +494,12 @@ func New(cfg Config) (*Verifier, error) {
 		v.publisher = tree.NewOutputPublisher(v.db, v.mptMgr, nil, nil)
 		v.readServer = server.NewReadServer(v.db, v.mptMgr, v.publisher, v.db.ChunkSize())
 		v.readServer.SetPathPrefix(cfg.PathPrefix)
+		if cfg.PrefixPolicy != nil {
+			v.readServer.SetPrefixPolicy(cfg.PrefixPolicy)
+		}
+		if cfg.MaxPrefixKeys > 0 {
+			v.readServer.SetMaxPrefixKeys(cfg.MaxPrefixKeys)
+		}
 		v.readServer.SetReadyChecker(v.HealthCheck)
 	}
 

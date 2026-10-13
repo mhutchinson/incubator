@@ -613,3 +613,350 @@ func TestReadServer_RegisterRoutesWithOutputLog(t *testing.T) {
 		t.Fatalf("unexpected body: %q", rec.Body.String())
 	}
 }
+
+func TestReadServer_HandleKeys_PointAndPrefix(t *testing.T) {
+	const chunkSize = 100
+	srv, db, _, pub := setupTestServer(t, chunkSize)
+	db.SetChunkSize(chunkSize)
+	srv.SetPrefixPolicy(DomainETLDP1PrefixPolicy)
+	indexer := kvstore.NewKVIndexer(db, chunkSize)
+
+	domainKeys := []string{
+		"com.google.",
+		"com.google.*.",
+		"com.google.docs.",
+		"com.google.mail.",
+		"com.googleapis.",
+	}
+	keyMap := make(map[[32]byte][]uint64, len(domainKeys))
+	canonMap := make(map[[32]byte]string, len(domainKeys))
+	for i, dk := range domainKeys {
+		kh := sha256.Sum256([]byte(dk))
+		keyMap[kh] = []uint64{uint64(i * 10), uint64(i*10 + 5)}
+		canonMap[kh] = dk
+	}
+
+	batch := &ingest.MappedBatch{
+		KeyMap:        keyMap,
+		CanonicalKeys: canonMap,
+	}
+	res, err := indexer.IndexMappedBatch(context.Background(), batch, nil, 500)
+	if err != nil {
+		t.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	rawInCP := []byte("example.com/input\n500\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	inCP := &log.Checkpoint{Origin: "example.com/input", Size: 500, Hash: make([]byte, 32)}
+	if _, err := pub.PublishKeyBatch(context.Background(), res.ModifiedKeySubRoots, inCP, rawInCP); err != nil {
+		t.Fatalf("PublishKeyBatch failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// 1. Point lookup inclusion
+	t.Run("point_inclusion", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.mail.", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "— mpt-proof-v1 inclusion —") {
+			t.Fatalf("missing inclusion proof header: %s", body)
+		}
+		sr := res.ModifiedKeySubRoots["com.google.mail."]
+		wantSubRoot := hex.EncodeToString(sr[:])
+		if !strings.Contains(body, "— keys-v1 —\ncom.google.mail. "+wantSubRoot+"\n") {
+			t.Fatalf("keys-v1 section mismatch, got:\n%s", body)
+		}
+	})
+
+	// 2. Point lookup non-inclusion
+	t.Run("point_non_inclusion", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.absent.", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "— mpt-proof-v1 non-inclusion —") {
+			t.Fatalf("missing non-inclusion proof header: %s", body)
+		}
+		if !strings.HasSuffix(body, "— keys-v1 —\n") {
+			t.Fatalf("expected empty keys-v1 section, got:\n%s", body)
+		}
+	})
+
+	// 3. Prefix discovery matching 4 keys in ascending order
+	t.Run("prefix_discovery_matches", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.?prefix=true", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "— mpt-proof-v1 prefix —") {
+			t.Fatalf("missing prefix proof header: %s", body)
+		}
+		for _, wantKey := range []string{"com.google.", "com.google.*.", "com.google.docs.", "com.google.mail."} {
+			if !strings.Contains(body, "\n"+wantKey+" ") {
+				t.Errorf("missing expected key %q in prefix response:\n%s", wantKey, body)
+			}
+		}
+		if strings.Contains(body, "com.googleapis.") {
+			t.Errorf("unexpected sibling key com.googleapis. in prefix response:\n%s", body)
+		}
+	})
+
+	// 4. Empty prefix discovery
+	t.Run("prefix_discovery_empty", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.nonexistent.?prefix=true", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, "— mpt-proof-v1 prefix —") {
+			t.Fatalf("missing prefix proof header: %s", body)
+		}
+		if !strings.HasSuffix(body, "— keys-v1 —\n") {
+			t.Fatalf("expected empty keys-v1 section, got:\n%s", body)
+		}
+	})
+
+	// 5. Prefix policy rejections (bare TLDs, public suffixes, missing trailing dot)
+	t.Run("prefix_policy_rejections", func(t *testing.T) {
+		for _, badPrefix := range []string{
+			"com.",
+			"uk.co.",
+			"io.github.",
+			"com.*.",
+			"com.g*o.",
+			"com.*google.",
+			"com.Google.",
+			"com.foo$bar.",
+			"com.google", // missing trailing dot
+		} {
+			req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/"+badPrefix+"?prefix=true", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("GET /vindex/v1/keys/%s?prefix=true status = %d, want 400", badPrefix, w.Code)
+			}
+		}
+		// Valid eTLD+1 prefixes under multi-label public suffixes must pass policy
+		for _, goodPrefix := range []string{
+			"uk.co.bbc.news.",
+			"io.github.myorg.",
+			"com.google.*.",
+		} {
+			req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/"+goodPrefix+"?prefix=true", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Errorf("GET /vindex/v1/keys/%s?prefix=true status = %d, want 200: %s", goodPrefix, w.Code, w.Body.String())
+			}
+		}
+	})
+
+	// 6. Prefix cardinality limit (HTTP 413 Content Too Large)
+	t.Run("prefix_cardinality_cap_413", func(t *testing.T) {
+		srv.SetMaxPrefixKeys(3)
+		defer srv.SetMaxPrefixKeys(DefaultMaxPrefixKeys)
+
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.?prefix=true", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, want 413 Content Too Large", w.Code)
+		}
+	})
+}
+
+func TestReadServer_HandleEntries_LockFreeAndPagination(t *testing.T) {
+	const chunkSize = 100
+	srv, db, mptMgr, pub := setupTestServer(t, chunkSize)
+	db.SetChunkSize(chunkSize)
+	indexer := kvstore.NewKVIndexer(db, chunkSize)
+
+	// Use a key containing slashes (like a Go module path) to verify path extraction
+	keyStr := "github.com/google/uuid"
+	keyHash := sha256.Sum256([]byte(keyStr))
+	var indices []uint64
+	for i := uint64(0); i < 150; i++ {
+		indices = append(indices, i*2)
+	}
+
+	batch := &ingest.MappedBatch{
+		KeyMap:        map[[32]byte][]uint64{keyHash: indices},
+		CanonicalKeys: map[[32]byte]string{keyHash: keyStr},
+	}
+	res, err := indexer.IndexMappedBatch(context.Background(), batch, nil, 500)
+	if err != nil {
+		t.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	rawInCP := []byte("example.com/input\n500\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	inCP := &log.Checkpoint{Origin: "example.com/input", Size: 500, Hash: make([]byte, 32)}
+	if _, err := pub.PublishKeyBatch(context.Background(), res.ModifiedKeySubRoots, inCP, rawInCP); err != nil {
+		t.Fatalf("PublishKeyBatch failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// 1. Missing mandatory 'before' parameter -> HTTP 400
+	reqNoBefore := httptest.NewRequest(http.MethodGet, "/vindex/v1/entries/"+keyStr, nil)
+	wNoBefore := httptest.NewRecorder()
+	mux.ServeHTTP(wNoBefore, reqNoBefore)
+	if wNoBefore.Code != http.StatusBadRequest {
+		t.Fatalf("missing before status = %d, want 400", wNoBefore.Code)
+	}
+
+	// 2. Hold exclusive write lock on mptMgr while calling HandleEntries to prove zero MPT lock acquisition!
+	mptMgr.Lock()
+	reqPage1 := httptest.NewRequest(http.MethodGet, "/vindex/v1/entries/"+keyStr+"?before=500&limit=50", nil)
+	wPage1 := httptest.NewRecorder()
+	mux.ServeHTTP(wPage1, reqPage1)
+	mptMgr.Unlock()
+
+	if wPage1.Code != http.StatusOK {
+		t.Fatalf("Page 1 status = %d, want 200: %s", wPage1.Code, wPage1.Body.String())
+	}
+	body1 := wPage1.Body.String()
+	if strings.Contains(body1, "vindex/v1") || strings.Contains(body1, "mpt-proof-v1") {
+		t.Fatalf("entries response must not contain checkpoint or MPT proof sections:\n%s", body1)
+	}
+	if !strings.Contains(body1, "— prefix-compact-range-v1 100 —") {
+		t.Fatalf("expected prefix-compact-range-v1 100, got:\n%s", body1)
+	}
+	if !strings.Contains(body1, "— indices-v1 200 —") {
+		t.Fatalf("expected indices-v1 200, got:\n%s", body1)
+	}
+
+	// 3. Page 2: before=200&limit=100 -> reaches start of mini-log (covered_size == 0, omits prefix-compact-range-v1)
+	reqPage2 := httptest.NewRequest(http.MethodGet, "/vindex/v1/entries/"+keyStr+"?before=200&limit=100", nil)
+	wPage2 := httptest.NewRecorder()
+	mux.ServeHTTP(wPage2, reqPage2)
+	if wPage2.Code != http.StatusOK {
+		t.Fatalf("Page 2 status = %d, want 200", wPage2.Code)
+	}
+	body2 := wPage2.Body.String()
+	if strings.Contains(body2, "prefix-compact-range-v1") {
+		t.Fatalf("expected prefix-compact-range-v1 to be omitted when covered_size == 0, got:\n%s", body2)
+	}
+	if !strings.HasPrefix(body2, "— indices-v1 —\n0\n") {
+		t.Fatalf("expected indices-v1 starting at 0 with no next_before, got:\n%s", body2)
+	}
+}
+
+func BenchmarkReadServer_TwoEndpointVsCombined(b *testing.B) {
+	dir := b.TempDir()
+	db, err := kvstore.Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("kvstore.Open failed: %v", err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+
+	const chunkSize = 1024
+	db.SetChunkSize(chunkSize)
+	mptMgr := tree.NewMem()
+	outLog := &mockOutputLog{origin: "example.com/output"}
+	pub := tree.NewOutputPublisher(db, mptMgr, outLog, nil)
+	srv := NewReadServer(db, mptMgr, pub, chunkSize)
+	indexer := kvstore.NewKVIndexer(db, chunkSize)
+
+	keyMap := make(map[[32]byte][]uint64, 500)
+	canonMap := make(map[[32]byte]string, 500)
+	for i := 0; i < 500; i++ {
+		var k string
+		if i < 25 {
+			k = fmt.Sprintf("com.google.sub%03d.", i)
+		} else {
+			k = fmt.Sprintf("org.other%03d.svc.", i)
+		}
+		kh := sha256.Sum256([]byte(k))
+		indices := make([]uint64, 64)
+		for j := range indices {
+			indices[j] = uint64(j*10 + (i % 7))
+		}
+		keyMap[kh] = indices
+		canonMap[kh] = k
+	}
+
+	batch := &ingest.MappedBatch{
+		KeyMap:        keyMap,
+		CanonicalKeys: canonMap,
+	}
+	res, err := indexer.IndexMappedBatch(context.Background(), batch, nil, 10000)
+	if err != nil {
+		b.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	rawInCP := []byte("example.com/input\n10000\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	inCP := &log.Checkpoint{Origin: "example.com/input", Size: 10000, Hash: make([]byte, 32)}
+	// Also populate legacy 32-byte key in MPT for BenchmarkReadServer_HandleLookup_Combined comparison
+	targetKey := "com.google.sub000."
+	targetHash := sha256.Sum256([]byte(targetKey))
+	if _, err := mptMgr.Commit(map[[32]byte][32]byte{targetHash: res.ModifiedSubRoots[targetHash]}); err != nil {
+		b.Fatalf("Commit failed: %v", err)
+	}
+	if _, err := pub.PublishKeyBatch(context.Background(), res.ModifiedKeySubRoots, inCP, rawInCP); err != nil {
+		b.Fatalf("PublishKeyBatch failed: %v", err)
+	}
+
+	targetHex := hex.EncodeToString(targetHash[:])
+
+	b.Run("Legacy_HandleLookup_Combined", func(b *testing.B) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/lookup/"+targetHex+"?limit=100", nil)
+		b.ReportAllocs()
+		for b.Loop() {
+			w := httptest.NewRecorder()
+			srv.HandleLookup(w, req)
+			if w.Code != http.StatusOK {
+				b.Fatalf("status = %d", w.Code)
+			}
+		}
+	})
+
+	b.Run("HandleKeys_Point", func(b *testing.B) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/"+targetKey, nil)
+		b.ReportAllocs()
+		for b.Loop() {
+			w := httptest.NewRecorder()
+			srv.HandleKeys(w, req)
+			if w.Code != http.StatusOK {
+				b.Fatalf("status = %d", w.Code)
+			}
+		}
+	})
+
+	b.Run("HandleKeys_Prefix25", func(b *testing.B) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.?prefix=true", nil)
+		b.ReportAllocs()
+		for b.Loop() {
+			w := httptest.NewRecorder()
+			srv.HandleKeys(w, req)
+			if w.Code != http.StatusOK {
+				b.Fatalf("status = %d", w.Code)
+			}
+		}
+	})
+
+	b.Run("HandleEntries_LockFree", func(b *testing.B) {
+		req := httptest.NewRequest(http.MethodGet, "/vindex/v1/entries/"+targetKey+"?before=10000&limit=100", nil)
+		b.ReportAllocs()
+		for b.Loop() {
+			w := httptest.NewRecorder()
+			srv.HandleEntries(w, req)
+			if w.Code != http.StatusOK {
+				b.Fatalf("status = %d", w.Code)
+			}
+		}
+	})
+}

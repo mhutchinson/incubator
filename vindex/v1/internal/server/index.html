@@ -44,8 +44,8 @@
                 <label class="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-2">Configuration</label>
                 <div class="space-y-3">
                     <div>
-                        <label class="text-[10px] text-slate-400 block mb-1">VIndex Lookup Path</label>
-                        <input id="config-vindex-url" type="text" value="/vindex/v1/lookup/" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs mono outline-none focus:border-blue-500 text-slate-300">
+                        <label class="text-[10px] text-slate-400 block mb-1">VIndex API Base Path</label>
+                        <input id="config-vindex-url" type="text" value="/vindex/v1" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs mono outline-none focus:border-blue-500 text-slate-300">
                     </div>
                     <div>
                         <label class="text-[10px] text-slate-400 block mb-1">Input Log Base URL</label>
@@ -54,6 +54,10 @@
                     <div>
                         <label class="text-[10px] text-slate-400 block mb-1">Results Limit Per Page</label>
                         <input id="config-limit" type="number" value="50" min="1" max="1000" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs mono outline-none focus:border-blue-500 text-slate-300">
+                    </div>
+                    <div class="flex items-center gap-2 pt-1">
+                        <input id="config-prefix-mode" type="checkbox" class="rounded border-slate-800 bg-slate-950 text-blue-600 focus:ring-0">
+                        <label for="config-prefix-mode" class="text-[11px] text-slate-400 cursor-pointer">Prefix Search (?prefix=true)</label>
                     </div>
                     <div class="flex items-center gap-2 pt-1">
                         <input id="config-use-woodpecker" type="checkbox" checked class="rounded border-slate-800 bg-slate-950 text-blue-600 focus:ring-0">
@@ -180,6 +184,11 @@
             return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
         }
 
+        // Encode each path segment of a canonical key while preserving '/' separators
+        function encodeKeyPath(key) {
+            return key.split('/').map(seg => encodeURIComponent(seg)).join('/');
+        }
+
         // Parse plain-text C2SP MIME sectioned response
         function parseV1Sections(text) {
             const sectionRegex = /^—\s+([\w\/-]+)(?:\s+(.*?))?\s+—$/;
@@ -218,6 +227,7 @@
                 inputLogTreeSize: 0,
                 outputLogTreeSize: 0,
                 mapRoot: '',
+                discoveredKeys: [],
                 indices: [],
                 nextBefore: null,
                 tileCache: {}
@@ -249,49 +259,64 @@
                 let rawKey = inputEl.value.trim();
                 if (!rawKey && !isPagination) return;
 
-                if (!isPagination) {
-                    this.state.currentKey = rawKey;
-                    this.state.indices = [];
-                    this.state.nextBefore = null;
-
-                    // If 64 hex chars, treat as raw hash; otherwise compute SHA-256 pre-image hash
-                    if (/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-                        this.state.keyHash = rawKey.toLowerCase();
-                    } else {
-                        this.setStatus('Hashing...', 'loading');
-                        this.state.keyHash = await sha256Hex(rawKey);
-                    }
-                }
-
                 const vindexBasePath = document.getElementById('config-vindex-url').value.trim().replace(/\/+$/, '');
                 const limit = document.getElementById('config-limit').value || 50;
-
-                let url = `${vindexBasePath}/${this.state.keyHash}?limit=${limit}`;
-                if (isPagination && this.state.nextBefore !== null) {
-                    url += `&before=${this.state.nextBefore}`;
-                }
-
-                this.setStatus('Querying VIndex...', 'loading');
-                if (!isPagination) {
-                    document.getElementById('results-container').innerHTML = `
-                        <div class="flex flex-col items-center justify-center h-64 text-slate-500 animate-pulse">
-                            <div class="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-3"></div>
-                            <span>Fetching proof and index pointers...</span>
-                        </div>
-                    `;
-                }
+                const isPrefix = document.getElementById('config-prefix-mode').checked;
 
                 try {
-                    const resp = await fetch(url);
-                    if (!resp.ok) {
-                        const errText = await resp.text();
-                        throw new Error(`HTTP ${resp.status}: ${errText}`);
+                    if (!isPagination) {
+                        this.state.currentKey = rawKey;
+                        this.state.indices = [];
+                        this.state.nextBefore = null;
+                        this.state.discoveredKeys = [];
+                        this.state.keyHash = await sha256Hex(rawKey);
+
+                        this.setStatus('Querying MPT /keys/...', 'loading');
+                        document.getElementById('results-container').innerHTML = `
+                            <div class="flex flex-col items-center justify-center h-64 text-slate-500 animate-pulse">
+                                <div class="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+                                <span>Fetching MPT proof and keys...</span>
+                            </div>
+                        `;
+
+                        let keysUrl = `${vindexBasePath}/keys/${encodeKeyPath(rawKey)}`;
+                        if (isPrefix) {
+                            keysUrl += `?prefix=true`;
+                        }
+                        const keysResp = await fetch(keysUrl);
+                        if (!keysResp.ok) {
+                            const errText = await keysResp.text();
+                            throw new Error(`HTTP ${keysResp.status}: ${errText}`);
+                        }
+                        const keysBody = await keysResp.text();
+                        const keysSections = parseV1Sections(keysBody);
+                        const hasKeys = this.processKeysResponse(keysSections);
+                        if (!hasKeys) {
+                            this.setStatus('Verified', 'success');
+                            return;
+                        }
+                        // Default to loading entries for the first matched key
+                        this.state.currentKey = this.state.discoveredKeys[0].key;
+                        this.state.keyHash = await sha256Hex(this.state.currentKey);
                     }
 
-                    const bodyText = await resp.text();
-                    const sections = parseV1Sections(bodyText);
+                    const before = isPagination ? (this.state.nextBefore || this.state.inputLogTreeSize) : this.state.inputLogTreeSize;
+                    if (!before) {
+                        this.renderResults();
+                        this.setStatus('Verified', 'success');
+                        return;
+                    }
 
-                    this.processResponse(sections, isPagination);
+                    this.setStatus('Querying Pebble /entries/...', 'loading');
+                    const entriesUrl = `${vindexBasePath}/entries/${encodeKeyPath(this.state.currentKey)}?before=${before}&limit=${limit}`;
+                    const entriesResp = await fetch(entriesUrl);
+                    if (!entriesResp.ok) {
+                        const errText = await entriesResp.text();
+                        throw new Error(`HTTP ${entriesResp.status}: ${errText}`);
+                    }
+                    const entriesBody = await entriesResp.text();
+                    const entriesSections = parseV1Sections(entriesBody);
+                    this.processEntriesResponse(entriesSections, isPagination);
                     this.setStatus('Verified', 'success');
                 } catch (e) {
                     console.error(e);
@@ -300,23 +325,18 @@
                 }
             },
 
-            processResponse(sections, isPagination) {
-                // Parse Output Log Leaf & Map Root
+            processKeysResponse(sections) {
                 const leafSec = sections['output-log-leaf-v1'];
                 if (leafSec) {
                     const lines = leafSec.body.split('\n');
                     if (lines.length >= 1) {
                         this.state.mapRoot = lines[0].trim();
                     }
-                    if (lines.length >= 2) {
-                        const inCPOrigin = lines[1].trim();
-                        if (lines.length >= 3) {
-                            this.state.inputLogTreeSize = parseInt(lines[2].trim(), 10) || 0;
-                        }
+                    if (lines.length >= 3) {
+                        this.state.inputLogTreeSize = parseInt(lines[2].trim(), 10) || 0;
                     }
                 }
 
-                // Parse Output Log Checkpoint size
                 const outSec = sections['vindex/v1'];
                 if (outSec) {
                     const lines = outSec.body.split('\n');
@@ -325,29 +345,43 @@
                     }
                 }
 
-                // Parse MPT Proof Type
                 const mptSec = sections['mpt-proof-v1'];
-                const isNonInclusion = mptSec && mptSec.arg === 'non-inclusion';
+                const proofMode = mptSec ? mptSec.arg.trim() : '';
 
-                // Update Metadata Sidebar
+                const keysSec = sections['keys-v1'];
+                const discovered = [];
+                if (keysSec && keysSec.body) {
+                    for (const l of keysSec.body.split('\n')) {
+                        const trimmed = l.trim();
+                        if (!trimmed) continue;
+                        const parts = trimmed.split(/\s+/);
+                        if (parts.length >= 2) {
+                            discovered.push({ key: parts[0], subRoot: parts[1] });
+                        }
+                    }
+                }
+                this.state.discoveredKeys = discovered;
+
                 document.getElementById('metadata-section').classList.remove('hidden');
                 document.getElementById('meta-key-hash').textContent = this.state.keyHash;
                 document.getElementById('meta-map-root').textContent = this.state.mapRoot || '--';
                 document.getElementById('meta-inlog-size').textContent = this.state.inputLogTreeSize.toLocaleString();
                 document.getElementById('meta-outlog-size').textContent = this.state.outputLogTreeSize.toLocaleString();
-                
+
                 const proofTypeEl = document.getElementById('meta-proof-type');
-                if (isNonInclusion) {
-                    proofTypeEl.textContent = "Non-Inclusion (Empty)";
+                if (proofMode === 'non-inclusion' || discovered.length === 0) {
+                    proofTypeEl.textContent = proofMode === 'prefix' ? "Prefix Empty (0 Keys)" : "Non-Inclusion (Empty)";
                     proofTypeEl.className = "inline-block mt-0.5 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-rose-950 text-rose-400 border border-rose-800";
                     this.renderNonInclusion();
-                    return;
-                } else {
-                    proofTypeEl.textContent = "Inclusion Proof Valid";
-                    proofTypeEl.className = "inline-block mt-0.5 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-emerald-950 text-emerald-400 border border-emerald-800";
+                    return false;
                 }
 
-                // Parse Indices Section
+                proofTypeEl.textContent = proofMode === 'prefix' ? `Prefix Proof (${discovered.length} Keys)` : "Inclusion Proof Valid";
+                proofTypeEl.className = "inline-block mt-0.5 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-emerald-950 text-emerald-400 border border-emerald-800";
+                return true;
+            },
+
+            processEntriesResponse(sections, isPagination) {
                 const idxSec = sections['indices-v1'];
                 const pageIndices = [];
                 let nextBefore = null;
@@ -376,9 +410,35 @@
                 this.renderResults();
             },
 
+            async selectKey(idx) {
+                const entry = this.state.discoveredKeys[idx];
+                if (!entry) return;
+                this.state.currentKey = entry.key;
+                this.state.keyHash = await sha256Hex(entry.key);
+                this.state.indices = [];
+                this.state.nextBefore = null;
+                await this.lookup(true);
+            },
+
             renderResults() {
                 const container = document.getElementById('results-container');
                 container.innerHTML = '';
+
+                if (this.state.discoveredKeys.length > 1) {
+                    const keyBar = document.createElement('div');
+                    keyBar.className = "flex flex-wrap items-center gap-1.5 pb-3 mb-2 border-b border-slate-800";
+                    this.state.discoveredKeys.forEach((dk, i) => {
+                        const btn = document.createElement('button');
+                        const active = dk.key === this.state.currentKey;
+                        btn.className = active
+                            ? "px-2.5 py-1 rounded-lg text-xs font-mono bg-blue-600 text-white border border-blue-500"
+                            : "px-2.5 py-1 rounded-lg text-xs font-mono bg-slate-900 text-slate-300 border border-slate-700 hover:border-slate-500";
+                        btn.textContent = dk.key;
+                        btn.onclick = () => app.selectKey(i);
+                        keyBar.appendChild(btn);
+                    });
+                    container.appendChild(keyBar);
+                }
 
                 if (this.state.indices.length === 0) {
                     this.renderNonInclusion();
@@ -559,7 +619,7 @@
             }
             const vindexInput = document.getElementById('config-vindex-url');
             if (vindexInput) {
-                vindexInput.value = basePath + 'vindex/v1/lookup/';
+                vindexInput.value = basePath + 'vindex/v1';
             }
             const inlogInput = document.getElementById('config-inlog-url');
             if (inlogInput) {

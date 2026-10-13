@@ -19,15 +19,196 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"golang.org/x/net/publicsuffix"
 )
+
+// FormatKeysResponse builds the plain-text C2SP response for GET /vindex/v1/keys/{key...}[?prefix=true].
+// mode must be one of "inclusion", "non-inclusion", or "prefix".
+func FormatKeysResponse(state *tree.ServingState, mode string, proof []byte, matches []tree.PrefixKeyVal) []byte {
+	var sb bytes.Buffer
+
+	// Section 1: — vindex/v1 —
+	sb.WriteString("— vindex/v1 —\n")
+	sb.Write(bytes.TrimRight(state.RawCheckpoint, "\n"))
+	sb.WriteString("\n\n")
+
+	// Section 2: — output-log-leaf-v1 <leaf_index> —
+	fmt.Fprintf(&sb, "— output-log-leaf-v1 %d —\n", state.OutputLogIndex)
+	sb.WriteString(hex.EncodeToString(state.MapRoot[:]))
+	sb.WriteString("\n")
+	sb.Write(bytes.TrimRight(state.RawInputLogCP, "\n"))
+	sb.WriteString("\n\n")
+
+	// Section 3: — output-log-proof-v1 —
+	sb.WriteString("— output-log-proof-v1 —\n")
+	for _, p := range state.OutputLogProof {
+		sb.WriteString(base64.StdEncoding.EncodeToString(p[:]))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+
+	// Section 4: — mpt-proof-v1 <mode> —
+	fmt.Fprintf(&sb, "— mpt-proof-v1 %s —\n", mode)
+	sb.WriteString(base64.StdEncoding.EncodeToString(proof))
+	sb.WriteString("\n\n")
+
+	// Section 5: — keys-v1 —
+	sb.WriteString("— keys-v1 —\n")
+	for _, m := range matches {
+		sb.WriteString(m.Key)
+		sb.WriteByte(' ')
+		sb.WriteString(hex.EncodeToString(m.SubRoot[:]))
+		sb.WriteByte('\n')
+	}
+
+	return sb.Bytes()
+}
+
+// FormatEntriesResponse builds the plain-text C2SP response for GET /vindex/v1/entries/{key...}?before=X[&limit=Y].
+func FormatEntriesResponse(matchedIndices []uint64, prefixCR *kvstore.CompactRange, nextBefore *uint64) []byte {
+	var sb bytes.Buffer
+
+	// Section 1: — prefix-compact-range-v1 <covered_size> — (omitted when covered_size == 0)
+	if prefixCR != nil && prefixCR.CoveredSize > 0 {
+		fmt.Fprintf(&sb, "— prefix-compact-range-v1 %d —\n", prefixCR.CoveredSize)
+		for _, h := range prefixCR.Hashes {
+			sb.WriteString(base64.StdEncoding.EncodeToString(h[:]))
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	// Section 2: — indices-v1 [next_before] —
+	if nextBefore != nil {
+		fmt.Fprintf(&sb, "— indices-v1 %d —\n", *nextBefore)
+	} else {
+		sb.WriteString("— indices-v1 —\n")
+	}
+	for _, idx := range matchedIndices {
+		sb.WriteString(strconv.FormatUint(idx, 10))
+		sb.WriteString("\n")
+	}
+
+	return sb.Bytes()
+}
+
+// PrefixPolicy validates whether a prefix query (?prefix=true) is permitted.
+type PrefixPolicy func(prefix string) error
+
+// AllowAllPrefixPolicy permits any valid canonical key prefix.
+func AllowAllPrefixPolicy(_ string) error {
+	return nil
+}
+
+// DisallowPrefixPolicy rejects all prefix queries.
+func DisallowPrefixPolicy(prefix string) error {
+	return fmt.Errorf("prefix queries are disabled on this server (prefix %q)", prefix)
+}
+
+// DomainETLDP1PrefixPolicy enforces that a reversed-label domain prefix ends with a trailing '.'
+// and contains at least a registrable eTLD+1 boundary according to the Mozilla Public Suffix List,
+// rejecting bare TLDs or public suffixes such as "com.", "uk.co.", or "io.github.".
+func DomainETLDP1PrefixPolicy(prefix string) error {
+	if !strings.HasSuffix(prefix, ".") {
+		return fmt.Errorf("domain prefix %q must terminate with a trailing dot '.'", prefix)
+	}
+	trimmed := strings.TrimSuffix(prefix, ".")
+	if trimmed == "" {
+		return errors.New("domain prefix cannot be empty")
+	}
+	labels := strings.Split(trimmed, ".")
+	// If the last reversed label is a wildcard "*", strip it when checking the parent domain's eTLD+1.
+	if len(labels) > 0 && labels[len(labels)-1] == "*" {
+		labels = labels[:len(labels)-1]
+	}
+	if len(labels) == 0 {
+		return fmt.Errorf("domain prefix %q must contain a registrable domain before wildcard", prefix)
+	}
+	reversed := make([]string, len(labels))
+	for i, lbl := range labels {
+		if !isValidDNSLabel(lbl) {
+			return fmt.Errorf("domain prefix %q contains invalid DNS label %q", prefix, lbl)
+		}
+		reversed[len(labels)-1-i] = lbl
+	}
+	forwardDomain := strings.Join(reversed, ".")
+	etld1, err := publicsuffix.EffectiveTLDPlusOne(forwardDomain)
+	if err != nil || etld1 == "" {
+		return fmt.Errorf("domain prefix %q (domain %q) is broader than a registrable eTLD+1 boundary: %v", prefix, forwardDomain, err)
+	}
+	return nil
+}
+
+func isValidDNSLabel(lbl string) bool {
+	if len(lbl) == 0 || len(lbl) > 63 {
+		return false
+	}
+	if lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(lbl); i++ {
+		c := lbl[i]
+		isLower := c >= 'a' && c <= 'z'
+		isDigit := c >= '0' && c <= '9'
+		if !isLower && !isDigit && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// ParsePrefixPolicy resolves a prefix policy name ("allow", "domain", "none") to a PrefixPolicy function.
+func ParsePrefixPolicy(name string) (PrefixPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "allow", "all":
+		return AllowAllPrefixPolicy, nil
+	case "domain", "etld+1", "psl":
+		return DomainETLDP1PrefixPolicy, nil
+	case "none", "disallow", "off":
+		return DisallowPrefixPolicy, nil
+	default:
+		return nil, fmt.Errorf("unknown prefix policy %q (expected allow, domain, or none)", name)
+	}
+}
+
+func parseCanonicalKey(r *http.Request, routePrefixes []string) (string, error) {
+	escapedPath := r.URL.EscapedPath()
+	var keyEscaped string
+	matched := false
+	for _, prefix := range routePrefixes {
+		if strings.HasPrefix(escapedPath, prefix) {
+			keyEscaped = strings.TrimPrefix(escapedPath, prefix)
+			matched = true
+			break
+		}
+		if strings.HasPrefix(r.URL.Path, prefix) {
+			keyEscaped = strings.TrimPrefix(r.URL.Path, prefix)
+			matched = true
+			break
+		}
+	}
+	if !matched || keyEscaped == "" {
+		return "", errors.New("missing key in URL path")
+	}
+	keyStr, err := url.PathUnescape(keyEscaped)
+	if err != nil {
+		return "", fmt.Errorf("invalid URL-escaped key: %w", err)
+	}
+	if err := tree.ValidateCanonicalKey([]byte(keyStr)); err != nil {
+		return "", err
+	}
+	return keyStr, nil
+}
 
 // FormatResponse builds the standardized plain-text C2SP response for lookup results.
 func FormatResponse(state *tree.ServingState, proof []byte, exists bool, matchedIndices []uint64, prefixCR *kvstore.CompactRange, nextBefore *uint64) []byte {

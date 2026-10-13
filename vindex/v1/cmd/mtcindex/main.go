@@ -186,6 +186,7 @@ func run(ctx context.Context) error {
 	// 7. HTTP Read Server
 	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
 	readSrv.SetEnableUI(*enableUI)
+	readSrv.SetPrefixPolicy(server.DomainETLDP1PrefixPolicy)
 	mux := http.NewServeMux()
 	readSrv.RegisterRoutes(mux)
 

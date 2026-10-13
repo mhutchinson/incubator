@@ -63,6 +63,8 @@ type Config struct {
 	OutputLogSignerKey string
 	WitnessURLs        []string
 	WitnessPubKeys     []string
+	PrefixPolicy       server.PrefixPolicy
+	MaxPrefixKeys      int
 }
 
 // DefaultConfig returns standard default configuration values.
@@ -78,6 +80,7 @@ func DefaultConfig() Config {
 		FetchWorkers:      ingest.DefaultFetchWorkers(),
 		FetchBatchBundles: ingest.DefaultFetchBatchBundles(),
 		PollInterval:      10 * time.Second,
+		MaxPrefixKeys:     server.DefaultMaxPrefixKeys,
 	}
 }
 
@@ -285,6 +288,12 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 	// 10. Initialize HTTP Read Server
 	srv := server.NewReadServer(db, mptMgr, pub, cfg.ChunkSize)
 	srv.SetReadyChecker(coord.ReadinessCheck)
+	if cfg.PrefixPolicy != nil {
+		srv.SetPrefixPolicy(cfg.PrefixPolicy)
+	}
+	if cfg.MaxPrefixKeys > 0 {
+		srv.SetMaxPrefixKeys(cfg.MaxPrefixKeys)
+	}
 
 	// 11. Initialize Tile Reaper
 	reaper := ingest.NewTileReaper(db, mptMgr, cache)

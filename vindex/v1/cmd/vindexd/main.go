@@ -89,6 +89,8 @@ var (
 	cleanDirs                = flag.Bool("clean", false, "Clean db_path, mpt_dir, output_log_dir, and tile_cache_dir on startup.")
 	backfillMaxPendingKeys   = flag.Int("backfill_max_pending_keys", 50000000, "Maximum deduplicated keys buffered in memory during Genesis Backfill before flushing to MPT (defaults to 50,000,000, ~5.5 GB RAM).")
 	coarseCheckpointInterval = flag.Int("coarse_checkpoint_interval", 50000000, "Maximum leaves between coarse checkpoints during Genesis Backfill (defaults to 50,000,000).")
+	prefixPolicyFlag         = flag.String("prefix_policy", "allow", "Prefix query policy for /vindex/v1/keys/?prefix=true: 'allow' (default), 'domain' (eTLD+1 Public Suffix List), or 'none'.")
+	maxPrefixKeysFlag        = flag.Int("max_prefix_keys", server.DefaultMaxPrefixKeys, "Maximum matching keys returned by a single /vindex/v1/keys/?prefix=true query before returning HTTP 413.")
 )
 
 func main() {
@@ -252,9 +254,15 @@ func runPublisher(ctx context.Context) error {
 		defer func() { _ = metricsServer.Close() }()
 	}
 
+	prefixPolicy, err := server.ParsePrefixPolicy(*prefixPolicyFlag)
+	if err != nil {
+		return err
+	}
 	readSrv := server.NewReadServer(db, nil, nil, *chunkSize)
 	readSrv.SetEnableUI(*enableUI)
 	readSrv.SetPathPrefix(*pathPrefix)
+	readSrv.SetPrefixPolicy(prefixPolicy)
+	readSrv.SetMaxPrefixKeys(*maxPrefixKeysFlag)
 	readMux := http.NewServeMux()
 	readSrv.RegisterRoutesWithOutputLog(readMux, *outputLogDir)
 	httpServer := &http.Server{
@@ -486,6 +494,11 @@ func runAuditor(ctx context.Context) error {
 		defer closeMapper()
 	}
 
+	prefixPolicy, err := server.ParsePrefixPolicy(*prefixPolicyFlag)
+	if err != nil {
+		return err
+	}
+
 	cfg := auditor.Config{
 		InputLogURL:     *inputLogURL,
 		InputLogPubKey:  resolvedInPubKey,
@@ -502,6 +515,8 @@ func runAuditor(ctx context.Context) error {
 		ListenAddr:      *listenAddr,
 		MetricsAddr:     *metricsAddr,
 		PathPrefix:      *pathPrefix,
+		PrefixPolicy:    prefixPolicy,
+		MaxPrefixKeys:   *maxPrefixKeysFlag,
 		PollInterval:    *pollInterval,
 		ChunkSize:       *chunkSize,
 		CommitBatchSize: *commitBatchSize,
