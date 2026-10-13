@@ -2,6 +2,16 @@
 
 This backlog consolidates open architectural refinements, documentation alignment tasks, implementation bugs, and upstream library investigations for **VIndex v1**.
 
+## Milestone Roadmap
+
+| Milestone | Status | Scope & Backlog Items | Spec / Workboard |
+| :--- | :--- | :--- | :--- |
+| **M1: Core Storage, Recovery & Pipeline Hardening** | 🏃 Active | Orthogonal engine & storage fixes: `kvstore` (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`), `ingest` & WASM slab safety (`2.1.1`–`2.1.5`, `2.2.1`, `2.2.2`, `2.2.4`), `tree`/`coordinator` recovery & durability (`1.1.4`, `2.4.1`, `2.4.2`, `2.5.1`–`2.5.4`, `2.6.5`), and `auditor` (`2.7.1`–`2.7.4`). | [`docs/milestones/milestone-01-engine-hardening.md`](docs/milestones/milestone-01-engine-hardening.md) |
+| **M2: True Prefix Lookups & Two-Endpoint Read Protocol** | 📋 Planned | Variable-length `[]byte` MPT keys (`filippo.io/torchwood/mpt`), `/vindex/v1/keys/{key...}` + `/vindex/v1/entries/{key...}` split, server-side eTLD+1 & `maxPrefixKeys` guardrails, reversed-label trailing-dot CT/MTC mappers, and client verification (`1.1.0`, `1.1.1`, `2.2.3`, `2.6.1`–`2.6.3`). | [`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md) |
+| **M3: Package Decoupling & C2SP `tlog-vindex` Spec Alignment** | 📋 Planned | Split `internal/mpt` vs `internal/publish` (`1.2.1`, `2.6.4`), extract `mapfn/host` (`1.2.2`) and shared `wire/` (`1.2.3`), isolate `internal/mtc` (`1.2.4`), and align all Type A/B docs (`1.3.1`–`1.3.7`). | TBD (`milestone-03`) |
+
+> **Performance Commit Policy**: Every performance improvement (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`, etc.) MUST include unit tests and Go benchmarks (`go test -bench=... -benchmem`), and cite the **before/after performance scores (`ns/op`, `B/op`, `allocs/op`) directly in the commit message**.
+
 It is organized into three categories:
 1. [**Architectural & Documentation Issues**](#1-architectural--documentation-issues)
 2. [**VIndex Code Issues (Implementation Bugs)**](#2-vindex-code-issues-implementation-bugs)
@@ -13,7 +23,18 @@ It is organized into three categories:
 
 ### 1.1 Protocol & Read-Path Architecture Refinements
 
-- [ ] **1.1.1 Zero-MPT Continuation & The "Map of Logs" API (`before != nil`)**
+- [ ] **1.1.0 Major Design Overhaul: True Prefix Lookups & Two-Endpoint Read Protocol**
+  - **Design Doc**: [`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md)
+  - **Affected Components**: `go.mod` (`filippo.io/torchwood/mpt`), [`internal/tree`](internal/tree/README.md), [`internal/kvstore`](internal/kvstore/README.md), [`internal/server`](internal/server/README.md), [`client`](client/README.md), [`cmd/mapfn-ct`](cmd/mapfn-ct/main.go), [`internal/mtc`](internal/mtc/README.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+  - **Summary**: Upgrade `filippo.io/torchwood/mpt` from fixed 32-byte hashed keys to native variable-length `[]byte` keys (`<= 1024` bytes) with prefix scanning (`Tree.Scan`), subtree proofs (`ProvePrefix` / `VerifyPrefix`), and point proofs (`ProveLookup` / `VerifyLookup`):
+    - **1 Key per Domain in CT/MTC**: Emit a single reversed-label domain key with a mandatory trailing dot (`mail.google.com` -> `com.google.mail.`, `*.google.com` -> `com.google.*.`) instead of expanding ancestor domain hashes during ingestion. Cuts per-certificate MPT mutations by 2x–3x while isolating apex domain queries from wildcard/subdomain noise.
+    - **Hybrid Storage Keying**: Store raw `[]byte` keys in the MPT (`internal/tree`) to enable cryptographic prefix discovery, while retaining fixed 32-byte `SHA256(key)` keys inside Pebble (`'c' + 32B KeyHash + 8B ^chunkNum`) and `KVIndexer` active chunk caches.
+    - **Two Orthogonal Read Endpoints (Resolves `1.1.1`)**: Replace `GET /vindex/v1/lookup/{keyhash}` with two store-aligned endpoints:
+      1. `GET /vindex/v1/keys/{key...}[?prefix=true]` (MPT + Output Log only): Authenticates exact key or prefix subtree against the signed Output Log checkpoint and returns `— keys-v1 —` (`<key> <subRootHex>`).
+      2. `GET /vindex/v1/entries/{key...}?before=X[&limit=Y]` (Pebble only, zero MPT locks): Hashes `{key}` internally (`SHA256(key)`) and returns `prefix-compact-range-v1` + `indices-v1`.
+    - **Server-Side Prefix Guardrails**: Move eTLD+1 Public Suffix List validation out of the WASM `MapFn` and into `GET /vindex/v1/keys/{key...}?prefix=true`, paired with a `maxPrefixKeys` scan cardinality cap.
+
+- [ ] **1.1.1 Zero-MPT Continuation & The "Map of Logs" API (`before != nil`)** *(Resolved by [`1.1.0` / `docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md))*
   - **Affected Components**: [`internal/server`](internal/server/README.md), [`client`](client/README.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
   - **Current Behavior**: Every query to `/vindex/v1/lookup/{keyhash}` acquires an MPT read lock (`mptMgr.RLock()`), retrieves serving state, and formats an Output Log checkpoint, Output Log leaf, Output Log inclusion proof, and MPT inclusion/non-inclusion proof alongside returned indices.
   - **Problem**: VIndex is a **Map of Logs** where `Map` commits to `KeyHash -> MiniLogRoot` at tip and `MiniLog` is an append-only RFC 6962 Merkle log of occurrence indices. On Page 1 (`before == nil`), the client authenticates `MiniLogRoot` against `MapRoot` via the MPT proof and computes `expectedMiniLogRoot` for the remaining prefix from `prefix-compact-range-v1`. On Page 2+ (`before = next_before`), the client verifies continuity purely against the previous page's `expectedMiniLogRoot`:
@@ -21,9 +42,7 @@ It is organized into three categories:
     NewRange(Page_N.PrefixCR).Append(Page_N.Indices).GetRootHash() == Page_(N-1).expectedMiniLogRoot
     ```
     Continuation pages never need the MPT or Output Log, and a mid-log mini-log root cannot match the tip `MapRoot`. Returning MPT/Output Log proofs on `before != nil` wastes lock acquisitions, trie traversal CPU, and wire bandwidth.
-  - **Candidate Directions**:
-    - *Option A (Smart Tip with Zero-MPT Continuations)*: Keep combined proof + Page 1 data in 1 RTT when `before == nil`; when `before != nil`, skip `mptMgr.RLock()` and `ProveLocked()`, query Pebble directly, and omit Output Log / MPT sections.
-    - *Option B (Pure 2-Phase Split `/proof` vs. `/entries`)*: Expose `GET /vindex/v1/proof/{keyhash}` (MPT only) and `GET /vindex/v1/entries/{keyhash}?before=X` (Pebble only, requiring `before=InputLogSize` from the proof to prevent write-skew races).
+  - **Resolution**: Adopted **Option B** via the two-endpoint protocol in [`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md) (`GET /vindex/v1/keys/{key...}` for MPT proofs vs. `GET /vindex/v1/entries/{key...}?before=X` for zero-MPT Pebble pagination).
 
 - [ ] **1.1.2 Chunk-Aligned Paging (Eliminating Dynamic Read-Path Merkle Hashing)**
   - **Affected Components**: [`internal/kvstore`](internal/kvstore/README.md), [`internal/server`](internal/server/README.md)
