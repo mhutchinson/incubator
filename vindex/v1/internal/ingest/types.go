@@ -67,11 +67,12 @@ func (b *LeafBundle) Release() {
 
 // MappedBatch contains the extracted key-to-indices mapping for a LeafBundle.
 type MappedBatch struct {
-	BundleIdx    uint64
-	StartLeafIdx uint64
-	EndLeafIdx   uint64
-	Count        uint32
-	KeyMap       map[[32]byte][]uint64
+	BundleIdx     uint64
+	StartLeafIdx  uint64
+	EndLeafIdx    uint64
+	Count         uint32
+	KeyMap        map[[32]byte][]uint64
+	CanonicalKeys map[[32]byte]string
 }
 
 // BundleMapper is an optional optimization interface for LeafMappers supporting batched execution.
@@ -104,6 +105,16 @@ func (b *MappedBatch) Merge(other *MappedBatch) {
 	}
 	for k, indices := range other.KeyMap {
 		b.KeyMap[k] = append(b.KeyMap[k], indices...)
+	}
+	if len(other.CanonicalKeys) > 0 {
+		if b.CanonicalKeys == nil {
+			b.CanonicalKeys = make(map[[32]byte]string, len(other.CanonicalKeys))
+		}
+		for kh, ck := range other.CanonicalKeys {
+			if ck != "" {
+				b.CanonicalKeys[kh] = ck
+			}
+		}
 	}
 	if otherEnd > b.EndLeafIdx {
 		b.EndLeafIdx = otherEnd

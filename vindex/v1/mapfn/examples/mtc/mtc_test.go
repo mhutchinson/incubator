@@ -99,6 +99,7 @@ func TestMapMTCLeaf_WASMHost_Golden(t *testing.T) {
 			var want []ingest.MappedEntry
 			for _, d := range tc.ExpectedDomains {
 				want = append(want, ingest.MappedEntry{
+					Key:     d,
 					KeyHash: sha256.Sum256([]byte(d)),
 				})
 			}

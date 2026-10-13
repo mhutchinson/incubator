@@ -179,8 +179,13 @@ func initMapper(ctx context.Context, wasm, mapperName string) (ingest.LeafMapper
 type defaultIdentityMapper struct{}
 
 func (m *defaultIdentityMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	kh := sha256.Sum256(leaf)
-	return []ingest.MappedEntry{{KeyHash: kh}}, nil
+	trimmed := bytes.TrimSpace(leaf)
+	var key string
+	if ingest.ValidatePreimageKey(trimmed) == nil {
+		key = string(trimmed)
+	}
+	kh := sha256.Sum256(trimmed)
+	return []ingest.MappedEntry{{Key: key, KeyHash: kh}}, nil
 }
 
 func (m *defaultIdentityMapper) Close(_ context.Context) error { return nil }

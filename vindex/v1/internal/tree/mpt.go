@@ -17,6 +17,7 @@ package tree
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -29,6 +30,61 @@ import (
 	torchmpt "filippo.io/torchwood/mpt"
 	"golang.org/x/sync/errgroup"
 )
+
+func keyHashToHexKey(keyHash [sha256.Size]byte) []byte {
+	var hexKey [sha256.Size * 2]byte
+	hex.Encode(hexKey[:], keyHash[:])
+	return hexKey[:]
+}
+
+const (
+	// MaxKeyLen is the maximum length in bytes of a canonical key stored in the MPT.
+	MaxKeyLen = torchmpt.MaxKeyLen
+	// MaxValLen is the maximum length in bytes of a value stored in the MPT.
+	MaxValLen = torchmpt.MaxValLen
+)
+
+var (
+	// ErrKeySize is returned when an MPT key is empty or exceeds MaxKeyLen (1024 bytes).
+	ErrKeySize = torchmpt.ErrKeySize
+	// ErrValSize is returned when an MPT value exceeds MaxValLen (1024 bytes).
+	ErrValSize = torchmpt.ErrValSize
+	// ErrInvalidCanonicalKey is returned when a canonical key is outside 1..1024 printable ASCII bytes (0x21..0x7E).
+	ErrInvalidCanonicalKey = errors.New("invalid canonical key: must be 1..1024 printable ASCII bytes (0x21..0x7E) without NUL or whitespace")
+	// ErrPrefixTooManyKeys is returned when a prefix scan exceeds the configured maximum key cardinality.
+	ErrPrefixTooManyKeys = errors.New("prefix scan exceeded maximum allowed keys")
+)
+
+// PrefixKeyVal represents a canonical key and its 32-byte mini-log sub-root yielded by a prefix scan.
+type PrefixKeyVal struct {
+	Key     string
+	SubRoot [sha256.Size]byte
+}
+
+// ValidateCanonicalKey checks that key is between 1 and 1024 printable ASCII bytes (0x21..0x7E),
+// containing no NUL (0x00) bytes or ASCII whitespace.
+func ValidateCanonicalKey(key []byte) error {
+	if len(key) == 0 || len(key) > MaxKeyLen {
+		return fmt.Errorf("%w: length %d", ErrInvalidCanonicalKey, len(key))
+	}
+	for _, b := range key {
+		if b < 0x21 || b > 0x7E {
+			return fmt.Errorf("%w: invalid byte 0x%02x", ErrInvalidCanonicalKey, b)
+		}
+	}
+	return nil
+}
+
+func validateMPTKeyLen(key []byte) error {
+	return ValidateCanonicalKey(key)
+}
+
+func validateMPTValLen(val []byte) error {
+	if len(val) > MaxValLen {
+		return fmt.Errorf("%w: length %d (max %d)", ErrValSize, len(val), MaxValLen)
+	}
+	return nil
+}
 
 // Manager manages a Merkle Patricia Trie with thread-safe read access and lock-free root prediction.
 type Manager struct {
@@ -106,7 +162,6 @@ func NewManager(mmapDir string) (*Manager, error) {
 	return Open(mmapDir)
 }
 
-
 // RLock acquires the read lock.
 func (m *Manager) RLock() {
 	m.treeMu.RLock()
@@ -140,15 +195,17 @@ func (m *Manager) Root() [sha256.Size]byte {
 func SortKeyVals(changes []torchmpt.KeyVal) {
 	const parallelThreshold = 8192
 	if len(changes) < parallelThreshold {
-		slices.SortFunc(changes, func(a, b torchmpt.KeyVal) int {
-			return bytes.Compare(a.Key[:], b.Key[:])
-		})
+		slices.SortFunc(changes, torchmpt.KeyVal.CompareKey)
 		return
 	}
 
 	var counts [256]int
 	for i := range changes {
-		counts[changes[i].Key[0]]++
+		var b byte
+		if len(changes[i].Key) > 0 {
+			b = changes[i].Key[0]
+		}
+		counts[b]++
 	}
 
 	var offsets [257]int
@@ -159,7 +216,10 @@ func SortKeyVals(changes []torchmpt.KeyVal) {
 	aux := make([]torchmpt.KeyVal, len(changes))
 	cursor := offsets
 	for i := range changes {
-		b := changes[i].Key[0]
+		var b byte
+		if len(changes[i].Key) > 0 {
+			b = changes[i].Key[0]
+		}
 		aux[cursor[b]] = changes[i]
 		cursor[b]++
 	}
@@ -184,9 +244,7 @@ func SortKeyVals(changes []torchmpt.KeyVal) {
 				start := offsets[b]
 				end := offsets[b+1]
 				if end-start > 1 {
-					slices.SortFunc(aux[start:end], func(a, b torchmpt.KeyVal) int {
-						return bytes.Compare(a.Key[:], b.Key[:])
-					})
+					slices.SortFunc(aux[start:end], torchmpt.KeyVal.CompareKey)
 				}
 			}
 			return nil
@@ -196,7 +254,29 @@ func SortKeyVals(changes []torchmpt.KeyVal) {
 	copy(changes, aux)
 }
 
-// Predict calculates the MPT root hash that would result from applying mutations without modifying the tree.
+// PredictKeys calculates the MPT root hash that would result from applying variable-length key mutations without modifying the tree.
+func (m *Manager) PredictKeys(mutations map[string][sha256.Size]byte) ([sha256.Size]byte, error) {
+	if len(mutations) == 0 {
+		return m.Root(), nil
+	}
+
+	changes := make([]torchmpt.KeyVal, 0, len(mutations))
+	for k, v := range mutations {
+		if err := validateMPTKeyLen([]byte(k)); err != nil {
+			return [sha256.Size]byte{}, err
+		}
+		valCopy := v
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key(k),
+			Val: torchmpt.Val(valCopy[:]),
+		})
+	}
+	SortKeyVals(changes)
+
+	return m.PredictKeyVals(changes)
+}
+
+// Predict calculates the MPT root hash that would result from applying fixed 32-byte keyHash mutations (encoded as 64-byte lowercase hex keys) without modifying the tree.
 func (m *Manager) Predict(mutations map[[sha256.Size]byte][sha256.Size]byte) ([sha256.Size]byte, error) {
 	if len(mutations) == 0 {
 		return m.Root(), nil
@@ -204,9 +284,10 @@ func (m *Manager) Predict(mutations map[[sha256.Size]byte][sha256.Size]byte) ([s
 
 	changes := make([]torchmpt.KeyVal, 0, len(mutations))
 	for k, v := range mutations {
+		valCopy := v
 		changes = append(changes, torchmpt.KeyVal{
-			Key: torchmpt.Key(k),
-			Val: torchmpt.Val(v),
+			Key: torchmpt.Key(keyHashToHexKey(k)),
+			Val: torchmpt.Val(valCopy[:]),
 		})
 	}
 	SortKeyVals(changes)
@@ -219,6 +300,14 @@ func (m *Manager) PredictKeyVals(changes []torchmpt.KeyVal) ([sha256.Size]byte, 
 	if len(changes) == 0 {
 		return m.Root(), nil
 	}
+	for i := range changes {
+		if err := validateMPTKeyLen(changes[i].Key); err != nil {
+			return [sha256.Size]byte{}, err
+		}
+		if err := validateMPTValLen(changes[i].Val); err != nil {
+			return [sha256.Size]byte{}, err
+		}
+	}
 
 	m.treeMu.RLock()
 	defer m.treeMu.RUnlock()
@@ -230,15 +319,21 @@ func (m *Manager) PredictKeyVals(changes []torchmpt.KeyVal) ([sha256.Size]byte, 
 	return [sha256.Size]byte(hash), nil
 }
 
-// Update inserts or updates a single key-value pair in the MPT.
-func (m *Manager) Update(keyHash [sha256.Size]byte, valHash [sha256.Size]byte) error {
+// UpdateKey inserts or updates a single variable-length key-value pair in the MPT.
+func (m *Manager) UpdateKey(key []byte, valHash [sha256.Size]byte) error {
+	if err := validateMPTKeyLen(key); err != nil {
+		return err
+	}
+	keyCopy := slices.Clone(key)
+	valCopy := slices.Clone(valHash[:])
+
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
 
 	m.treeMu.Lock()
 	defer m.treeMu.Unlock()
 
-	if err := m.tree.Set(torchmpt.Key(keyHash), torchmpt.Val(valHash)); err != nil {
+	if err := m.tree.Set(torchmpt.Key(keyCopy), torchmpt.Val(valCopy)); err != nil {
 		return fmt.Errorf("tree.Set failed: %w", err)
 	}
 	snap, err := m.tree.Snap(-1)
@@ -246,21 +341,32 @@ func (m *Manager) Update(keyHash [sha256.Size]byte, valHash [sha256.Size]byte) e
 		return fmt.Errorf("tree.Snap failed: %w", err)
 	}
 	m.currentRoot = [sha256.Size]byte(snap.Hash)
+	m.exact.Store(true)
 	return nil
 }
 
-// SetBatch applies mutations directly to the working tree under writeMu without creating a snapshot.
-func (m *Manager) SetBatch(mutations map[[sha256.Size]byte][sha256.Size]byte) error {
+// Update inserts or updates a single 32-byte keyHash (encoded as 64-byte lowercase hex) in the MPT.
+func (m *Manager) Update(keyHash [sha256.Size]byte, valHash [sha256.Size]byte) error {
+	return m.UpdateKey(keyHashToHexKey(keyHash), valHash)
+}
+
+// SetKeyBatch applies variable-length key mutations directly to the working tree under writeMu without creating a snapshot.
+func (m *Manager) SetKeyBatch(mutations map[string][sha256.Size]byte) error {
 	if len(mutations) == 0 {
 		return nil
 	}
-	keys := make([][sha256.Size]byte, 0, len(mutations))
-	for k := range mutations {
-		keys = append(keys, k)
+	changes := make([]torchmpt.KeyVal, 0, len(mutations))
+	for k, v := range mutations {
+		if err := validateMPTKeyLen([]byte(k)); err != nil {
+			return err
+		}
+		valCopy := v
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key(k),
+			Val: torchmpt.Val(valCopy[:]),
+		})
 	}
-	slices.SortFunc(keys, func(a, b [sha256.Size]byte) int {
-		return bytes.Compare(a[:], b[:])
-	})
+	SortKeyVals(changes)
 
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
@@ -268,10 +374,39 @@ func (m *Manager) SetBatch(mutations map[[sha256.Size]byte][sha256.Size]byte) er
 	m.treeMu.Lock()
 	defer m.treeMu.Unlock()
 
-	for _, k := range keys {
-		v := mutations[k]
-		if err := m.tree.Set(torchmpt.Key(k), torchmpt.Val(v)); err != nil {
-			return fmt.Errorf("tree.Set failed for key %x: %w", k, err)
+	for _, kv := range changes {
+		if err := m.tree.Set(kv.Key, kv.Val); err != nil {
+			return fmt.Errorf("tree.Set failed for key %q: %w", kv.Key, err)
+		}
+	}
+	m.exact.Store(false)
+	return nil
+}
+
+// SetBatch applies fixed 32-byte keyHash mutations (encoded as 64-byte lowercase hex) directly to the working tree under writeMu without creating a snapshot.
+func (m *Manager) SetBatch(mutations map[[sha256.Size]byte][sha256.Size]byte) error {
+	if len(mutations) == 0 {
+		return nil
+	}
+	changes := make([]torchmpt.KeyVal, 0, len(mutations))
+	for k, v := range mutations {
+		valCopy := v
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key(keyHashToHexKey(k)),
+			Val: torchmpt.Val(valCopy[:]),
+		})
+	}
+	SortKeyVals(changes)
+
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	m.treeMu.Lock()
+	defer m.treeMu.Unlock()
+
+	for _, kv := range changes {
+		if err := m.tree.Set(kv.Key, kv.Val); err != nil {
+			return fmt.Errorf("tree.Set failed for key %x: %w", kv.Key, err)
 		}
 	}
 	m.exact.Store(false)
@@ -295,12 +430,33 @@ func (m *Manager) Snap(version int64) ([sha256.Size]byte, error) {
 	return m.currentRoot, nil
 }
 
-// Commit applies mutations to the MPT under the write lock and returns the new root hash.
+// CommitKeys applies variable-length key mutations to the MPT under the write lock and returns the new root hash.
+func (m *Manager) CommitKeys(mutations map[string][sha256.Size]byte) ([sha256.Size]byte, error) {
+	return m.CommitKeysWithVersion(mutations, -1)
+}
+
+// CommitKeysWithVersion applies variable-length key mutations, records the version watermark, and returns the new root hash.
+func (m *Manager) CommitKeysWithVersion(mutations map[string][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+
+	m.treeMu.Lock()
+	defer m.treeMu.Unlock()
+
+	return m.commitKeysLocked(mutations, version)
+}
+
+// CommitKeysWithVersionLocked applies variable-length key mutations without acquiring the lock (caller must hold m.Lock()).
+func (m *Manager) CommitKeysWithVersionLocked(mutations map[string][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
+	return m.commitKeysLocked(mutations, version)
+}
+
+// Commit applies fixed 32-byte key mutations to the MPT under the write lock and returns the new root hash.
 func (m *Manager) Commit(mutations map[[sha256.Size]byte][sha256.Size]byte) ([sha256.Size]byte, error) {
 	return m.CommitWithVersion(mutations, -1)
 }
 
-// CommitWithVersion applies mutations, records the version watermark, and returns the new root hash.
+// CommitWithVersion applies fixed 32-byte key mutations, records the version watermark, and returns the new root hash.
 func (m *Manager) CommitWithVersion(mutations map[[sha256.Size]byte][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
@@ -311,13 +467,21 @@ func (m *Manager) CommitWithVersion(mutations map[[sha256.Size]byte][sha256.Size
 	return m.commitLocked(mutations, version)
 }
 
-// CommitWithVersionLocked applies mutations without acquiring the lock (caller must hold m.Lock()).
+// CommitWithVersionLocked applies fixed 32-byte key mutations without acquiring the lock (caller must hold m.Lock()).
 func (m *Manager) CommitWithVersionLocked(mutations map[[sha256.Size]byte][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
 	return m.commitLocked(mutations, version)
 }
 
 // CommitKeyValsLocked applies sorted changes directly without acquiring the lock (caller must hold m.Lock()).
 func (m *Manager) CommitKeyValsLocked(changes []torchmpt.KeyVal, version int64) ([sha256.Size]byte, error) {
+	for i := range changes {
+		if err := validateMPTKeyLen(changes[i].Key); err != nil {
+			return [sha256.Size]byte{}, err
+		}
+		if err := validateMPTValLen(changes[i].Val); err != nil {
+			return [sha256.Size]byte{}, err
+		}
+	}
 	for _, kv := range changes {
 		if err := m.tree.Set(kv.Key, kv.Val); err != nil {
 			return [sha256.Size]byte{}, fmt.Errorf("tree.Set failed for key %x: %w", kv.Key, err)
@@ -333,47 +497,121 @@ func (m *Manager) CommitKeyValsLocked(changes []torchmpt.KeyVal, version int64) 
 	return m.currentRoot, nil
 }
 
-func (m *Manager) commitLocked(mutations map[[sha256.Size]byte][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
-	if len(mutations) > 0 {
-		keys := make([][sha256.Size]byte, 0, len(mutations))
-		for k := range mutations {
-			keys = append(keys, k)
+func (m *Manager) commitKeysLocked(mutations map[string][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
+	if len(mutations) == 0 {
+		return m.CommitKeyValsLocked(nil, version)
+	}
+	changes := make([]torchmpt.KeyVal, 0, len(mutations))
+	for k, v := range mutations {
+		if err := validateMPTKeyLen([]byte(k)); err != nil {
+			return [sha256.Size]byte{}, err
 		}
-		slices.SortFunc(keys, func(a, b [sha256.Size]byte) int {
-			return bytes.Compare(a[:], b[:])
+		valCopy := v
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key(k),
+			Val: torchmpt.Val(valCopy[:]),
 		})
-
-		for _, k := range keys {
-			v := mutations[k]
-			if err := m.tree.Set(torchmpt.Key(k), torchmpt.Val(v)); err != nil {
-				return [sha256.Size]byte{}, fmt.Errorf("tree.Set failed for key %x: %w", k, err)
-			}
-		}
 	}
-
-	snap, err := m.tree.Snap(version)
-	if err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("tree.Snap failed: %w", err)
-	}
-	m.currentRoot = [sha256.Size]byte(snap.Hash)
-	m.exact.Store(true)
-	return m.currentRoot, nil
+	SortKeyVals(changes)
+	return m.CommitKeyValsLocked(changes, version)
 }
 
-// Prove generates an inclusion or non-inclusion proof for the given keyHash.
-func (m *Manager) Prove(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error) {
+func (m *Manager) commitLocked(mutations map[[sha256.Size]byte][sha256.Size]byte, version int64) ([sha256.Size]byte, error) {
+	if len(mutations) == 0 {
+		return m.CommitKeyValsLocked(nil, version)
+	}
+	changes := make([]torchmpt.KeyVal, 0, len(mutations))
+	for k, v := range mutations {
+		valCopy := v
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key(keyHashToHexKey(k)),
+			Val: torchmpt.Val(valCopy[:]),
+		})
+	}
+	SortKeyVals(changes)
+	return m.CommitKeyValsLocked(changes, version)
+}
+
+// ProveKey generates an inclusion or non-inclusion proof for the given variable-length key.
+func (m *Manager) ProveKey(key []byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error) {
 	m.treeMu.RLock()
 	defer m.treeMu.RUnlock()
-	return m.ProveLocked(keyHash)
+	return m.ProveKeyLocked(key)
 }
 
-// ProveLocked generates an inclusion or non-inclusion proof without acquiring the lock (caller must hold m.RLock()).
-func (m *Manager) ProveLocked(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error) {
-	val, ok, p, err := m.tree.Prove(torchmpt.Key(keyHash))
+// ProveKeyLocked generates an inclusion or non-inclusion proof for key without acquiring the lock (caller must hold m.RLock()).
+func (m *Manager) ProveKeyLocked(key []byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error) {
+	if err := validateMPTKeyLen(key); err != nil {
+		return nil, [sha256.Size]byte{}, false, err
+	}
+	path, err := m.tree.Path(torchmpt.Key(key))
 	if err != nil {
 		return nil, [sha256.Size]byte{}, false, err
 	}
-	return []byte(p), [sha256.Size]byte(val), ok, nil
+	val, ok, p, err := torchmpt.ProveLookup(torchmpt.Key(key), path)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, false, err
+	}
+	var sr [sha256.Size]byte
+	if ok {
+		if len(val) != sha256.Size {
+			return nil, [sha256.Size]byte{}, false, fmt.Errorf("unexpected MPT value length %d, want %d", len(val), sha256.Size)
+		}
+		copy(sr[:], val)
+	}
+	return []byte(p), sr, ok, nil
+}
+
+// Prove generates an inclusion or non-inclusion proof for the given 32-byte keyHash (encoded as 64-byte lowercase hex).
+func (m *Manager) Prove(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error) {
+	return m.ProveKey(keyHashToHexKey(keyHash))
+}
+
+// ProveLocked generates an inclusion or non-inclusion proof for keyHash (encoded as 64-byte lowercase hex) without acquiring the lock (caller must hold m.RLock()).
+func (m *Manager) ProveLocked(keyHash [sha256.Size]byte) (proof []byte, subRoot [sha256.Size]byte, exists bool, err error) {
+	return m.ProveKeyLocked(keyHashToHexKey(keyHash))
+}
+
+// ProvePrefix generates a prefix subtree proof and scans all keys matching prefix up to maxKeys (if maxKeys > 0).
+func (m *Manager) ProvePrefix(prefix []byte, maxKeys int) (proof []byte, matches []PrefixKeyVal, err error) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	return m.ProvePrefixLocked(prefix, maxKeys)
+}
+
+// ProvePrefixLocked generates a prefix subtree proof and scans all matching keys without acquiring the lock (caller must hold m.RLock()).
+// If maxKeys > 0 and the number of matching keys exceeds maxKeys, iteration aborts immediately with ErrPrefixTooManyKeys.
+func (m *Manager) ProvePrefixLocked(prefix []byte, maxKeys int) (proof []byte, matches []PrefixKeyVal, err error) {
+	if err := validateMPTKeyLen(prefix); err != nil {
+		return nil, nil, err
+	}
+	path, err := m.tree.Path(torchmpt.Key(prefix))
+	if err != nil {
+		return nil, nil, err
+	}
+	_, p, err := torchmpt.ProvePrefix(prefix, path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for kv, scanErr := range m.tree.Scan(prefix) {
+		if scanErr != nil {
+			return nil, nil, scanErr
+		}
+		if maxKeys > 0 && len(matches) >= maxKeys {
+			return nil, nil, fmt.Errorf("%w: prefix %q exceeded limit of %d keys", ErrPrefixTooManyKeys, prefix, maxKeys)
+		}
+		if len(kv.Val) != sha256.Size {
+			return nil, nil, fmt.Errorf("unexpected MPT value length %d for key %q, want %d", len(kv.Val), kv.Key, sha256.Size)
+		}
+		var sr [sha256.Size]byte
+		copy(sr[:], kv.Val)
+		matches = append(matches, PrefixKeyVal{
+			Key:     string(kv.Key),
+			SubRoot: sr,
+		})
+	}
+	return []byte(p), matches, nil
 }
 
 // Version returns the version number of the MPT's last complete snapshot and whether it is exact.
@@ -438,8 +676,11 @@ func (m *Manager) Close() error {
 	return m.tree.Close()
 }
 
-// Verify verifies an inclusion or non-inclusion proof against an MPT root hash.
-func Verify(root [sha256.Size]byte, keyHash [sha256.Size]byte, valHash [sha256.Size]byte, exists bool, proof []byte) error {
+// VerifyKey verifies an inclusion or non-inclusion proof for a variable-length key against an MPT root hash.
+func VerifyKey(root [sha256.Size]byte, key []byte, valHash [sha256.Size]byte, exists bool, proof []byte) error {
+	if err := validateMPTKeyLen(key); err != nil {
+		return err
+	}
 	snap := torchmpt.Snapshot{
 		Hash:    torchmpt.Hash(root),
 		Version: -1,
@@ -448,5 +689,58 @@ func Verify(root [sha256.Size]byte, keyHash [sha256.Size]byte, valHash [sha256.S
 	if exists {
 		val = valHash[:]
 	}
-	return torchmpt.Verify(snap, keyHash[:], val, exists, torchmpt.Proof(proof))
+	return torchmpt.VerifyLookup(snap, key, val, exists, torchmpt.Proof(proof))
+}
+
+// Verify verifies an inclusion or non-inclusion proof for a 32-byte keyHash (encoded as 64-byte lowercase hex) against an MPT root hash.
+func Verify(root [sha256.Size]byte, keyHash [sha256.Size]byte, valHash [sha256.Size]byte, exists bool, proof []byte) error {
+	return VerifyKey(root, keyHashToHexKey(keyHash), valHash, exists, proof)
+}
+
+// VerifyPrefix verifies a prefix subtree proof and the completeness/soundness of matches against an MPT root hash.
+// It enforces the two-sided prefix verification invariant:
+//  1. prefix and every returned key must be valid NUL-free keys of length 1..1024.
+//  2. Every returned key k must satisfy mpt.Key(k).HasPrefix(prefix).
+//  3. Returned keys must be in strictly ascending mpt.Key.Compare order with no duplicates.
+//  4. The reconstructed subtree hash from matches must pass mpt.VerifyPrefix against root.
+func VerifyPrefix(root [sha256.Size]byte, prefix []byte, matches []PrefixKeyVal, proof []byte) error {
+	if err := validateMPTKeyLen(prefix); err != nil {
+		return err
+	}
+	if bytes.IndexByte(prefix, 0) != -1 {
+		return fmt.Errorf("%w: prefix contains NUL byte", ErrInvalidCanonicalKey)
+	}
+
+	kvs := make([]torchmpt.KeyVal, len(matches))
+	for i, m := range matches {
+		kBytes := []byte(m.Key)
+		if err := validateMPTKeyLen(kBytes); err != nil {
+			return fmt.Errorf("invalid key at index %d: %w", i, err)
+		}
+		if bytes.IndexByte(kBytes, 0) != -1 {
+			return fmt.Errorf("%w: key at index %d contains NUL byte", ErrInvalidCanonicalKey, i)
+		}
+		k := torchmpt.Key(kBytes)
+		if !k.HasPrefix(prefix) {
+			return fmt.Errorf("%w: key %q does not have prefix %q", torchmpt.ErrInvalidProof, m.Key, prefix)
+		}
+		if i > 0 {
+			prevKey := kvs[i-1].Key
+			if prevKey.Compare(k) >= 0 {
+				return fmt.Errorf("%w: keys not in strictly increasing order at index %d (%q >= %q)", torchmpt.ErrInvalidProof, i, prevKey, k)
+			}
+		}
+		valCopy := m.SubRoot
+		kvs[i] = torchmpt.KeyVal{
+			Key: k,
+			Val: torchmpt.Val(valCopy[:]),
+		}
+	}
+
+	subtreeHash := torchmpt.TreeHash(slices.Values(kvs))
+	snap := torchmpt.Snapshot{
+		Hash:    torchmpt.Hash(root),
+		Version: -1,
+	}
+	return torchmpt.VerifyPrefix(snap, prefix, subtreeHash, torchmpt.Proof(proof))
 }

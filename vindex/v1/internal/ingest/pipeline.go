@@ -17,6 +17,7 @@ package ingest
 import (
 	"container/heap"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"runtime"
 	"sync"
@@ -355,6 +356,24 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 
 				subLeaves := bundle.Leaves[startIdx-bundle.StartLeafIdx : endIdx-bundle.StartLeafIdx]
 				keyMap := make(map[[32]byte][]uint64, len(subLeaves))
+				var canonicalKeys map[[32]byte]string
+				recordEntry := func(e MappedEntry, leafIdx uint64) error {
+					kh := e.KeyHash
+					if e.Key != "" {
+						if err := ValidatePreimageKey([]byte(e.Key)); err != nil {
+							return fmt.Errorf("invalid canonical key on leaf %d: %w", leafIdx, err)
+						}
+						if kh == ([32]byte{}) {
+							kh = sha256.Sum256([]byte(e.Key))
+						}
+						if canonicalKeys == nil {
+							canonicalKeys = make(map[[32]byte]string, len(subLeaves))
+						}
+						canonicalKeys[kh] = e.Key
+					}
+					keyMap[kh] = append(keyMap[kh], leafIdx)
+					return nil
+				}
 				var mapErr error
 				var numLeavesMapped int
 				var totalKeysGenerated int
@@ -376,7 +395,14 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 							totalKeysGenerated += len(entries)
 
 							for _, e := range entries {
-								keyMap[e.KeyHash] = append(keyMap[e.KeyHash], leafIdx)
+								if err := recordEntry(e, leafIdx); err != nil {
+									metrics.MapErrorsTotal.WithLabelValues("HALT").Inc()
+									mapErr = err
+									break
+								}
+							}
+							if mapErr != nil {
+								break
 							}
 						}
 					}
@@ -402,15 +428,30 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 						if len(entries) > 1 {
 							seenInLeaf := make(map[[32]byte]bool, len(entries))
 							for _, e := range entries {
-								if !seenInLeaf[e.KeyHash] {
-									seenInLeaf[e.KeyHash] = true
-									keyMap[e.KeyHash] = append(keyMap[e.KeyHash], leafIdx)
+								kh := e.KeyHash
+								if e.Key != "" && kh == ([32]byte{}) {
+									kh = sha256.Sum256([]byte(e.Key))
+								}
+								if !seenInLeaf[kh] {
+									seenInLeaf[kh] = true
+									if err := recordEntry(e, leafIdx); err != nil {
+										metrics.MapErrorsTotal.WithLabelValues("HALT").Inc()
+										mapErr = err
+										break
+									}
 								}
 							}
 						} else {
 							for _, e := range entries {
-								keyMap[e.KeyHash] = append(keyMap[e.KeyHash], leafIdx)
+								if err := recordEntry(e, leafIdx); err != nil {
+									metrics.MapErrorsTotal.WithLabelValues("HALT").Inc()
+									mapErr = err
+									break
+								}
 							}
+						}
+						if mapErr != nil {
+							break
 						}
 					}
 				}
@@ -429,11 +470,12 @@ func (p *IngestionPipeline) StreamBatches(ctx context.Context, fromLeafIdx, targ
 				metrics.KeysMappedTotal.Add(float64(totalKeysGenerated))
 
 				batch := &MappedBatch{
-					BundleIdx:    bundle.BundleIdx,
-					StartLeafIdx: startIdx,
-					EndLeafIdx:   endIdx,
-					Count:        uint32(endIdx - startIdx),
-					KeyMap:       keyMap,
+					BundleIdx:     bundle.BundleIdx,
+					StartLeafIdx:  startIdx,
+					EndLeafIdx:    endIdx,
+					Count:         uint32(endIdx - startIdx),
+					KeyMap:        keyMap,
+					CanonicalKeys: canonicalKeys,
 				}
 				bundle.Release()
 

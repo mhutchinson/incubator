@@ -80,6 +80,7 @@ type IndexStore interface {
 
 // IndexResult contains the result of an indexing batch.
 type IndexResult struct {
-	NewKVSize        uint64
-	ModifiedSubRoots map[[sha256.Size]byte][sha256.Size]byte
+	NewKVSize           uint64
+	ModifiedSubRoots    map[[sha256.Size]byte][sha256.Size]byte
+	ModifiedKeySubRoots map[string][sha256.Size]byte
 }

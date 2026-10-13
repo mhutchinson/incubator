@@ -43,8 +43,23 @@ var (
 
 // MappedEntry represents a single search key and optional value produced by a LeafMapper.
 type MappedEntry struct {
+	Key     string
 	KeyHash [sha256.Size]byte
 	Value   []byte
+}
+
+// ValidatePreimageKey validates that a WASM-emitted preimage key satisfies the canonical
+// key invariants: 1 <= len <= 1024 and printable ASCII (0x21..0x7E, no NUL or whitespace).
+func ValidatePreimageKey(keyBytes []byte) error {
+	if len(keyBytes) == 0 || len(keyBytes) > 1024 {
+		return fmt.Errorf("%w: canonical key length %d out of range [1, 1024]", ErrMalformedOutput, len(keyBytes))
+	}
+	for i, b := range keyBytes {
+		if b < 0x21 || b > 0x7E {
+			return fmt.Errorf("%w: canonical key contains invalid byte 0x%02x at offset %d", ErrMalformedOutput, b, i)
+		}
+	}
+	return nil
 }
 
 // LeafMapper maps a raw Input Log leaf payload to a set of searchable MappedEntry records.
@@ -394,8 +409,14 @@ func decodeBundleOutputInto(resultsBuf [][]MappedEntry, entriesBuf []MappedEntry
 			}
 			keyBytes := outBuf[preimagesOffset : preimagesOffset+int(keyLen)]
 			preimagesOffset += int(keyLen)
+			if err := ValidatePreimageKey(keyBytes); err != nil {
+				return nil, nil, err
+			}
 
-			allEntries[curEntryIdx] = MappedEntry{KeyHash: sha256.Sum256(keyBytes)}
+			allEntries[curEntryIdx] = MappedEntry{
+				Key:     string(keyBytes),
+				KeyHash: sha256.Sum256(keyBytes),
+			}
 			curEntryIdx++
 		}
 
@@ -675,6 +696,7 @@ func cloneMappedEntries(entries []MappedEntry) []MappedEntry {
 	cloned := make([]MappedEntry, len(entries))
 	for i, e := range entries {
 		cloned[i] = MappedEntry{
+			Key:     e.Key,
 			KeyHash: e.KeyHash,
 			Value:   append([]byte(nil), e.Value...),
 		}

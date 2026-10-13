@@ -389,18 +389,18 @@ func TestSortKeyVals(t *testing.T) {
 			input := make([]torchmpt.KeyVal, sz)
 			for i := 0; i < sz; i++ {
 				h := sha256.Sum256([]byte(fmt.Sprintf("key_%d", (i*31+17)%1000000)))
-				input[i] = torchmpt.KeyVal{Key: torchmpt.Key(h)}
+				input[i] = torchmpt.KeyVal{Key: torchmpt.Key(h[:])}
 			}
 			expected := make([]torchmpt.KeyVal, sz)
 			copy(expected, input)
 			slices.SortFunc(expected, func(a, b torchmpt.KeyVal) int {
-				return bytes.Compare(a.Key[:], b.Key[:])
+				return a.Key.Compare(b.Key)
 			})
 
 			SortKeyVals(input)
 
 			for i := 0; i < sz; i++ {
-				if input[i].Key != expected[i].Key {
+				if !bytes.Equal(input[i].Key, expected[i].Key) {
 					t.Fatalf("mismatch at index %d: got %x, want %x", i, input[i].Key, expected[i].Key)
 				}
 			}
@@ -413,18 +413,18 @@ func TestSortKeyVals(t *testing.T) {
 		for i := 0; i < sz; i++ {
 			h := sha256.Sum256([]byte(fmt.Sprintf("prefix_key_%d", i)))
 			h[0] = 0x42 // force all into single bucket
-			input[i] = torchmpt.KeyVal{Key: torchmpt.Key(h)}
+			input[i] = torchmpt.KeyVal{Key: torchmpt.Key(h[:])}
 		}
 		expected := make([]torchmpt.KeyVal, sz)
 		copy(expected, input)
 		slices.SortFunc(expected, func(a, b torchmpt.KeyVal) int {
-			return bytes.Compare(a.Key[:], b.Key[:])
+			return a.Key.Compare(b.Key)
 		})
 
 		SortKeyVals(input)
 
 		for i := 0; i < sz; i++ {
-			if input[i].Key != expected[i].Key {
+			if !bytes.Equal(input[i].Key, expected[i].Key) {
 				t.Fatalf("mismatch at index %d: got %x, want %x", i, input[i].Key, expected[i].Key)
 			}
 		}
@@ -435,22 +435,144 @@ func TestSortKeyVals(t *testing.T) {
 		input := make([]torchmpt.KeyVal, sz)
 		for i := 0; i < sz; i++ {
 			h := sha256.Sum256([]byte(fmt.Sprintf("dup_key_%d", i%100)))
-			input[i] = torchmpt.KeyVal{Key: torchmpt.Key(h)}
+			input[i] = torchmpt.KeyVal{Key: torchmpt.Key(h[:])}
 		}
 		expected := make([]torchmpt.KeyVal, sz)
 		copy(expected, input)
 		slices.SortFunc(expected, func(a, b torchmpt.KeyVal) int {
-			return bytes.Compare(a.Key[:], b.Key[:])
+			return a.Key.Compare(b.Key)
 		})
 
 		SortKeyVals(input)
 
 		for i := 0; i < sz; i++ {
-			if input[i].Key != expected[i].Key {
+			if !bytes.Equal(input[i].Key, expected[i].Key) {
 				t.Fatalf("mismatch at index %d: got %x, want %x", i, input[i].Key, expected[i].Key)
 			}
 		}
 	})
+}
+
+func TestMPT_VariableLengthKeysAndPrefixProofs(t *testing.T) {
+	mgr := NewMem()
+
+	mutations := map[string][sha256.Size]byte{
+		"com.google.":      sha256.Sum256([]byte("val_apex")),
+		"com.google.*.":    sha256.Sum256([]byte("val_wildcard")),
+		"com.google.docs.": sha256.Sum256([]byte("val_docs")),
+		"com.google.mail.": sha256.Sum256([]byte("val_mail")),
+		"com.googleapis.":  sha256.Sum256([]byte("val_apis")),
+		"org.example.":     sha256.Sum256([]byte("val_example")),
+	}
+
+	for k := range mutations {
+		if err := ValidateCanonicalKey([]byte(k)); err != nil {
+			t.Fatalf("ValidateCanonicalKey(%q) failed: %v", k, err)
+		}
+	}
+
+	if err := ValidateCanonicalKey(nil); err == nil {
+		t.Fatal("expected error for empty canonical key")
+	}
+	if err := ValidateCanonicalKey([]byte("com.google.\x00")); err == nil {
+		t.Fatal("expected error for canonical key with NUL")
+	}
+	if err := ValidateCanonicalKey([]byte("com.google. ")); err == nil {
+		t.Fatal("expected error for canonical key with space")
+	}
+
+	predictedRoot, err := mgr.PredictKeys(mutations)
+	if err != nil {
+		t.Fatalf("PredictKeys failed: %v", err)
+	}
+
+	actualRoot, err := mgr.CommitKeys(mutations)
+	if err != nil {
+		t.Fatalf("CommitKeys failed: %v", err)
+	}
+	if actualRoot != predictedRoot {
+		t.Fatalf("PredictKeys / CommitKeys mismatch: %x != %x", predictedRoot, actualRoot)
+	}
+
+	// Point lookup proofs (including coexisting "com.google." and "com.google.mail.")
+	for k, wantVal := range mutations {
+		proof, gotVal, exists, err := mgr.ProveKey([]byte(k))
+		if err != nil {
+			t.Fatalf("ProveKey(%q) failed: %v", k, err)
+		}
+		if !exists || gotVal != wantVal {
+			t.Fatalf("ProveKey(%q) exists=%v, val=%x, want %x", k, exists, gotVal, wantVal)
+		}
+		if err := VerifyKey(actualRoot, []byte(k), gotVal, true, proof); err != nil {
+			t.Fatalf("VerifyKey(%q) failed: %v", k, err)
+		}
+	}
+
+	// Prefix proof for "com.google." (should match 4 keys in ascending order)
+	prefix := []byte("com.google.")
+	prefixProof, matches, err := mgr.ProvePrefix(prefix, 0)
+	if err != nil {
+		t.Fatalf("ProvePrefix failed: %v", err)
+	}
+	if len(matches) != 4 {
+		t.Fatalf("len(matches) = %d, want 4", len(matches))
+	}
+	if err := VerifyPrefix(actualRoot, prefix, matches, prefixProof); err != nil {
+		t.Fatalf("VerifyPrefix failed: %v", err)
+	}
+
+	// Adversarial check: omitting a key must fail VerifyPrefix
+	if err := VerifyPrefix(actualRoot, prefix, matches[:3], prefixProof); err == nil {
+		t.Fatal("expected VerifyPrefix to fail when omitting a matching key")
+	}
+
+	// MaxResults limit check
+	if _, _, err := mgr.ProvePrefix(prefix, 3); err == nil {
+		t.Fatal("expected ProvePrefix with maxResults=3 to fail with ErrPrefixTooManyKeys")
+	}
+
+	// Empty prefix match ("com.nonexistent.")
+	emptyPrefix := []byte("com.nonexistent.")
+	emptyProof, emptyMatches, err := mgr.ProvePrefix(emptyPrefix, 0)
+	if err != nil {
+		t.Fatalf("ProvePrefix(emptyPrefix) failed: %v", err)
+	}
+	if len(emptyMatches) != 0 {
+		t.Fatalf("len(emptyMatches) = %d, want 0", len(emptyMatches))
+	}
+	if err := VerifyPrefix(actualRoot, emptyPrefix, emptyMatches, emptyProof); err != nil {
+		t.Fatalf("VerifyPrefix(emptyPrefix) failed: %v", err)
+	}
+}
+
+func BenchmarkMPT_ProvePrefix(b *testing.B) {
+	mgr := NewMem()
+	mutations := make(map[string][sha256.Size]byte, 2000)
+	for i := 0; i < 2000; i++ {
+		var k string
+		if i < 50 {
+			k = fmt.Sprintf("com.google.sub%04d.", i)
+		} else {
+			k = fmt.Sprintf("org.other%04d.sub.", i)
+		}
+		mutations[k] = sha256.Sum256([]byte(k))
+	}
+	root, err := mgr.CommitKeys(mutations)
+	if err != nil {
+		b.Fatalf("CommitKeys failed: %v", err)
+	}
+	prefix := []byte("com.google.")
+
+	b.ResetTimer()
+	for b.Loop() {
+		proof, matches, err := mgr.ProvePrefix(prefix, 1000)
+		if err != nil {
+			b.Fatalf("ProvePrefix failed: %v", err)
+		}
+		if err := VerifyPrefix(root, prefix, matches, proof); err != nil {
+			b.Fatalf("VerifyPrefix failed: %v", err)
+		}
+	}
 }
 
 

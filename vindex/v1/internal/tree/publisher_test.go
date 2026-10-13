@@ -118,6 +118,39 @@ func TestPublisher_PublishBatch(t *testing.T) {
 	}
 }
 
+func TestPublisher_PublishKeyBatch(t *testing.T) {
+	ctx := context.Background()
+	mptMgr := NewMem()
+	outLog := newMockOutputLog("example.com/outputlog")
+	wit := &mockWitness{witnessName: "witness.alpha"}
+
+	pub := NewOutputPublisher(nil, mptMgr, outLog, wit)
+
+	key1 := "com.google.mail."
+	val1 := sha256.Sum256([]byte("val1"))
+	subRoots := map[string][32]byte{key1: val1}
+
+	rawInputCP := []byte("example.com/inputlog\n1000\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	inputCP := &log.Checkpoint{
+		Origin: "example.com/inputlog",
+		Size:   1000,
+		Hash:   make([]byte, 32),
+	}
+
+	state, err := pub.PublishKeyBatch(ctx, subRoots, inputCP, rawInputCP)
+	if err != nil {
+		t.Fatalf("PublishKeyBatch failed: %v", err)
+	}
+
+	proof, val, exists, err := mptMgr.ProveKey([]byte(key1))
+	if err != nil || !exists || val != val1 {
+		t.Fatalf("ProveKey(%q) failed: exists=%v, val=%x, err=%v", key1, exists, val, err)
+	}
+	if err := VerifyKey(state.MapRoot, []byte(key1), val, true, proof); err != nil {
+		t.Fatalf("VerifyKey(%q) failed: %v", key1, err)
+	}
+}
+
 type divergingOutputLog struct {
 	*mockOutputLog
 	mptMgr *Manager

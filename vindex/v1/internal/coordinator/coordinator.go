@@ -17,6 +17,7 @@ package coordinator
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -408,12 +409,18 @@ func (c *Coordinator) recoverGenesisBackfill(ctx context.Context) error {
 		defer c.replayActive.Store(false)
 
 		batchChan, errChan := c.pipeline.StreamBatches(ctx, replayStart, kvSize)
-		modifiedKeys := make(map[[sha256.Size]byte]struct{})
+		modifiedKeys := make(map[[sha256.Size]byte]string)
 		replayedLeaves := replayStart
 		lastReplayLog := replayStart
 		for batch := range batchChan {
 			for k := range batch.KeyMap {
-				modifiedKeys[k] = struct{}{}
+				ck := hex.EncodeToString(k[:])
+				if batch.CanonicalKeys != nil {
+					if name, ok := batch.CanonicalKeys[k]; ok && name != "" {
+						ck = name
+					}
+				}
+				modifiedKeys[k] = ck
 			}
 			replayedLeaves += uint64(batch.Count)
 			c.replayCurrent.Store(replayedLeaves)
@@ -428,18 +435,13 @@ func (c *Coordinator) recoverGenesisBackfill(ctx context.Context) error {
 		}
 
 		klog.Infof("Genesis replay extracting sub-roots for %d unique modified keys from Pebble (zero storage writes)...", len(modifiedKeys))
-		uniqueKeys := make([][sha256.Size]byte, 0, len(modifiedKeys))
-		for k := range modifiedKeys {
-			uniqueKeys = append(uniqueKeys, k)
-		}
-
-		mutations, err := c.indexer.GetSubRoots(ctx, uniqueKeys, kvSize)
+		mutations, err := c.indexer.GetKeySubRoots(ctx, modifiedKeys, kvSize)
 		if err != nil {
 			return fmt.Errorf("failed to extract sub-roots during genesis replay: %w", err)
 		}
 
 		klog.Infof("Genesis replay applying %d sub-root mutations to MPT...", len(mutations))
-		if err := c.mptMgr.SetBatch(mutations); err != nil {
+		if err := c.mptMgr.SetKeyBatch(mutations); err != nil {
 			return fmt.Errorf("failed to set batch in MPT during genesis replay: %w", err)
 		}
 
@@ -579,13 +581,19 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 			}
 		}
 
-		modifiedKeys := make(map[[sha256.Size]byte]struct{})
+		modifiedKeys := make(map[[sha256.Size]byte]string)
 
 		if c.pipeline != nil {
 			batchChan, errChan := c.pipeline.StreamBatches(ctx, replayStart, targetInputSize)
 			for batch := range batchChan {
 				for k := range batch.KeyMap {
-					modifiedKeys[k] = struct{}{}
+					ck := hex.EncodeToString(k[:])
+					if batch.CanonicalKeys != nil {
+						if name, ok := batch.CanonicalKeys[k]; ok && name != "" {
+							ck = name
+						}
+					}
+					modifiedKeys[k] = ck
 				}
 			}
 			if err := <-errChan; err != nil {
@@ -593,17 +601,13 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 			}
 		}
 
-		uniqueKeys := make([][sha256.Size]byte, 0, len(modifiedKeys))
-		for k := range modifiedKeys {
-			uniqueKeys = append(uniqueKeys, k)
-		}
-		mutations, err := c.indexer.GetSubRoots(ctx, uniqueKeys, targetInputSize)
+		mutations, err := c.indexer.GetKeySubRoots(ctx, modifiedKeys, targetInputSize)
 		if err != nil {
 			return fmt.Errorf("failed to get sub-roots during Phase 2 replay: %w", err)
 		}
 
 		// Commit mutations to MPT
-		actualRoot, err := c.mptMgr.CommitWithVersion(mutations, int64(targetInputSize))
+		actualRoot, err := c.mptMgr.CommitKeysWithVersion(mutations, int64(targetInputSize))
 		if err != nil {
 			return fmt.Errorf("mptMgr.CommitWithVersion failed during replay: %w", err)
 		}
@@ -699,7 +703,7 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		}
 	}
 
-	allModifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+	allModifiedSubRoots := make(map[string][sha256.Size]byte)
 	startTime := time.Now()
 	startProgressSize := startLogSize
 	lastLogSize := startLogSize
@@ -717,7 +721,7 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		}
 		metrics.KVCommittedSize.Set(float64(res.NewKVSize))
 		metrics.LeavesIndexedTotal.Add(float64(batch.Count))
-		for k, v := range res.ModifiedSubRoots {
+		for k, v := range res.ModifiedKeySubRoots {
 			allModifiedSubRoots[k] = v
 		}
 		metrics.IndexingLag.Set(float64(targetCP.Size - res.NewKVSize))
@@ -742,7 +746,7 @@ func (c *Coordinator) SyncOnce(ctx context.Context) error {
 		Size:   targetCP.Size,
 		Hash:   targetCP.Hash[:],
 	}
-	if _, err := c.pub.PublishBatch(ctx, allModifiedSubRoots, logCP, targetCP.Raw); err != nil {
+	if _, err := c.pub.PublishKeyBatch(ctx, allModifiedSubRoots, logCP, targetCP.Raw); err != nil {
 		return fmt.Errorf("publish error: %w", err)
 	}
 	metrics.IndexingLag.Set(0)
@@ -789,7 +793,7 @@ func (c *Coordinator) syncGenesisBackfill(ctx context.Context, targetCP *ingest.
 	c.setFetcherTreeState(targetCP.Size, targetCP.Hash)
 
 type backfillFlushJob struct {
-	keys      map[[sha256.Size]byte][sha256.Size]byte
+	keys      map[string][sha256.Size]byte
 	watermark uint64
 	doneChan  chan error
 }
@@ -816,8 +820,8 @@ type backfillFlushJob struct {
 			flushStart := time.Now()
 			klog.Infof("Genesis backfill background worker: flushing %d deduplicated keys to MPT at leaf %d...", len(job.keys), job.watermark)
 			if len(job.keys) > 0 {
-				if err := c.mptMgr.SetBatch(job.keys); err != nil {
-					job.doneChan <- fmt.Errorf("genesis background mpt.SetBatch error: %w", err)
+				if err := c.mptMgr.SetKeyBatch(job.keys); err != nil {
+					job.doneChan <- fmt.Errorf("genesis background mpt.SetKeyBatch error: %w", err)
 					backgroundWorkerErr = err
 					return
 				}
@@ -839,7 +843,7 @@ type backfillFlushJob struct {
 		}
 	}()
 
-	activeBuffer := make(map[[sha256.Size]byte][sha256.Size]byte)
+	activeBuffer := make(map[string][sha256.Size]byte)
 	var currentJob *backfillFlushJob
 	currentThreshold := min(uint64(5000000), maxPendingKeys)
 
@@ -884,7 +888,7 @@ type backfillFlushJob struct {
 			doneChan:  make(chan error, 1),
 		}
 		currentJob = job
-		activeBuffer = make(map[[sha256.Size]byte][sha256.Size]byte) // Swap to fresh active buffer (A/B double buffer)
+		activeBuffer = make(map[string][sha256.Size]byte) // Swap to fresh active buffer (A/B double buffer)
 		flushChan <- job
 
 		if currentThreshold < maxPendingKeys {
@@ -904,10 +908,11 @@ type backfillFlushJob struct {
 		metrics.LeavesIndexedTotal.Add(float64(batch.Count))
 		metrics.IndexingLag.Set(float64(targetCP.Size - res.NewKVSize))
 
-		for k, v := range res.ModifiedSubRoots {
+		for k, v := range res.ModifiedKeySubRoots {
 			activeBuffer[k] = v
 		}
-		res.ModifiedSubRoots = nil // Discard batch slice
+		res.ModifiedSubRoots = nil
+		res.ModifiedKeySubRoots = nil
 
 		flushNeeded := uint64(len(activeBuffer)) >= currentThreshold ||
 			(coarseInterval > 0 && res.NewKVSize < targetCP.Size && (res.NewKVSize-lastCheckpointLeaf) >= coarseInterval)
@@ -948,7 +953,7 @@ type backfillFlushJob struct {
 		if lastIndexedSize > lastCheckpointLeaf {
 			if err := c.db.Sync(); err == nil {
 				if len(activeBuffer) > 0 {
-					_ = c.mptMgr.SetBatch(activeBuffer)
+					_ = c.mptMgr.SetKeyBatch(activeBuffer)
 				}
 				if _, err := c.mptMgr.Snap(int64(lastIndexedSize)); err == nil {
 					if err := c.mptMgr.Sync(); err == nil {
@@ -963,14 +968,14 @@ type backfillFlushJob struct {
 	return c.finalizeGenesisBackfill(ctx, targetCP, activeBuffer)
 }
 
-func (c *Coordinator) finalizeGenesisBackfill(ctx context.Context, targetCP *ingest.Checkpoint, pendingSubRoots map[[sha256.Size]byte][sha256.Size]byte) error {
+func (c *Coordinator) finalizeGenesisBackfill(ctx context.Context, targetCP *ingest.Checkpoint, pendingSubRoots map[string][sha256.Size]byte) error {
 	if err := c.db.Sync(); err != nil {
 		return fmt.Errorf("genesis final db.Sync error: %w", err)
 	}
 	if len(pendingSubRoots) > 0 {
 		klog.Infof("Genesis backfill: applying final %d deduplicated keys to MPT at leaf %d...", len(pendingSubRoots), targetCP.Size)
-		if err := c.mptMgr.SetBatch(pendingSubRoots); err != nil {
-			return fmt.Errorf("genesis final mpt.SetBatch error: %w", err)
+		if err := c.mptMgr.SetKeyBatch(pendingSubRoots); err != nil {
+			return fmt.Errorf("genesis final mpt.SetKeyBatch error: %w", err)
 		}
 	}
 	finalRoot, err := c.mptMgr.Snap(int64(targetCP.Size))
@@ -991,7 +996,7 @@ func (c *Coordinator) finalizeGenesisBackfill(ctx context.Context, targetCP *ing
 		}
 		rawCP = targetCP.Raw
 	}
-	if _, err := c.pub.PublishBatch(ctx, nil, logCP, rawCP); err != nil {
+	if _, err := c.pub.PublishKeyBatch(ctx, nil, logCP, rawCP); err != nil {
 		return fmt.Errorf("genesis Leaf 0 publish error: %w", err)
 	}
 	metrics.IndexingLag.Set(0)

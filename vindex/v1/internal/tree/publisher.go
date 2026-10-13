@@ -65,8 +65,47 @@ func (p *OutputPublisher) SetServingState(state *ServingState) {
 	}
 }
 
-// PublishBatch publishes a batch of sub-root modifications to the Output Log and promotes the serving state.
+// PublishBatch publishes a batch of 32-byte keyHash sub-root modifications (encoded as 64-byte lowercase hex keys) to the Output Log and promotes the serving state.
 func (p *OutputPublisher) PublishBatch(ctx context.Context, modifiedSubRoots map[[sha256.Size]byte][sha256.Size]byte, inputLogCP *log.Checkpoint, rawInputLogCP []byte) (*ServingState, error) {
+	keys := make([]byte, len(modifiedSubRoots)*sha256.Size*2)
+	vals := make([]byte, len(modifiedSubRoots)*sha256.Size)
+	changes := make([]torchmpt.KeyVal, 0, len(modifiedSubRoots))
+	i := 0
+	for k, v := range modifiedSubRoots {
+		kb := keys[i*sha256.Size*2 : (i+1)*sha256.Size*2 : (i+1)*sha256.Size*2]
+		vb := vals[i*sha256.Size : (i+1)*sha256.Size : (i+1)*sha256.Size]
+		hex.Encode(kb, k[:])
+		copy(vb, v[:])
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key(kb),
+			Val: torchmpt.Val(vb),
+		})
+		i++
+	}
+	return p.publishKeyVals(ctx, changes, inputLogCP, rawInputLogCP)
+}
+
+// PublishKeyBatch publishes a batch of variable-length canonical key sub-root modifications to the Output Log and promotes the serving state.
+func (p *OutputPublisher) PublishKeyBatch(ctx context.Context, modifiedSubRoots map[string][sha256.Size]byte, inputLogCP *log.Checkpoint, rawInputLogCP []byte) (*ServingState, error) {
+	vals := make([]byte, len(modifiedSubRoots)*sha256.Size)
+	changes := make([]torchmpt.KeyVal, 0, len(modifiedSubRoots))
+	i := 0
+	for k, v := range modifiedSubRoots {
+		if err := ValidateCanonicalKey([]byte(k)); err != nil {
+			return nil, err
+		}
+		vb := vals[i*sha256.Size : (i+1)*sha256.Size : (i+1)*sha256.Size]
+		copy(vb, v[:])
+		changes = append(changes, torchmpt.KeyVal{
+			Key: torchmpt.Key([]byte(k)),
+			Val: torchmpt.Val(vb),
+		})
+		i++
+	}
+	return p.publishKeyVals(ctx, changes, inputLogCP, rawInputLogCP)
+}
+
+func (p *OutputPublisher) publishKeyVals(ctx context.Context, changes []torchmpt.KeyVal, inputLogCP *log.Checkpoint, rawInputLogCP []byte) (*ServingState, error) {
 	if inputLogCP == nil && len(rawInputLogCP) > 0 {
 		parsed, err := ParseCheckpointHeader(rawInputLogCP)
 		if err == nil {
@@ -78,13 +117,6 @@ func (p *OutputPublisher) PublishBatch(ctx context.Context, modifiedSubRoots map
 		inputLogSize = inputLogCP.Size
 	}
 
-	changes := make([]torchmpt.KeyVal, 0, len(modifiedSubRoots))
-	for k, v := range modifiedSubRoots {
-		changes = append(changes, torchmpt.KeyVal{
-			Key: torchmpt.Key(k),
-			Val: torchmpt.Val(v),
-		})
-	}
 	SortKeyVals(changes)
 
 	// 1. Lock-Free Phase: Predict MPT root

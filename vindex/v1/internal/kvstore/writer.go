@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"runtime"
 	"slices"
@@ -132,11 +133,32 @@ func (idx *KVIndexer) ModifiedSubRoots() map[[sha256.Size]byte][sha256.Size]byte
 	return idx.lastModifiedSubs
 }
 
+func canonicalKeyForHash(batch *ingest.MappedBatch, keyHash [sha256.Size]byte) string {
+	if batch != nil && batch.CanonicalKeys != nil {
+		if k, ok := batch.CanonicalKeys[keyHash]; ok && k != "" {
+			return k
+		}
+	}
+	return hex.EncodeToString(keyHash[:])
+}
+
+func buildModifiedKeySubRoots(batch *ingest.MappedBatch, modifiedSubRoots map[[sha256.Size]byte][sha256.Size]byte) map[string][sha256.Size]byte {
+	out := make(map[string][sha256.Size]byte, len(modifiedSubRoots))
+	for kh, sr := range modifiedSubRoots {
+		out[canonicalKeyForHash(batch, kh)] = sr
+	}
+	return out
+}
+
 // IndexBatch indexes a MappedBatch into Pebble inverted chunks and updates metadata in the same atomic Pebble batch.
 func (idx *KVIndexer) IndexBatch(ctx context.Context, batch *ingest.MappedBatch, targetCP *ingest.Checkpoint) (*IndexResult, error) {
 	if batch == nil {
 		kvSize, _ := idx.db.GetUint64(KeyMetaKVSize)
-		return &IndexResult{NewKVSize: kvSize, ModifiedSubRoots: make(map[[32]byte][32]byte)}, nil
+		return &IndexResult{
+			NewKVSize:           kvSize,
+			ModifiedSubRoots:    make(map[[32]byte][32]byte),
+			ModifiedKeySubRoots: make(map[string][32]byte),
+		}, nil
 	}
 
 	var rawCP []byte
@@ -152,7 +174,11 @@ func (idx *KVIndexer) IndexBatch(ctx context.Context, batch *ingest.MappedBatch,
 func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.MappedBatch, rawTargetCP []byte, targetSize uint64) (res *IndexResult, retErr error) {
 	if batch == nil {
 		kvSize, _ := idx.db.GetUint64(KeyMetaKVSize)
-		return &IndexResult{NewKVSize: kvSize, ModifiedSubRoots: make(map[[32]byte][32]byte)}, nil
+		return &IndexResult{
+			NewKVSize:           kvSize,
+			ModifiedSubRoots:    make(map[[32]byte][32]byte),
+			ModifiedKeySubRoots: make(map[string][32]byte),
+		}, nil
 	}
 
 	persistedKVSize, err := idx.db.GetUint64(KeyMetaKVSize)
@@ -213,8 +239,9 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 
 	idx.lastModifiedSubs = modifiedSubRoots
 	return &IndexResult{
-		NewKVSize:        newKVSize,
-		ModifiedSubRoots: modifiedSubRoots,
+		NewKVSize:           newKVSize,
+		ModifiedSubRoots:    modifiedSubRoots,
+		ModifiedKeySubRoots: buildModifiedKeySubRoots(batch, modifiedSubRoots),
 	}, nil
 }
 
@@ -224,7 +251,11 @@ func (idx *KVIndexer) IndexMappedBatch(ctx context.Context, batch *ingest.Mapped
 // stagedBatch and call ClearCache().
 func (idx *KVIndexer) StageMappedBatch(ctx context.Context, stagedBatch *pebble.Batch, persistedKVSize uint64, batch *ingest.MappedBatch, targetSize uint64) (res *IndexResult, retErr error) {
 	if batch == nil {
-		return &IndexResult{NewKVSize: persistedKVSize, ModifiedSubRoots: make(map[[32]byte][32]byte)}, nil
+		return &IndexResult{
+			NewKVSize:           persistedKVSize,
+			ModifiedSubRoots:    make(map[[32]byte][32]byte),
+			ModifiedKeySubRoots: make(map[string][32]byte),
+		}, nil
 	}
 	defer func() {
 		if retErr != nil {
@@ -249,8 +280,9 @@ func (idx *KVIndexer) StageMappedBatch(ctx context.Context, stagedBatch *pebble.
 
 	idx.lastModifiedSubs = modifiedSubRoots
 	return &IndexResult{
-		NewKVSize:        newKVSize,
-		ModifiedSubRoots: modifiedSubRoots,
+		NewKVSize:           newKVSize,
+		ModifiedSubRoots:    modifiedSubRoots,
+		ModifiedKeySubRoots: buildModifiedKeySubRoots(batch, modifiedSubRoots),
 	}, nil
 }
 
@@ -723,6 +755,31 @@ func (idx *KVIndexer) GetSubRoots(ctx context.Context, keys [][sha256.Size]byte,
 	res := make(map[[sha256.Size]byte][sha256.Size]byte, len(keys))
 	for _, r := range results {
 		res[r.key] = r.root
+	}
+	return res, nil
+}
+
+// GetKeySubRoots computes the Merkle sub-roots for a set of canonical keys (keyed by their SHA-256 keyHash)
+// up to maxInputLogSize in parallel, reusing Pebble iterators and performing zero storage writes.
+func (idx *KVIndexer) GetKeySubRoots(ctx context.Context, keys map[[sha256.Size]byte]string, maxInputLogSize uint64) (map[string][sha256.Size]byte, error) {
+	if len(keys) == 0 {
+		return make(map[string][sha256.Size]byte), nil
+	}
+	hashes := make([][sha256.Size]byte, 0, len(keys))
+	for kh := range keys {
+		hashes = append(hashes, kh)
+	}
+	hashSubRoots, err := idx.GetSubRoots(ctx, hashes, maxInputLogSize)
+	if err != nil {
+		return nil, err
+	}
+	res := make(map[string][sha256.Size]byte, len(hashSubRoots))
+	for kh, sr := range hashSubRoots {
+		ck := keys[kh]
+		if ck == "" {
+			ck = hex.EncodeToString(kh[:])
+		}
+		res[ck] = sr
 	}
 	return res, nil
 }

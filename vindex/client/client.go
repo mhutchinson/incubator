@@ -93,8 +93,8 @@ func VerifyLookupResponse(keyHash [sha256.Size]byte, resp api.LookupResponse, in
 		Version: int64(ilcp.Size),
 		Hash:    mapRoot,
 	}
-	if err := mpt.Verify(snap, keyHash[:], val, expectFound, resp.IndexProof); err != nil {
-		return nil, nil, fmt.Errorf("mpt.Verify(): %v", err)
+	if err := mpt.VerifyLookup(snap, keyHash[:], val, expectFound, resp.IndexProof); err != nil {
+		return nil, nil, fmt.Errorf("mpt.VerifyLookup(): %v", err)
 	}
 
 	return resp.IndexValue, inCp, nil

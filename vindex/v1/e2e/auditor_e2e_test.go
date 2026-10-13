@@ -148,7 +148,7 @@ func TestE2E_HonestSync(t *testing.T) {
 	}
 
 	mapper := vindex.FuncMapper(func(_ context.Context, leaf []byte) ([]vindex.MappedEntry, error) {
-		return []vindex.MappedEntry{{KeyHash: sha256.Sum256(leaf)}}, nil
+		return []vindex.MappedEntry{{Key: string(leaf), KeyHash: sha256.Sum256(leaf)}}, nil
 	})
 
 	// Start publisher engine
@@ -292,7 +292,7 @@ func TestE2E_TamperedRootDetection(t *testing.T) {
 	}
 
 	mapper := vindex.FuncMapper(func(_ context.Context, leaf []byte) ([]vindex.MappedEntry, error) {
-		return []vindex.MappedEntry{{KeyHash: sha256.Sum256(leaf)}}, nil
+		return []vindex.MappedEntry{{Key: string(leaf), KeyHash: sha256.Sum256(leaf)}}, nil
 	})
 
 	engine, err := vindex.New(vtc.config, mapper)
@@ -819,7 +819,7 @@ func TestE2E_SourcingInvariant_NoInputLogCheckpointCalls(t *testing.T) {
 	}
 
 	mapper := vindex.FuncMapper(func(_ context.Context, leaf []byte) ([]vindex.MappedEntry, error) {
-		return []vindex.MappedEntry{{KeyHash: sha256.Sum256(leaf)}}, nil
+		return []vindex.MappedEntry{{Key: string(leaf), KeyHash: sha256.Sum256(leaf)}}, nil
 	})
 
 	engine, err := vindex.New(vtc.config, mapper)
@@ -923,7 +923,7 @@ func TestE2E_CLI_EntryPoints(t *testing.T) {
 	}
 
 	mapper := vindex.FuncMapper(func(_ context.Context, leaf []byte) ([]vindex.MappedEntry, error) {
-		return []vindex.MappedEntry{{KeyHash: sha256.Sum256(leaf)}}, nil
+		return []vindex.MappedEntry{{Key: string(leaf), KeyHash: sha256.Sum256(leaf)}}, nil
 	})
 
 	engine, err := vindex.New(vtc.config, mapper)

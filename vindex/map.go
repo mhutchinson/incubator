@@ -540,7 +540,11 @@ func (b *VerifiableIndex) Lookup(ctx context.Context, key [sha256.Size]byte) (ap
 	result.OutputLogLeaf = data
 	result.OutputLogProof = proof
 
-	_, _, viProof, err := b.vindex.Prove(key)
+	path, err := b.vindex.Path(key[:])
+	if err != nil {
+		return result, fmt.Errorf("failed to get path from vindex: %v", err)
+	}
+	_, _, viProof, err := mpt.ProveLookup(key[:], path)
 	if err != nil {
 		return result, fmt.Errorf("failed to get inclusion proof from vindex: %v", err)
 	}
@@ -576,7 +580,7 @@ func (b *VerifiableIndex) Lookup(ctx context.Context, key [sha256.Size]byte) (ap
 		Version: int64(size),
 		Hash:    mapRoot,
 	}
-	if err := mpt.Verify(snap, key[:], val, expectFound, viProof); err != nil {
+	if err := mpt.VerifyLookup(snap, key[:], val, expectFound, viProof); err != nil {
 		return result, fmt.Errorf("failed to verify proof: %v", err)
 	}
 	result.IndexProof = viProof
@@ -725,7 +729,7 @@ func (b *VerifiableIndex) buildMap(ctx context.Context, updateIndex bool) error 
 				}
 			}
 
-			if err := b.vindex.Set(h, [sha256.Size]byte(sum.Sum(nil))); err != nil {
+			if err := b.vindex.Set(h[:], sum.Sum(nil)); err != nil {
 				return fmt.Errorf("Insert(): %s", err)
 			}
 		}

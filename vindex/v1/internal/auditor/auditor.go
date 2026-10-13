@@ -741,7 +741,7 @@ func (v *Verifier) verifyLeaf(ctx context.Context, leafIdx uint64, outCP *log.Ch
 		}
 	}()
 
-	allModifiedSubRoots := make(map[[sha256.Size]byte][sha256.Size]byte)
+	allModifiedSubRoots := make(map[string][sha256.Size]byte)
 	if targetInputSize > v.verifiedInputSize {
 		if stater, ok := v.inputFetcher.(interface{ SetTreeState(uint64, [32]byte) }); ok && len(inCP.Hash) == sha256.Size {
 			stater.SetTreeState(targetInputSize, [32]byte(inCP.Hash))
@@ -762,7 +762,7 @@ func (v *Verifier) verifyLeaf(ctx context.Context, leafIdx uint64, outCP *log.Ch
 				return fmt.Errorf("indexing error [%d, %d): %w", pendingBatch.StartLeafIdx, pendingBatch.EndLeafIdx, err)
 			}
 			stagedKVSize = res.NewKVSize
-			for k, subRoot := range res.ModifiedSubRoots {
+			for k, subRoot := range res.ModifiedKeySubRoots {
 				allModifiedSubRoots[k] = subRoot
 			}
 			pendingBatch = nil
@@ -784,6 +784,12 @@ func (v *Verifier) verifyLeaf(ctx context.Context, leafIdx uint64, outCP *log.Ch
 				for k, indices := range batch.KeyMap {
 					pendingBatch.KeyMap[k] = append([]uint64(nil), indices...)
 				}
+				if len(batch.CanonicalKeys) > 0 {
+					pendingBatch.CanonicalKeys = make(map[[32]byte]string, len(batch.CanonicalKeys))
+					for kh, ck := range batch.CanonicalKeys {
+						pendingBatch.CanonicalKeys[kh] = ck
+					}
+				}
 			} else {
 				pendingBatch.Merge(batch)
 			}
@@ -804,7 +810,7 @@ func (v *Verifier) verifyLeaf(ctx context.Context, leafIdx uint64, outCP *log.Ch
 	// 4. Predict local MPT root without mutating tree state
 	var localMapRoot [sha256.Size]byte
 	if targetInputSize > v.verifiedInputSize {
-		predRoot, err := v.mptMgr.Predict(allModifiedSubRoots)
+		predRoot, err := v.mptMgr.PredictKeys(allModifiedSubRoots)
 		if err != nil {
 			return fmt.Errorf("MPT predict failed at leaf %d: %w", leafIdx, err)
 		}
@@ -836,7 +842,7 @@ func (v *Verifier) verifyLeaf(ctx context.Context, leafIdx uint64, outCP *log.Ch
 	// so concurrent mirror readers never pair a stale ServingState with a mutated MPT (2.7.1).
 	v.mptMgr.Lock()
 	if targetInputSize > v.verifiedInputSize {
-		if _, err := v.mptMgr.CommitWithVersionLocked(allModifiedSubRoots, int64(targetInputSize)); err != nil {
+		if _, err := v.mptMgr.CommitKeysWithVersionLocked(allModifiedSubRoots, int64(targetInputSize)); err != nil {
 			v.mptMgr.Unlock()
 			return fmt.Errorf("MPT commit failed at leaf %d: %w", leafIdx, err)
 		}
