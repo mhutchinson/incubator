@@ -223,8 +223,10 @@ func TestReadServer_NonInclusionLookup(t *testing.T) {
 }
 
 func TestReadServer_InclusionLookupAndPagination(t *testing.T) {
-	srv, db, mptMgr, pub := setupTestServer(t, 0)
-	indexer := kvstore.NewKVIndexer(db, 0)
+	const chunkSize = 100
+	srv, db, mptMgr, pub := setupTestServer(t, chunkSize)
+	db.SetChunkSize(chunkSize)
+	indexer := kvstore.NewKVIndexer(db, chunkSize)
 
 	key := sha256.Sum256([]byte("searchable_domain.com"))
 	var indices []uint64

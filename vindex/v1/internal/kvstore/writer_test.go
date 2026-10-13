@@ -720,6 +720,106 @@ func TestKVIndexer_Uint16MaxChunkBoundary(t *testing.T) {
 	}
 }
 
+func TestKVIndexer_NoPhantomChunk0_SparseFirstSeen(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	idx := NewKVIndexer(db, ChunkSize)
+
+	key := sha256.Sum256([]byte("sparse_first_seen_chunk_5"))
+	firstLeaf := 5*ChunkSize + 42
+	batch := &ingest.MappedBatch{
+		StartLeafIdx: 5 * ChunkSize,
+		EndLeafIdx:   6 * ChunkSize,
+		Count:        uint32(ChunkSize),
+		KeyMap: map[[32]byte][]uint64{
+			key: {firstLeaf},
+		},
+	}
+
+	if _, err := idx.IndexBatch(ctx, batch, nil); err != nil {
+		t.Fatalf("IndexBatch failed: %v", err)
+	}
+
+	// Verify only 1 chunk record exists in Pebble for key (chunk 5, NOT phantom chunk 0).
+	prefix := EncodeChunkPrefix(key)
+	iter, err := db.NewIter(nil)
+	if err != nil {
+		t.Fatalf("NewIter failed: %v", err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	var chunksFound []uint64
+	for ok := iter.SeekPrefixGE(prefix); ok && bytes.HasPrefix(iter.Key(), prefix); ok = iter.Next() {
+		_, cNum, err := DecodeChunkKey(iter.Key())
+		if err != nil {
+			t.Fatalf("DecodeChunkKey failed: %v", err)
+		}
+		chunksFound = append(chunksFound, cNum)
+	}
+
+	if !slices.Equal(chunksFound, []uint64{5}) {
+		t.Fatalf("stored chunks for sparse key = %v, want [5] (no phantom chunk 0)", chunksFound)
+	}
+}
+
+func TestKVIndexer_GetSubRoot_MultiChunkO1Seek(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	const chunkSize = 64
+	db.SetChunkSize(chunkSize)
+	idx := NewKVIndexer(db, chunkSize)
+
+	key := sha256.Sum256([]byte("multichunk_o1_subroot"))
+	// Occurrences in chunks 1, 3, and 5 (skipping chunk 0, 2, 4)
+	indices := []uint64{
+		1*chunkSize + 10, 1*chunkSize + 20,
+		3*chunkSize + 5, 3*chunkSize + 15,
+		5*chunkSize + 30, 5*chunkSize + 40,
+	}
+	maxLogSize := uint64(6 * chunkSize)
+	batch := &ingest.MappedBatch{
+		StartLeafIdx: 0,
+		EndLeafIdx:   maxLogSize,
+		Count:        uint32(maxLogSize),
+		KeyMap: map[[32]byte][]uint64{
+			key: indices,
+		},
+	}
+	if _, err := idx.IndexBatch(ctx, batch, nil); err != nil {
+		t.Fatalf("IndexBatch failed: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		watermark uint64
+		wantSlice []uint64
+	}{
+		{name: "zero watermark", watermark: 0, wantSlice: nil},
+		{name: "before chunk 1", watermark: 1*chunkSize + 5, wantSlice: nil},
+		{name: "mid chunk 1", watermark: 1*chunkSize + 15, wantSlice: indices[:1]},
+		{name: "in empty chunk 2", watermark: 2*chunkSize + 10, wantSlice: indices[:2]},
+		{name: "in chunk 3 before first entry", watermark: 3*chunkSize + 2, wantSlice: indices[:2]},
+		{name: "mid chunk 3", watermark: 3*chunkSize + 10, wantSlice: indices[:3]},
+		{name: "in chunk 5 before first entry", watermark: 5*chunkSize + 10, wantSlice: indices[:4]},
+		{name: "mid chunk 5", watermark: 5*chunkSize + 35, wantSlice: indices[:5]},
+		{name: "full log", watermark: maxLogSize, wantSlice: indices},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := idx.GetSubRoot(key, tc.watermark)
+			if err != nil {
+				t.Fatalf("GetSubRoot(%d) failed: %v", tc.watermark, err)
+			}
+			want := EmptyRoot()
+			if len(tc.wantSlice) > 0 {
+				want = computeExpectedSubRoot(tc.wantSlice)
+			}
+			if got != want {
+				t.Fatalf("GetSubRoot(%d) = %x, want %x", tc.watermark, got, want)
+			}
+		})
+	}
+}
+
 func TestKVIndexer_AlreadyPersistedBatch(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -930,4 +1030,90 @@ func BenchmarkKVIndexer_IndexBatch_1000Keys(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkKVIndexer_SparseFirstSeen_Chunk1(b *testing.B) {
+	ctx := context.Background()
+	dir := b.TempDir()
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	idx := NewKVIndexer(db, ChunkSize)
+	const keysPerBatch = 1000
+	const targetSize = uint64(1 << 40)
+
+	b.ReportAllocs()
+	var batchNum uint64
+	for b.Loop() {
+		startLeaf := ChunkSize + batchNum*keysPerBatch
+		keyMap := make(map[[32]byte][]uint64, keysPerBatch)
+		for j := uint64(0); j < keysPerBatch; j++ {
+			var k [32]byte
+			binary.BigEndian.PutUint64(k[:8], batchNum)
+			binary.BigEndian.PutUint64(k[8:16], j)
+			keyMap[k] = []uint64{startLeaf + j}
+		}
+		batch := &ingest.MappedBatch{
+			BundleIdx:    batchNum,
+			StartLeafIdx: startLeaf,
+			EndLeafIdx:   startLeaf + keysPerBatch,
+			Count:        keysPerBatch,
+			KeyMap:       keyMap,
+		}
+		if _, err := idx.IndexMappedBatch(ctx, batch, nil, targetSize); err != nil {
+			b.Fatalf("IndexMappedBatch failed: %v", err)
+		}
+		batchNum++
+	}
+}
+
+func BenchmarkGetSubRoot_100Chunks(b *testing.B) {
+	ctx := context.Background()
+	dir := b.TempDir()
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const chunkSize = 64
+	db.SetChunkSize(chunkSize)
+	idx := NewKVIndexer(db, chunkSize)
+
+	key := sha256.Sum256([]byte("bench-subroot-100-chunks"))
+	const numChunks = 100
+	const entriesPerChunk = 50
+	indices := make([]uint64, 0, numChunks*entriesPerChunk)
+	for c := uint64(0); c < numChunks; c++ {
+		for j := uint64(0); j < entriesPerChunk; j++ {
+			indices = append(indices, c*chunkSize+j)
+		}
+	}
+	maxLogSize := uint64(numChunks * chunkSize)
+	batch := &ingest.MappedBatch{
+		StartLeafIdx: 0,
+		EndLeafIdx:   maxLogSize,
+		Count:        uint32(maxLogSize),
+		KeyMap: map[[32]byte][]uint64{
+			key: indices,
+		},
+	}
+	if _, err := idx.IndexMappedBatch(ctx, batch, nil, maxLogSize); err != nil {
+		b.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		sr, err := idx.GetSubRoot(key, maxLogSize)
+		if err != nil {
+			b.Fatalf("GetSubRoot failed: %v", err)
+		}
+		if sr == ([32]byte{}) {
+			b.Fatal("empty subroot")
+		}
+	}
+}
+
 

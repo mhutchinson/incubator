@@ -30,11 +30,12 @@ import (
 
 // DB wraps a Pebble database with VIndex conventions.
 type DB struct {
-	db        *pebble.DB
-	cache     *pebble.Cache
-	chunkSize uint64
-	closeMu   sync.Mutex
-	closed    bool
+	db              *pebble.DB
+	cache           *pebble.Cache
+	chunkSize       uint64
+	maxChunksPerReq int
+	closeMu         sync.Mutex
+	closed          bool
 }
 
 // SetChunkSize configures the chunk size for DB operations.
@@ -51,6 +52,22 @@ func (d *DB) ChunkSize() uint64 {
 		return ChunkSize
 	}
 	return d.chunkSize
+}
+
+// SetMaxChunksPerRequest configures the maximum number of non-empty chunks visited per Lookup request.
+func (d *DB) SetMaxChunksPerRequest(maxChunks int) {
+	if maxChunks <= 0 {
+		maxChunks = DefaultMaxChunksPerRequest
+	}
+	d.maxChunksPerReq = maxChunks
+}
+
+// MaxChunksPerRequest returns the maximum number of non-empty chunks visited per Lookup request.
+func (d *DB) MaxChunksPerRequest() int {
+	if d.maxChunksPerReq <= 0 {
+		return DefaultMaxChunksPerRequest
+	}
+	return d.maxChunksPerReq
 }
 
 var _ IndexStore = (*DB)(nil)

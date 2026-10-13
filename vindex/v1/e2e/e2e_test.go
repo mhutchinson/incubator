@@ -411,7 +411,7 @@ func TestTier1_BackwardPagination_MultiPageChaining(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	cluster := newTestCluster(t, ctx, 64, 16)
+	cluster := newTestCluster(t, ctx, 4, 16)
 
 	hotKey := sha256.Sum256([]byte("hot_topic"))
 	const totalLeaves = 12

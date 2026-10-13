@@ -199,8 +199,9 @@ func TestClient_PositiveInclusionAndNonInclusion(t *testing.T) {
 
 func TestClient_PaginationContinuation(t *testing.T) {
 	ctx := context.Background()
-	const chunkSize = kvstore.ChunkSize
-	srv, _, _, pub, idxer := setupTestEnvironment(t, chunkSize)
+	const chunkSize = 100
+	srv, db, _, pub, idxer := setupTestEnvironment(t, chunkSize)
+	db.SetChunkSize(chunkSize)
 
 	key := sha256.Sum256([]byte("paginated_key"))
 
@@ -521,8 +522,9 @@ func TestInputLogClient_Errors(t *testing.T) {
 
 func TestClient_LookupAll_ContinuationRootMismatch(t *testing.T) {
 	ctx := context.Background()
-	const chunkSize = kvstore.ChunkSize
-	srv, _, _, pub, idxer := setupTestEnvironment(t, chunkSize)
+	const chunkSize = 100
+	srv, db, _, pub, idxer := setupTestEnvironment(t, chunkSize)
+	db.SetChunkSize(chunkSize)
 
 	key := sha256.Sum256([]byte("mismatch_key"))
 	var indices []uint64

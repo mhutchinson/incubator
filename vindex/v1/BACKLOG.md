@@ -44,12 +44,12 @@ It is organized into three categories:
     Continuation pages never need the MPT or Output Log, and a mid-log mini-log root cannot match the tip `MapRoot`. Returning MPT/Output Log proofs on `before != nil` wastes lock acquisitions, trie traversal CPU, and wire bandwidth.
   - **Resolution**: Adopted **Option B** via the two-endpoint protocol in [`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md) (`GET /vindex/v1/keys/{key...}` for MPT proofs vs. `GET /vindex/v1/entries/{key...}?before=X` for zero-MPT Pebble pagination).
 
-- [ ] **1.1.2 Chunk-Aligned Paging (Eliminating Dynamic Read-Path Merkle Hashing)**
+- [x] **1.1.2 Chunk-Aligned Paging (Eliminating Dynamic Read-Path Merkle Hashing)**
   - **Affected Components**: [`internal/kvstore`](internal/kvstore/README.md), [`internal/server`](internal/server/README.md)
   - **Current Behavior**: When an inverted chunk (`^chunkNum`) contains more matching indices than the requested `limit`, `internal/kvstore/reader.go` splits the chunk and loops over `rec.RelativeIndices[:splitIdx]`, computing on-the-fly SHA-256 leaf and interior node hashes (`cr.Append(LeafHash(b[:]))`) to synthesize a mid-chunk `prefix-compact-range-v1`. For a hot chunk with 5,000 occurrences and `limit=100`, the server performs 4,900 SHA-256 computations per HTTP request.
   - **Proposed Refinement**: Treat the client's `limit` parameter as an advisory hint and align page boundaries to whole inverted chunks. Each stored chunk already contains precomputed `rec.CompactHashes` and `rec.CoveredSize` committing to all prior chunks. Returning whole chunks allows `CompactHashes` and `CoveredSize` to be copied in O(1) time with **zero dynamic SHA-256 hashing on the read path** (worst-case 65,536 `uint16` offsets is ~100 KB gzipped).
 
-- [ ] **1.1.3 Bounded Chunk Visitation for Sparse Keys (`maxChunksPerRequest` P99 Guardrail)**
+- [x] **1.1.3 Bounded Chunk Visitation for Sparse Keys (`maxChunksPerRequest` P99 Guardrail)**
   - **Affected Components**: [`internal/kvstore`](internal/kvstore/README.md), [`internal/server`](internal/server/README.md)
   - **Current Behavior**: `DB.Lookup` seeks to `maxChunkNum` and iterates backwards until `totalMatched == limit` or the key prefix is exhausted.
   - **Problem**: If a key appears once every 65,536 leaves across a 1B-leaf log (~15,000 chunks) and a client requests `limit=1000`, a single HTTP request executes 1,000 random SSTable seeks and unmarshals across cold disk levels, spiking P99 latency.
@@ -171,17 +171,17 @@ It is organized into three categories:
 
 ### 2.3 Inverted Storage Engine (`internal/kvstore/`)
 
-- [ ] **2.3.1 Phantom Empty Chunk 0 Written for Every Key First Seen at `leafIdx >= 65536`**
+- [x] **2.3.1 Phantom Empty Chunk 0 Written for Every Key First Seen at `leafIdx >= 65536`**
   - **Location**: [`internal/kvstore/writer.go:484-504`](internal/kvstore/writer.go#L484-L504) (`KVIndexer.processKey`)
   - **Bug**: When a key is not present in cache or Pebble, `currChunkNum` is initialized to `0` with an empty `ChunkRecord`. Immediately afterward in the `for _, leafIdx := range unpersisted` loop (`writer.go:496-504`), if `targetChunkNum > currChunkNum` (`leafIdx >= 65536`), it marshals and writes an empty chunk `0` record (`'c' + keyHash + ^uint64(0)`) to Pebble before setting `currChunkNum = targetChunkNum`. This doubles the KV record count for every sparse key first appearing after leaf 65,535.
   - **Fix**: When initializing a brand-new key (`!iter.SeekPrefixGE`), initialize `currChunkNum = unpersisted[0] / idx.chunkSize` (or skip sealing `rec` when `len(rec.RelativeIndices) == 0`).
 
-- [ ] **2.3.2 Prefix Bloom Filter Bypassed on `DB.Lookup` via `SeekGE`**
+- [x] **2.3.2 Prefix Bloom Filter Bypassed on `DB.Lookup` via `SeekGE`**
   - **Location**: [`internal/kvstore/reader.go:102`](internal/kvstore/reader.go#L102) (`DB.Lookup`)
   - **Bug**: `DB.Lookup` calls `iter.SeekGE(seekKey)`. Because Pebble is configured with a 33-byte prefix split (`'c' + KeyHash` in `store.go:77-82`), Pebble constructs *prefix* Bloom filters, which are only consulted on `SeekPrefixGE`. Calling `SeekGE` bypasses the Bloom filter on every point lookup and forces SSTable disk reads for non-existent keys.
   - **Fix**: Replace `iter.SeekGE(seekKey)` with `iter.SeekPrefixGE(seekKey)` (or `iter.SeekPrefixGE(prefix)` followed by positioning at `seekKey` within the prefix).
 
-- [ ] **2.3.3 `GetSubRoot` Scans All Historical Chunks and Re-Hashes from Leaf 0 in O(N)**
+- [x] **2.3.3 `GetSubRoot` Scans All Historical Chunks and Re-Hashes from Leaf 0 in O(N)**
   - **Location**: [`internal/kvstore/writer.go:545-605`](internal/kvstore/writer.go#L545-L605) (`KVIndexer.getSubRootWithIter`)
   - **Bug**: `getSubRootWithIter` iterates over and unmarshals *every* historical chunk for `keyHash`, calls `slices.Reverse(chunks)` (`writer.go:568`) to order them from chunk 0 ascending, and loops from chunk 0 forward. Because chunk 0 populates `cr.CoveredSize > 0` via `cr.Append`, `if cr.CoveredSize == 0 && len(rec.CompactHashes) > 0` (`writer.go:581`) is false for all subsequent chunks. All precomputed `CompactHashes` are ignored, and 100% of historical occurrences are read and re-hashed from leaf 0.
   - **Fix**: Seek directly to the newest chunk with `cNum * idx.chunkSize < maxInputLogSize` using inverted key ordering, seed `cr` with that single chunk's `rec.CoveredSize` and `rec.CompactHashes`, and append only the entries in that chunk with `absIdx < maxInputLogSize` in O(1) chunk reads (matching `DB.Lookup` in [`reader.go:93-170`](internal/kvstore/reader.go#L93-L170)).

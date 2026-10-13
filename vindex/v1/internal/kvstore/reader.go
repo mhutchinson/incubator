@@ -17,7 +17,6 @@ package kvstore
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
 	"slices"
 )
@@ -37,7 +36,8 @@ func (d *DB) ReadChunk(keyHash [sha256.Size]byte, chunkNum uint64) (*ChunkRecord
 // ActiveChunk retrieves the newest (active) ChunkRecord for a given keyHash.
 // Returns chunkNum, record, exists, error.
 func (d *DB) ActiveChunk(keyHash [sha256.Size]byte) (uint64, *ChunkRecord, bool, error) {
-	prefix := EncodeChunkPrefix(keyHash)
+	var prefixBuf [33]byte
+	prefix := EncodeChunkPrefixInto(&prefixBuf, keyHash)
 	iter, err := d.NewIter(nil)
 	if err != nil {
 		return 0, nil, false, fmt.Errorf("failed to create iterator: %w", err)
@@ -64,15 +64,15 @@ func (d *DB) ActiveChunk(keyHash [sha256.Size]byte) (uint64, *ChunkRecord, bool,
 // Lookup retrieves matching leaf indices and prefix compact ranges for keyHash up to before.
 //
 // Optimization rationale:
-// Previously: Scanned all historical chunks in Pebble for keyHash, reversed them into memory,
-// allocated allIndices for every historical occurrence, and re-hashed all prefix indices
-// from scratch via cr.Append(LeafHash(idx)) on every query. For high-frequency keys with
-// thousands of matches, this caused severe latency spikes and multi-megabyte allocations.
-//
-// Now: Exploits inverted chunk key ordering (^chunkNum) to seek directly to the newest
-// chunk <= upperBound and iterate backwards. Stops reading as soon as 'limit' entries are
-// satisfied. Leverages rec.CompactHashes and rec.CoveredSize stored on the oldest contributing
-// chunk to commit to all prior chunks in O(1), hashing only the leftover entries in that single chunk.
+// 1. Prefix Bloom Filters (SeekPrefixGE): Exploits Pebble's 33-byte prefix split ('c' + KeyHash)
+//    and inverted chunk key ordering (^chunkNum) via SeekPrefixGE to prune absent keys in O(1)
+//    and seek directly to the newest chunk <= upperBound.
+// 2. Chunk-Aligned Paging: Treats 'limit' as an advisory hint and aligns page boundaries to whole
+//    inverted chunks. Every stored chunk already contains precomputed rec.CompactHashes and
+//    rec.CoveredSize committing to all prior chunks, so prefix compact ranges are copied in O(1)
+//    with zero dynamic SHA-256 hashing on the read path.
+// 3. Bounded Chunk Visitation: Halts once totalMatched >= limit OR chunksVisited >= maxChunksPerRequest
+//    (DefaultMaxChunksPerRequest = 16) to bound worst-case SSTable seeks on sparse keys.
 func (d *DB) Lookup(keyHash [sha256.Size]byte, before *uint64, limit uint64, maxInputLogSize uint64) (*LookupResult, error) {
 	if limit == 0 {
 		limit = 100
@@ -88,10 +88,11 @@ func (d *DB) Lookup(keyHash [sha256.Size]byte, before *uint64, limit uint64, max
 		return &LookupResult{}, nil
 	}
 
-	prefix := EncodeChunkPrefix(keyHash)
 	chunkSize := d.ChunkSize()
 	maxChunkNum := (upperBound - 1) / chunkSize
-	seekKey := EncodeChunkKey(keyHash, maxChunkNum)
+	var seekKey [41]byte
+	EncodeChunkKeyInto(&seekKey, keyHash, maxChunkNum)
+	prefix := seekKey[:33]
 
 	iter, err := d.NewIter(nil)
 	if err != nil {
@@ -99,12 +100,14 @@ func (d *DB) Lookup(keyHash [sha256.Size]byte, before *uint64, limit uint64, max
 	}
 	defer func() { _ = iter.Close() }()
 
-	if !iter.SeekGE(seekKey) || !bytes.HasPrefix(iter.Key(), prefix) {
+	if !iter.SeekPrefixGE(seekKey[:]) || !bytes.HasPrefix(iter.Key(), prefix) {
 		return &LookupResult{}, nil
 	}
 
+	maxChunks := d.MaxChunksPerRequest()
 	var matchedSlices [][]uint64
 	var totalMatched int
+	var chunksVisited int
 	var prefixCoveredSz uint64
 	var prefixHashes [][sha256.Size]byte
 	var nextBefore *uint64
@@ -141,44 +144,15 @@ func (d *DB) Lookup(keyHash [sha256.Size]byte, before *uint64, limit uint64, max
 			continue
 		}
 
-		needed := int(limit) - totalMatched
-		if validCount > needed {
-			// This chunk satisfies all remaining needed matches with leftover prefix entries.
-			splitIdx := validCount - needed
-			chunkMatches := make([]uint64, needed)
-			for i, rel := range rec.RelativeIndices[splitIdx:validCount] {
-				chunkMatches[i] = chunkBase + uint64(rel)
-			}
-			matchedSlices = append(matchedSlices, chunkMatches)
-			totalMatched += needed
-
-			// Build prefix compact range from rec.CompactHashes + leftover entries in this chunk.
-			cr := &CompactRange{
-				CoveredSize: rec.CoveredSize,
-				Hashes:      slices.Clone(rec.CompactHashes),
-			}
-			for _, rel := range rec.RelativeIndices[:splitIdx] {
-				var b [8]byte
-				binary.BigEndian.PutUint64(b[:], chunkBase+uint64(rel))
-				cr.Append(LeafHash(b[:]))
-			}
-			prefixCoveredSz = cr.CoveredSize
-			prefixHashes = cr.Hashes
-			firstMatch := chunkMatches[0]
-			nextBefore = &firstMatch
-			break
-		}
-
-		// validCount <= needed: take all valid entries from this chunk.
 		chunkMatches := make([]uint64, validCount)
 		for i, rel := range rec.RelativeIndices[:validCount] {
 			chunkMatches[i] = chunkBase + uint64(rel)
 		}
 		matchedSlices = append(matchedSlices, chunkMatches)
 		totalMatched += validCount
+		chunksVisited++
 
-		if totalMatched == int(limit) {
-			// Exactly reached the limit on a chunk boundary.
+		if totalMatched >= int(limit) || chunksVisited >= maxChunks {
 			if rec.CoveredSize > 0 {
 				prefixCoveredSz = rec.CoveredSize
 				prefixHashes = slices.Clone(rec.CompactHashes)
@@ -193,11 +167,15 @@ func (d *DB) Lookup(keyHash [sha256.Size]byte, before *uint64, limit uint64, max
 		return &LookupResult{}, nil
 	}
 
-	// Reconstruct matchedIndices in ascending order.
-	// matchedSlices was collected newest-first, so assemble in reverse order.
-	allMatched := make([]uint64, 0, totalMatched)
-	for i := len(matchedSlices) - 1; i >= 0; i-- {
-		allMatched = append(allMatched, matchedSlices[i]...)
+	var allMatched []uint64
+	if len(matchedSlices) == 1 {
+		allMatched = matchedSlices[0]
+	} else {
+		// matchedSlices was collected newest-first, so assemble in reverse order.
+		allMatched = make([]uint64, 0, totalMatched)
+		for i := len(matchedSlices) - 1; i >= 0; i-- {
+			allMatched = append(allMatched, matchedSlices[i]...)
+		}
 	}
 
 	if nextBefore != nil {

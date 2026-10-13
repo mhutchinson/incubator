@@ -482,7 +482,7 @@ func (idx *KVIndexer) processKey(
 				runningRange.Append(LeafHash(b[:]))
 			}
 		} else {
-			currChunkNum = 0
+			currChunkNum = unpersisted[0] / idx.chunkSize
 			rec = &ChunkRecord{
 				CoveredSize:     0,
 				CompactHashes:   nil,
@@ -495,12 +495,14 @@ func (idx *KVIndexer) processKey(
 	for _, leafIdx := range unpersisted {
 		targetChunkNum := leafIdx / idx.chunkSize
 		if targetChunkNum > currChunkNum {
-			start := len(marshalBuf)
-			marshalBuf = AppendChunkValue(marshalBuf, rec)
-			sealedVal := marshalBuf[start:]
-			var sealedKey [41]byte
-			EncodeChunkKeyInto(&sealedKey, keyHash, currChunkNum)
-			*writes = append(*writes, chunkMutation{key: sealedKey, val: sealedVal})
+			if len(rec.RelativeIndices) > 0 {
+				start := len(marshalBuf)
+				marshalBuf = AppendChunkValue(marshalBuf, rec)
+				sealedVal := marshalBuf[start:]
+				var sealedKey [41]byte
+				EncodeChunkKeyInto(&sealedKey, keyHash, currChunkNum)
+				*writes = append(*writes, chunkMutation{key: sealedKey, val: sealedVal})
+			}
 
 			currChunkNum = targetChunkNum
 			rec = &ChunkRecord{
@@ -543,65 +545,55 @@ func (idx *KVIndexer) GetSubRoot(keyHash [sha256.Size]byte, maxInputLogSize uint
 }
 
 func (idx *KVIndexer) getSubRootWithIter(iter *pebble.Iterator, keyHash [sha256.Size]byte, maxInputLogSize uint64) ([sha256.Size]byte, error) {
-	prefix := EncodeChunkPrefix(keyHash)
-	if !iter.SeekPrefixGE(prefix) || !bytes.HasPrefix(iter.Key(), prefix) {
+	if maxInputLogSize == 0 {
 		return EmptyRoot(), nil
 	}
 
-	type chunkEntry struct {
-		chunkNum uint64
-		rec      *ChunkRecord
+	maxChunkNum := (maxInputLogSize - 1) / idx.chunkSize
+	var seekKey [41]byte
+	EncodeChunkKeyInto(&seekKey, keyHash, maxChunkNum)
+	prefix := seekKey[:33]
+
+	if !iter.SeekPrefixGE(seekKey[:]) || !bytes.HasPrefix(iter.Key(), prefix) {
+		return EmptyRoot(), nil
 	}
-	var chunks []chunkEntry
+
 	for ; iter.Valid() && bytes.HasPrefix(iter.Key(), prefix); iter.Next() {
-		_, chunkNum, err := DecodeChunkKey(iter.Key())
+		_, cNum, err := DecodeChunkKey(iter.Key())
 		if err != nil {
 			return [sha256.Size]byte{}, err
 		}
+		if cNum*idx.chunkSize >= maxInputLogSize {
+			continue
+		}
+
 		rec, err := UnmarshalChunkValue(iter.Value())
 		if err != nil {
 			return [sha256.Size]byte{}, err
 		}
-		chunks = append(chunks, chunkEntry{chunkNum: chunkNum, rec: rec})
-	}
 
-	slices.Reverse(chunks)
-
-	cr := NewCompactRange()
-	hasEntries := false
-
-	for _, ce := range chunks {
-		cNum := ce.chunkNum
-		rec := ce.rec
-
-		if cNum*idx.chunkSize >= maxInputLogSize {
-			break
+		cr := &CompactRange{
+			CoveredSize: rec.CoveredSize,
+			Hashes:      slices.Clone(rec.CompactHashes),
 		}
-
-		if cr.CoveredSize == 0 && len(rec.CompactHashes) > 0 {
-			cr.CoveredSize = rec.CoveredSize
-			cr.Hashes = slices.Clone(rec.CompactHashes)
-			if cr.CoveredSize > 0 {
-				hasEntries = true
-			}
-		}
-
+		chunkBase := cNum * idx.chunkSize
 		for _, rel := range rec.RelativeIndices {
-			absIdx := cNum*idx.chunkSize + uint64(rel)
-			if absIdx < maxInputLogSize {
-				var b [8]byte
-				binary.BigEndian.PutUint64(b[:], absIdx)
-				cr.Append(LeafHash(b[:]))
-				hasEntries = true
+			absIdx := chunkBase + uint64(rel)
+			if absIdx >= maxInputLogSize {
+				break
 			}
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], absIdx)
+			cr.Append(LeafHash(b[:]))
 		}
+
+		if cr.CoveredSize == 0 {
+			return EmptyRoot(), nil
+		}
+		return cr.Root(), nil
 	}
 
-	if !hasEntries {
-		return EmptyRoot(), nil
-	}
-
-	return cr.Root(), nil
+	return EmptyRoot(), nil
 }
 
 // GetSubRoots computes the Merkle sub-roots for a set of keys up to maxInputLogSize in parallel,

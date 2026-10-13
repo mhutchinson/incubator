@@ -89,51 +89,151 @@ func TestLookup_SingleChunk_ReversePagination(t *testing.T) {
 		t.Fatalf("Lookup(before=nil) PrefixCoveredSz = %d, want 0", resAll.PrefixCoveredSz)
 	}
 
-	// 2. Query Page 1 (Tip, limit = 3) -> should return latest 3 entries: [100, 250, 500]
-	// prefix compact range should cover [10, 25, 50]
+	// 2. Query with advisory limit = 3 (< 6 entries in Chunk 0).
+	// With chunk-aligned paging (1.1.2), limit is an advisory hint and whole chunks
+	// are returned without mid-chunk splitting or dynamic read-path SHA-256 hashing.
 	resTip, err := db.Lookup(keyHash, nil, 3, 1000)
 	if err != nil {
 		t.Fatalf("Lookup(before=nil, limit=3) failed: %v", err)
 	}
-	wantTipMatched := []uint64{100, 250, 500}
-	if !slices.Equal(resTip.MatchedIndices, wantTipMatched) {
-		t.Fatalf("Lookup(before=nil, limit=3) MatchedIndices = %v, want %v", resTip.MatchedIndices, wantTipMatched)
+	if !slices.Equal(resTip.MatchedIndices, indices) {
+		t.Fatalf("Lookup(before=nil, limit=3) MatchedIndices = %v, want full chunk %v", resTip.MatchedIndices, indices)
 	}
-	if resTip.NextBefore == nil || *resTip.NextBefore != 100 {
-		t.Fatalf("Lookup(before=nil, limit=3) NextBefore = %v, want 100", resTip.NextBefore)
+	if resTip.NextBefore != nil {
+		t.Fatalf("Lookup(before=nil, limit=3) NextBefore = %v, want nil", resTip.NextBefore)
 	}
-	if resTip.PrefixCoveredSz != 3 {
-		t.Fatalf("Lookup(before=nil, limit=3) PrefixCoveredSz = %d, want 3", resTip.PrefixCoveredSz)
+	if resTip.PrefixCoveredSz != 0 {
+		t.Fatalf("Lookup(before=nil, limit=3) PrefixCoveredSz = %d, want 0", resTip.PrefixCoveredSz)
+	}
+}
+
+func TestLookup_ChunkAlignedPaging_MultiChunk(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db_chunk_aligned")
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	const customChunkSize = 100
+	db.SetChunkSize(customChunkSize)
+	indexer := NewKVIndexer(db, customChunkSize)
+	keyHash := sha256.Sum256([]byte("chunk_aligned_key"))
+
+	// Chunk 0: [10, 20, 30]
+	// Chunk 1: [110, 120, 130, 140, 150]
+	indices := []uint64{10, 20, 30, 110, 120, 130, 140, 150}
+	batch := &ingest.MappedBatch{
+		KeyMap: map[[32]byte][]uint64{
+			keyHash: indices,
+		},
+	}
+	if _, err := indexer.IndexMappedBatch(ctx, batch, nil, 200); err != nil {
+		t.Fatalf("IndexMappedBatch failed: %v", err)
 	}
 
-	// Verify prefix compact range matches the hash of [10, 25, 50]
+	// Request limit = 2: Chunk 1 has 5 entries (> 2), so the whole Chunk 1 is returned
+	// with Chunk 1's precomputed CompactHashes covering Chunk 0 (3 entries).
+	page1, err := db.Lookup(keyHash, nil, 2, 200)
+	if err != nil {
+		t.Fatalf("Page 1 Lookup failed: %v", err)
+	}
+	wantPage1 := []uint64{110, 120, 130, 140, 150}
+	if !slices.Equal(page1.MatchedIndices, wantPage1) {
+		t.Fatalf("Page 1 MatchedIndices = %v, want %v", page1.MatchedIndices, wantPage1)
+	}
+	if page1.NextBefore == nil || *page1.NextBefore != 110 {
+		t.Fatalf("Page 1 NextBefore = %v, want 110", page1.NextBefore)
+	}
+	if page1.PrefixCoveredSz != 3 {
+		t.Fatalf("Page 1 PrefixCoveredSz = %d, want 3", page1.PrefixCoveredSz)
+	}
 	expectedPrefixRoot := BatchRoot([][]byte{
 		binary.BigEndian.AppendUint64(nil, 10),
-		binary.BigEndian.AppendUint64(nil, 25),
-		binary.BigEndian.AppendUint64(nil, 50),
+		binary.BigEndian.AppendUint64(nil, 20),
+		binary.BigEndian.AppendUint64(nil, 30),
 	})
-	cr := &CompactRange{
-		CoveredSize: resTip.PrefixCoveredSz,
-		Hashes:      resTip.PrefixHashes,
-	}
+	cr := &CompactRange{CoveredSize: page1.PrefixCoveredSz, Hashes: page1.PrefixHashes}
 	if cr.Root() != expectedPrefixRoot {
-		t.Fatalf("Lookup(before=nil, limit=3) Prefix compact range root mismatch: got %x, want %x", cr.Root(), expectedPrefixRoot)
+		t.Fatalf("Page 1 prefix root = %x, want %x", cr.Root(), expectedPrefixRoot)
 	}
 
-	// 3. Query Page 2 (before = 100, limit = 3) -> returns [10, 25, 50], NextBefore = nil
-	resPage2, err := db.Lookup(keyHash, resTip.NextBefore, 3, 1000)
+	// Page 2 (before = 110): returns Chunk 0 [10, 20, 30], NextBefore = nil
+	page2, err := db.Lookup(keyHash, page1.NextBefore, 2, 200)
 	if err != nil {
-		t.Fatalf("Lookup(before=100, limit=3) failed: %v", err)
+		t.Fatalf("Page 2 Lookup failed: %v", err)
 	}
-	wantPage2Matched := []uint64{10, 25, 50}
-	if !slices.Equal(resPage2.MatchedIndices, wantPage2Matched) {
-		t.Fatalf("Lookup(before=100, limit=3) MatchedIndices = %v, want %v", resPage2.MatchedIndices, wantPage2Matched)
+	wantPage2 := []uint64{10, 20, 30}
+	if !slices.Equal(page2.MatchedIndices, wantPage2) {
+		t.Fatalf("Page 2 MatchedIndices = %v, want %v", page2.MatchedIndices, wantPage2)
 	}
-	if resPage2.NextBefore != nil {
-		t.Fatalf("Lookup(before=100, limit=3) NextBefore = %v, want nil", resPage2.NextBefore)
+	if page2.NextBefore != nil {
+		t.Fatalf("Page 2 NextBefore = %v, want nil", page2.NextBefore)
 	}
-	if resPage2.PrefixCoveredSz != 0 {
-		t.Fatalf("Lookup(before=100, limit=3) PrefixCoveredSz = %d, want 0", resPage2.PrefixCoveredSz)
+	if page2.PrefixCoveredSz != 0 {
+		t.Fatalf("Page 2 PrefixCoveredSz = %d, want 0", page2.PrefixCoveredSz)
+	}
+}
+
+func TestLookup_MaxChunksPerRequest_BoundedSparseKeys(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "db_max_chunks")
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	const customChunkSize = 64
+	db.SetChunkSize(customChunkSize)
+	db.SetMaxChunksPerRequest(4)
+	if db.MaxChunksPerRequest() != 4 {
+		t.Fatalf("MaxChunksPerRequest = %d, want 4", db.MaxChunksPerRequest())
+	}
+
+	indexer := NewKVIndexer(db, customChunkSize)
+	keyHash := sha256.Sum256([]byte("sparse_bounded_key"))
+
+	// 10 chunks, 1 entry per chunk
+	var wantAll []uint64
+	for c := uint64(0); c < 10; c++ {
+		wantAll = append(wantAll, c*customChunkSize+7)
+	}
+	maxLogSize := uint64(10 * customChunkSize)
+	batch := &ingest.MappedBatch{
+		KeyMap: map[[32]byte][]uint64{
+			keyHash: wantAll,
+		},
+	}
+	if _, err := indexer.IndexMappedBatch(ctx, batch, nil, maxLogSize); err != nil {
+		t.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	// Request limit = 100, but MaxChunksPerRequest = 4 caps each page to 4 chunks (4 entries).
+	var collected []uint64
+	var before *uint64
+	pages := 0
+	for {
+		pages++
+		res, err := db.Lookup(keyHash, before, 100, maxLogSize)
+		if err != nil {
+			t.Fatalf("page %d Lookup failed: %v", pages, err)
+		}
+		if len(res.MatchedIndices) > 4 {
+			t.Fatalf("page %d returned %d entries, exceeding maxChunksPerRequest=4", pages, len(res.MatchedIndices))
+		}
+		collected = append(slices.Clone(res.MatchedIndices), collected...)
+		if res.NextBefore == nil {
+			break
+		}
+		before = res.NextBefore
+	}
+	if pages != 3 {
+		t.Fatalf("expected 3 pages (4 + 4 + 2 chunks), got %d", pages)
+	}
+	if !slices.Equal(collected, wantAll) {
+		t.Fatalf("collected = %v, want %v", collected, wantAll)
 	}
 }
 
@@ -348,10 +448,146 @@ func BenchmarkLookup_MultiChunk(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Lookup failed: %v", err)
 		}
-		if len(res.MatchedIndices) != 100 {
-			b.Fatalf("expected 100 matches, got %d", len(res.MatchedIndices))
+		if len(res.MatchedIndices) == 0 {
+			b.Fatalf("expected non-empty matches, got 0")
 		}
 	}
 }
+
+func BenchmarkLookup_AbsentKey_FlushedSSTables(b *testing.B) {
+	ctx := context.Background()
+	dir := filepath.Join(b.TempDir(), "db_bloom_bench")
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	indexer := NewKVIndexer(db, ChunkSize)
+	const numFlushes = 6
+	const keysPerFlush = 2000
+
+	for f := 0; f < numFlushes; f++ {
+		keyMap := make(map[[32]byte][]uint64, keysPerFlush)
+		startLeaf := uint64(f * keysPerFlush)
+		for i := 0; i < keysPerFlush; i++ {
+			var k [32]byte
+			binary.BigEndian.PutUint64(k[:8], uint64(i*2)) // even keys only
+			binary.BigEndian.PutUint64(k[8:16], uint64(f))
+			keyMap[k] = []uint64{startLeaf + uint64(i)}
+		}
+		batch := &ingest.MappedBatch{
+			StartLeafIdx: startLeaf,
+			EndLeafIdx:   startLeaf + keysPerFlush,
+			Count:        keysPerFlush,
+			KeyMap:       keyMap,
+		}
+		if _, err := indexer.IndexMappedBatch(ctx, batch, nil, startLeaf+keysPerFlush); err != nil {
+			b.Fatalf("IndexMappedBatch failed: %v", err)
+		}
+		if err := db.Sync(); err != nil {
+			b.Fatalf("Sync failed: %v", err)
+		}
+	}
+
+	absentKeys := make([][32]byte, 1024)
+	for i := range absentKeys {
+		binary.BigEndian.PutUint64(absentKeys[i][:8], uint64(i*2+1)) // odd keys fall between even keys across all SSTables
+	}
+	maxLogSize := uint64(numFlushes * keysPerFlush)
+
+	b.ReportAllocs()
+	var idx int
+	for b.Loop() {
+		res, err := db.Lookup(absentKeys[idx&1023], nil, 100, maxLogSize)
+		if err != nil {
+			b.Fatalf("Lookup failed: %v", err)
+		}
+		if len(res.MatchedIndices) != 0 {
+			b.Fatalf("expected 0 matches, got %d", len(res.MatchedIndices))
+		}
+		idx++
+	}
+}
+
+func BenchmarkLookup_HotChunk_ChunkAligned(b *testing.B) {
+	ctx := context.Background()
+	dir := filepath.Join(b.TempDir(), "db_hot_chunk_bench")
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	indexer := NewKVIndexer(db, ChunkSize)
+	keyHash := sha256.Sum256([]byte("bench_hot_chunk_5000"))
+
+	const entriesInChunk = 5000
+	indices := make([]uint64, entriesInChunk)
+	for i := range indices {
+		indices[i] = uint64(i * 10)
+	}
+	batch := &ingest.MappedBatch{
+		KeyMap: map[[32]byte][]uint64{
+			keyHash: indices,
+		},
+	}
+	if _, err := indexer.IndexMappedBatch(ctx, batch, nil, ChunkSize); err != nil {
+		b.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		res, err := db.Lookup(keyHash, nil, 100, ChunkSize)
+		if err != nil {
+			b.Fatalf("Lookup failed: %v", err)
+		}
+		if len(res.MatchedIndices) == 0 {
+			b.Fatal("expected matches")
+		}
+	}
+}
+
+func BenchmarkLookup_SparseManyChunks_Bounded(b *testing.B) {
+	ctx := context.Background()
+	dir := filepath.Join(b.TempDir(), "db_sparse_chunks_bench")
+	db, err := Open(dir, &pebble.Options{})
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const chunkSize = 64
+	db.SetChunkSize(chunkSize)
+	indexer := NewKVIndexer(db, chunkSize)
+
+	keyHash := sha256.Sum256([]byte("bench_sparse_500_chunks"))
+	const numChunks = 500
+	indices := make([]uint64, numChunks)
+	for c := 0; c < numChunks; c++ {
+		indices[c] = uint64(c*chunkSize + 1)
+	}
+	maxLogSize := uint64(numChunks * chunkSize)
+	batch := &ingest.MappedBatch{
+		KeyMap: map[[32]byte][]uint64{
+			keyHash: indices,
+		},
+	}
+	if _, err := indexer.IndexMappedBatch(ctx, batch, nil, maxLogSize); err != nil {
+		b.Fatalf("IndexMappedBatch failed: %v", err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		res, err := db.Lookup(keyHash, nil, 1000, maxLogSize)
+		if err != nil {
+			b.Fatalf("Lookup failed: %v", err)
+		}
+		if len(res.MatchedIndices) == 0 {
+			b.Fatal("expected matches")
+		}
+	}
+}
+
 
 

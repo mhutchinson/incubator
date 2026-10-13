@@ -24,6 +24,10 @@ const (
 	// ChunkSize is the logical capacity of a single chunk (65536 entries).
 	ChunkSize uint64 = 65536
 
+	// DefaultMaxChunksPerRequest bounds the number of non-empty inverted chunks
+	// visited in a single Lookup call to prevent P99 latency spikes on sparse keys.
+	DefaultMaxChunksPerRequest = 16
+
 	// PrefixChunkByte identifies KV Chunk records.
 	PrefixChunkByte byte = 'c'
 
