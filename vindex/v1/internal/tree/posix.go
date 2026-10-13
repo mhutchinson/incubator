@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,6 +87,43 @@ func WithWitnessGroup(wg tessera.WitnessGroup, opts *tessera.WitnessOptions) POS
 		c.witnessGroup = &wg
 		c.witnessOpts = opts
 	}
+}
+
+// WithDefaultWitnessGroup configures mandatory (fail-closed) witness cosigning for published checkpoints.
+func WithDefaultWitnessGroup(wg tessera.WitnessGroup) POSIXOption {
+	return WithWitnessGroup(wg, &tessera.WitnessOptions{FailOpen: false})
+}
+
+// BuildWitnessGroup constructs a tessera.WitnessGroup requiring cosignatures from all configured witnesses.
+func BuildWitnessGroup(urls, pubKeys []string) (tessera.WitnessGroup, error) {
+	if len(urls) != len(pubKeys) {
+		return tessera.WitnessGroup{}, fmt.Errorf("witness URLs count (%d) does not match witness pubkeys count (%d)", len(urls), len(pubKeys))
+	}
+	if len(urls) == 0 {
+		return tessera.WitnessGroup{}, nil
+	}
+	var wg tessera.WitnessGroup
+	for i := range urls {
+		rawURL := strings.TrimSpace(urls[i])
+		pubKey := strings.TrimSpace(pubKeys[i])
+		if rawURL == "" || pubKey == "" {
+			return tessera.WitnessGroup{}, fmt.Errorf("witness URL and pubkey at index %d must not be empty", i)
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return tessera.WitnessGroup{}, fmt.Errorf("invalid witness URL %q at index %d: %w", rawURL, i, err)
+		}
+		w, err := tessera.NewWitness(pubKey, u)
+		if err != nil {
+			return tessera.WitnessGroup{}, fmt.Errorf("invalid witness at index %d: %w", i, err)
+		}
+		if i == 0 {
+			wg = tessera.NewWitnessGroup(1, w)
+		} else {
+			wg = tessera.NewWitnessGroup(2, wg, w)
+		}
+	}
+	return wg, nil
 }
 
 // POSIXOutputLog wraps a Tessera POSIX-backed tile log for appending and serving output log commitments.

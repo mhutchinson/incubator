@@ -55,7 +55,7 @@ It is organized into three categories:
   - **Problem**: If a key appears once every 65,536 leaves across a 1B-leaf log (~15,000 chunks) and a client requests `limit=1000`, a single HTTP request executes 1,000 random SSTable seeks and unmarshals across cold disk levels, spiking P99 latency.
   - **Proposed Refinement**: Enforce a dual termination condition in the Pebble reader loop: `totalMatched >= limitHint` **OR** `chunksVisited >= maxChunksPerRequest` (e.g., 8–16 chunks). Because compact ranges authenticate arbitrarily small pages, halting early and returning the oldest visited chunk's `CompactHashes` with `next_before` bounds worst-case server I/O per HTTP request while preserving 100% verifiability.
 
-- [ ] **1.1.4 Decoupled & Asynchronous Serving Startup (`vindexd`)**
+- [x] **1.1.4 Decoupled & Asynchronous Serving Startup (`vindexd`)**
   - **Affected Components**: [`cmd/vindexd`](cmd/vindexd/main.go), [`internal/coordinator`](internal/coordinator/README.md), [`internal/server`](internal/server/README.md)
   - **Current Behavior**: `vindexd/main.go` synchronously blocks on `tree.Open(*mptDir)` before binding `:8080`, causing `/healthz`, `/readyz`, and `/checkpoint` to fail with `Connection refused` during large MPT journal replays.
   - **Proposed Refinement**: Bind `:8080` and start the HTTP server immediately so `/healthz` returns `200 OK` and `/readyz` + `/vindex/v1/lookup/*` return `503 Service Unavailable` (`Retry-After: 30`, `"status": "mpt_initializing"`) while `tree.Open()` and `coord.Recover(ctx)` run asynchronously in the background.
@@ -190,7 +190,7 @@ It is organized into three categories:
 
 ### 2.4 State Commitment (MPT & Publisher) (`internal/tree/`)
 
-- [ ] **2.4.1 Missing MPT Disk `Persist()` (`tree.Sync()`) in `PublishBatch` and `Phase2` & Premature `PersistedSize()`**
+- [x] **2.4.1 Missing MPT Disk `Persist()` (`tree.Sync()`) in `PublishBatch` and `Phase2` & Premature `PersistedSize()`**
   - **Location**: [`internal/tree/publisher.go:138-170`](internal/tree/publisher.go#L138-L170) (`OutputPublisher.PublishBatch`), [`internal/coordinator/coordinator.go:471`](internal/coordinator/coordinator.go#L471) (`Coordinator.Phase2`), [`internal/tree/mpt.go:70, 302-315, 368-389`](internal/tree/mpt.go#L70) (`Manager`)
   - **Bug**:
     1. Neither `PublishBatch` nor `Coordinator.Phase2` ever calls `mptMgr.Persist()` (`m.tree.Sync()`), so dirty MPT `mmap` pages are never explicitly `fsync`-ed to disk during normal serving or after Phase 2 recovery.
@@ -198,7 +198,7 @@ It is organized into three categories:
     3. `tree.Open` (`mpt.go:70`) immediately calls `tree.Snap(-1)` on startup and `PersistedVersion()` (`mpt.go:370`) discards the `exact` boolean from `m.tree.Version()`, erasing dirty-crash detection (`exact == false`).
   - **Fix**: Track a dedicated `durableSize atomic.Uint64` on `tree.Manager` that only advances after `m.tree.Sync()` completes; trigger `mptMgr.Persist()` after `PublishBatch` and `Phase2`; and inspect `m.tree.Version()` `(version, exact)` in `tree.Open` *before* calling `Snap(-1)`.
 
-- [ ] **2.4.2 Unwired Witness Client in `cmd/vindexd` and `vindex.New`**
+- [x] **2.4.2 Unwired Witness Client in `cmd/vindexd` and `vindex.New`**
   - **Location**: [`vindex.go:65-66, 197, 213`](vindex.go#L65-L66), [`cmd/vindexd/main.go:267, 273`](cmd/vindexd/main.go#L267)
   - **Bug**: `vindex.Config` defines `WitnessURLs` and `WitnessPubKeys`, but `vindex.New` ignores them and passes `nil` to `tree.NewOutputPublisher(db, mptMgr, outLog, nil)`. `cmd/vindexd/main.go` has no witness flags and also passes `nil`.
   - **Fix**: Wire witness configuration flags and pass configured `tessera.WitnessGroup` / `WitnessClient` to `NewPOSIXOutputLog` / `NewOutputPublisher`.
@@ -207,7 +207,7 @@ It is organized into three categories:
 
 ### 2.5 Coordinator & Top-Level Wiring (`internal/coordinator/`, `vindex.go`, `cmd/vindexd/`)
 
-- [ ] **2.5.1 Phase 3 Recovery Advances `m_kv_size` Without Updating MPT/Output Log, Causing Duplicate Replay in `SyncOnce`**
+- [x] **2.5.1 Phase 3 Recovery Advances `m_kv_size` Without Updating MPT/Output Log, Causing Duplicate Replay in `SyncOnce`**
   - **Location**: [`internal/coordinator/coordinator.go:236-238, 512-580`](internal/coordinator/coordinator.go#L512-L580) (`Coordinator.Phase3`), [`coordinator.go:613-680`](internal/coordinator/coordinator.go#L613-L680) (`Coordinator.SyncOnce`), [`cmd/vindexd/main.go:355-381`](cmd/vindexd/main.go#L355-L381)
   - **Bug**:
     1. `cmd/vindexd/main.go:357` starts the HTTP Read Server *before* `coord.Recover(ctx)` (`main.go:378`).
@@ -215,7 +215,7 @@ It is organized into three categories:
     3. When `SyncOnce` runs next (`coordinator.go:614`), `startLogSize` is still `ServingState.InputLogSize` (`<= old kvSize < targetCP.Size`), forcing `SyncOnce` to re-stream and re-map the entire `[ServingState.InputLogSize, targetCP.Size)` range a second time.
   - **Fix**: Remove the redundant `Phase3` KV-only streaming loop (letting `SyncOnce` handle catch-up from `ServingState.InputLogSize` in a single pass after `Phase1`/`Phase2`), and open the Read Server after `Phase1`/`Phase2` completes.
 
-- [ ] **2.5.2 Genesis Backfill Non-Durable `pebble.NoSync` Watermark Writes & Unupdated `lastCheckpointLeaf` on Cancellation**
+- [x] **2.5.2 Genesis Backfill Non-Durable `pebble.NoSync` Watermark Writes & Unupdated `lastCheckpointLeaf` on Cancellation**
   - **Location**: [`internal/coordinator/coordinator.go:750-782, 813-893`](internal/coordinator/coordinator.go#L750-L782) (`Coordinator.syncGenesisBackfill`), [`internal/kvstore/writer.go:336-352`](internal/kvstore/writer.go#L336-L352) (`IndexMappedBatchWithOptions`), [`cmd/vindexd/main.go:86, 368-370`](cmd/vindexd/main.go#L86)
   - **Bug**:
     1. During Genesis Backfill, `IndexMappedBatchWithOptions` writes `m_kv_size` inside `batch.Set` (`writer.go:336`) *before* the chunk-writing loop (`writer.go:341-351`) and commits every batch with `pebble.NoSync`, while `c.db.Sync()` (`d.db.Flush()`) is deferred to the asynchronous background flush worker. If the process crashes between `c.db.Sync()` calls, un-flushed memtable writes for `m_kv_size` and chunks are lost; furthermore, while the background worker runs `c.db.Sync()`, the foreground goroutine concurrently commits subsequent `pebble.NoSync` batches into the same memtable being flushed.
@@ -223,12 +223,12 @@ It is organized into three categories:
     3. In `cmd/vindexd/main.go:86, 368`, `--backfill_max_pending_keys` defaults to `50000000`, so `if *backfillMaxPendingKeys > 0` is always true and unconditionally overwrites `resBudget.GenesisKeyBufferSize`.
   - **Fix**: Execute `c.db.Sync()` synchronously in `dispatchFlush` *before* handing the buffer off to the background MPT worker, guard `isFlagPassed("backfill_max_pending_keys")` in `main.go`, and update `lastCheckpointLeaf` after `workerWg.Wait()`.
 
-- [ ] **2.5.3 Decentralized `TileReaper` Polling Instead of Coordinator-Governed Pruning**
+- [x] **2.5.3 Decentralized `TileReaper` Polling Instead of Coordinator-Governed Pruning**
   - **Location**: [`internal/coordinator/coordinator.go:144-151`](internal/coordinator/coordinator.go#L144-L151) (`Coordinator.SafeWatermark`), [`internal/ingest/reaper.go:40-133`](internal/ingest/reaper.go#L40-L133), [`cmd/vindexd/main.go:384-388`](cmd/vindexd/main.go#L384-L388), [`vindex.go:264, 337-343`](vindex.go#L264)
   - **Bug**: `Coordinator.SafeWatermark` has zero callers; `TileReaper` runs on an independent 60s ticker reading `m_kv_size` and `mptMgr.PersistedSize()` directly.
   - **Fix**: Have `Coordinator` govern `SafeWatermark` (or ensure `TileReaper` only reads the fsync-durable MPT watermark).
 
-- [ ] **2.5.4 Top-Level `vindex.go` Duplicate Pipeline & Ephemeral `memoryOutputLog` Fallback**
+- [x] **2.5.4 Top-Level `vindex.go` Duplicate Pipeline & Ephemeral `memoryOutputLog` Fallback**
   - **Location**: [`vindex.go:204-210, 240-258`](vindex.go#L204-L210) (`vindex.New`)
   - **Bug**:
     1. `vindex.New` constructs `e.pipeline` with `cfg.Workers` (`vindex.go:242`), which is never used; `coordinator.NewCoordinator` (`vindex.go:252`) constructs a second internal pipeline with `workers = 0` (`GOMAXPROCS - 1`), dropping `cfg.Workers`.
@@ -265,7 +265,7 @@ It is organized into three categories:
     4. `client/client.go` imports `internal/tree` and `internal/verifier`, transitively pulling `internal/kvstore` and `github.com/cockroachdb/pebble` into the public client SDK.
   - **Fix**: Enforce non-nil verifiers (and optional witness policy), verify checkpoints in `GetCheckpoint`/`GetInputLogCheckpoint`, implement monotonic history verification, and decouple `client/` from `internal/kvstore`/`pebble`.
 
-- [ ] **2.6.5 Missing Genesis Backfill Structured JSON on `/readyz` and `/syncz`**
+- [x] **2.6.5 Missing Genesis Backfill Structured JSON on `/readyz` and `/syncz`**
   - **Location**: [`internal/server/server.go:266-300`](internal/server/server.go#L266-L300) (`HandleReadyz`), [`cmd/vindexd/main.go:344-354`](cmd/vindexd/main.go#L344-L354)
   - **Bug**: During Genesis Backfill (`Output_CP.Size == 0`), `GET /readyz` and `GET /syncz` return plain text `503 Service Unavailable` (`"serving state not ready\n"`) instead of the documented structured JSON (`{"genesis_backfill": true, "leaves_indexed": X, "target_leaves": Y}`).
   - **Fix**: Wire a readiness status provider from `Coordinator` to `ReadServer` that emits the Genesis Backfill progress JSON when `outputLog.Size == 0`.

@@ -17,9 +17,11 @@ package coordinator
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/transparency-dev/formats/log"
@@ -57,9 +59,37 @@ type Coordinator struct {
 	commitBatchSize           uint64
 	coarseCheckpointInterval  uint64
 	backfillMaxPendingKeys    uint64
+	workers                   int
 	fetchWorkers              int
 	fetchBatchBundles         int
 	pipelineChanCap           int
+	replayActive              atomic.Bool
+	replayCurrent             atomic.Uint64
+}
+
+// SetWorkers configures the number of WASM / mapping workers for the coordinator's pipeline.
+func (c *Coordinator) SetWorkers(n int) {
+	if n < 0 {
+		n = 0
+	}
+	c.workers = n
+	if c.fetcher != nil && c.mapper != nil {
+		c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, c.workers)
+		if c.fetchWorkers > 0 {
+			c.pipeline.SetFetchWorkers(c.fetchWorkers)
+		}
+		if c.fetchBatchBundles > 0 {
+			c.pipeline.SetFetchBatchBundles(c.fetchBatchBundles)
+		}
+		if c.pipelineChanCap > 0 {
+			c.pipeline.SetChannelCapacity(c.pipelineChanCap)
+		}
+	}
+}
+
+// SetPipeline explicitly sets the IngestionPipeline instance used by the coordinator.
+func (c *Coordinator) SetPipeline(p *ingest.IngestionPipeline) {
+	c.pipeline = p
 }
 
 // NewCoordinator creates a new recovery Coordinator.
@@ -150,6 +180,74 @@ func (c *Coordinator) SafeWatermark(_ context.Context) (uint64, error) {
 	return min(kvSize, mptPersistedSize), nil
 }
 
+type readinessStatusError struct {
+	Status          string `json:"status"`
+	GenesisBackfill bool   `json:"genesis_backfill"`
+	LeavesIndexed   uint64 `json:"leaves_indexed"`
+	TargetLeaves    uint64 `json:"target_leaves"`
+}
+
+func (e *readinessStatusError) Error() string {
+	return fmt.Sprintf("status=%s genesis_backfill=%v leaves_indexed=%d target_leaves=%d",
+		e.Status, e.GenesisBackfill, e.LeavesIndexed, e.TargetLeaves)
+}
+
+func (e *readinessStatusError) JSONDiagnostics() []byte {
+	b, _ := json.Marshal(e)
+	return append(b, '\n')
+}
+
+// ReadinessCheck evaluates whether the coordinator has promoted a valid ServingState.
+// While in Genesis Backfill or startup recovery, it returns a structured JSON diagnostic error.
+func (c *Coordinator) ReadinessCheck() error {
+	if c.pub != nil {
+		if state := c.pub.GetServingState(); state != nil && len(state.RawCheckpoint) > 0 {
+			return nil
+		}
+	}
+
+	var kvSize uint64
+	var targetLeaves uint64
+	if c.db != nil {
+		kvSize, _ = c.db.GetUint64(kvstore.KeyMetaKVSize)
+		for _, metaKey := range [][]byte{kvstore.KeyMetaTargetCheckpoint, kvstore.KeyMetaKVCheckpoint} {
+			if rawCP, err := c.db.GetMetadata(metaKey); err == nil && len(rawCP) > 0 {
+				if cp, pErr := tree.ParseCheckpointHeader(rawCP); pErr == nil && cp.Size > 0 {
+					targetLeaves = cp.Size
+					break
+				}
+			}
+		}
+	}
+	leavesIndexed := kvSize
+	if c.replayActive.Load() {
+		leavesIndexed = c.replayCurrent.Load()
+	}
+	if targetLeaves == 0 {
+		targetLeaves = kvSize
+	}
+
+	outSize := uint64(0)
+	if c.outputLog != nil {
+		outSize, _ = c.outputLog.Size(context.Background())
+	}
+
+	if outSize == 0 {
+		return &readinessStatusError{
+			Status:          "genesis_backfill",
+			GenesisBackfill: true,
+			LeavesIndexed:   leavesIndexed,
+			TargetLeaves:    targetLeaves,
+		}
+	}
+	return &readinessStatusError{
+		Status:          "recovering",
+		GenesisBackfill: false,
+		LeavesIndexed:   leavesIndexed,
+		TargetLeaves:    targetLeaves,
+	}
+}
+
 // SetFetchWorkers sets the number of concurrent tile fetch workers for the pipeline.
 func (c *Coordinator) SetFetchWorkers(n int) {
 	if n < 1 {
@@ -211,7 +309,6 @@ func (c *Coordinator) PipelineChannelCapacity() int {
 // 1. If output log has size 0, executes Genesis Backfill dirty crash recovery if needed.
 // 2. Phase 1: Tip match check (< 5ms fast serve on clean shutdown).
 // 3. Phase 2: If tip did not match, replay missing tiles up to Output Log tip, verify, and promote serving state.
-// 4. Phase 3: Resume background pipeline.
 func (c *Coordinator) Recover(ctx context.Context) error {
 	outSize, err := c.outputLog.Size(ctx)
 	if err != nil {
@@ -233,15 +330,26 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 		}
 	}
 
-	if err := c.Phase3(ctx); err != nil {
-		return fmt.Errorf("phase 3 recovery failed: %w", err)
-	}
-
 	return nil
 }
 
+func (c *Coordinator) setFetcherTreeState(size uint64, hash [sha256.Size]byte) {
+	if c.fetcher == nil {
+		return
+	}
+	if hash != ([sha256.Size]byte{}) {
+		if stater, ok := c.fetcher.(interface{ SetTreeState(uint64, [32]byte) }); ok {
+			stater.SetTreeState(size, hash)
+			return
+		}
+	}
+	if sizer, ok := c.fetcher.(interface{ SetTreeSize(uint64) }); ok {
+		sizer.SetTreeSize(size)
+	}
+}
+
 // recoverGenesisBackfill handles crash recovery when outputLog.Size() == 0.
-// If mptPersistedSize < kvSize, leaves in [mptPersistedSize .. kvSize) are replayed
+// If mptPersistedSize < kvSize (or MPT is dirty), leaves in [replayStart .. kvSize) are replayed
 // with zero storage writes and sub-roots extracted via indexer.GetSubRoot, then coarse-checkpointed.
 func (c *Coordinator) recoverGenesisBackfill(ctx context.Context) error {
 	kvSize, err := c.db.GetUint64(kvstore.KeyMetaKVSize)
@@ -255,15 +363,33 @@ func (c *Coordinator) recoverGenesisBackfill(ctx context.Context) error {
 		return fmt.Errorf("%w: MPT durable size (%d) > m_kv_size (%d)", ErrInvariantViolation, mptPersistedSize, kvSize)
 	}
 
-	if mptPersistedSize < kvSize {
-		klog.Infof("Genesis dirty crash detected: MPT size (%d) < KV size (%d). Replaying leaves [%d..%d) from WASM with zero Pebble writes...",
-			mptPersistedSize, kvSize, mptPersistedSize, kvSize)
+	if mptPersistedSize < kvSize || (!c.mptMgr.IsExact() && kvSize > 0) {
+		replayStart := mptPersistedSize
+		if replayStart == kvSize {
+			replayStart = 0
+		}
+		klog.Infof("Genesis dirty crash detected: MPT size (%d, exact=%v) vs KV size (%d). Replaying leaves [%d..%d) from WASM with zero Pebble writes...",
+			mptPersistedSize, c.mptMgr.IsExact(), kvSize, replayStart, kvSize)
 
-		if c.fetcher != nil {
-			if sizer, ok := c.fetcher.(interface{ SetTreeSize(uint64) }); ok {
-				sizer.SetTreeSize(kvSize)
+		cpSize := kvSize
+		var cpHash [sha256.Size]byte
+		for _, metaKey := range [][]byte{kvstore.KeyMetaKVCheckpoint, kvstore.KeyMetaTargetCheckpoint} {
+			if rawCP, err := c.db.GetMetadata(metaKey); err == nil && len(rawCP) > 0 {
+				if cp, pErr := tree.ParseCheckpointHeader(rawCP); pErr == nil && cp.Size >= kvSize && len(cp.Hash) == sha256.Size {
+					cpSize = cp.Size
+					cpHash = [sha256.Size]byte(cp.Hash)
+					break
+				}
 			}
 		}
+		if cpHash == ([sha256.Size]byte{}) && c.fetcher != nil {
+			if cp, err := c.fetcher.Checkpoint(ctx); err == nil && cp != nil && cp.Size >= kvSize {
+				cpSize = cp.Size
+				cpHash = cp.Hash
+			}
+		}
+		c.setFetcherTreeState(cpSize, cpHash)
+
 		if c.pipeline == nil && c.fetcher != nil && c.mapper != nil {
 			c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, 0)
 			if c.fetchWorkers > 0 {
@@ -277,15 +403,20 @@ func (c *Coordinator) recoverGenesisBackfill(ctx context.Context) error {
 			return errors.New("cannot replay genesis backfill: pipeline not initialized")
 		}
 
-		batchChan, errChan := c.pipeline.StreamBatches(ctx, mptPersistedSize, kvSize)
+		c.replayCurrent.Store(replayStart)
+		c.replayActive.Store(true)
+		defer c.replayActive.Store(false)
+
+		batchChan, errChan := c.pipeline.StreamBatches(ctx, replayStart, kvSize)
 		modifiedKeys := make(map[[sha256.Size]byte]struct{})
-		replayedLeaves := mptPersistedSize
-		lastReplayLog := mptPersistedSize
+		replayedLeaves := replayStart
+		lastReplayLog := replayStart
 		for batch := range batchChan {
 			for k := range batch.KeyMap {
 				modifiedKeys[k] = struct{}{}
 			}
 			replayedLeaves += uint64(batch.Count)
+			c.replayCurrent.Store(replayedLeaves)
 			if replayedLeaves-lastReplayLog >= 500000 || replayedLeaves == kvSize {
 				klog.Infof("Genesis replay progress: %d / %d leaves replayed (%d unique keys)",
 					replayedLeaves, kvSize, len(modifiedKeys))
@@ -352,7 +483,7 @@ func (c *Coordinator) Phase1(ctx context.Context) (matched bool, err error) {
 	}
 
 	mptPersistedSize := c.mptMgr.PersistedSize()
-	if inCP.Size == mptPersistedSize && c.mptMgr.Root() == mapRoot {
+	if inCP.Size == mptPersistedSize && c.mptMgr.IsExact() && c.mptMgr.Root() == mapRoot {
 		// Clean match at tip! Generate inclusion proof and promote serving state
 		proof, err := c.outputLog.InclusionProof(ctx, tipIdx, outSize)
 		if err != nil {
@@ -423,17 +554,21 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 		klog.Errorf("Invariant violation: MPT durable size (%d) > OutputLog tip size (%d)", mptPersistedSize, targetInputSize)
 		return fmt.Errorf("%w: MPT durable size (%d) > OutputLog tip size (%d)", ErrInvariantViolation, mptPersistedSize, targetInputSize)
 	}
-	if mptPersistedSize == targetInputSize && c.mptMgr.Root() != tipMapRoot {
+	if mptPersistedSize == targetInputSize && c.mptMgr.IsExact() && c.mptMgr.Root() != tipMapRoot {
 		klog.Errorf("Invariant violation: MPT root mismatch at equal size %d (MPT root %x != tip root %x)", targetInputSize, c.mptMgr.Root(), tipMapRoot)
 		return fmt.Errorf("%w: MPT root mismatch at size %d: MPT %x, want tip %x", ErrRootMismatch, targetInputSize, c.mptMgr.Root(), tipMapRoot)
 	}
 
-	if mptPersistedSize < targetInputSize {
-		if c.fetcher != nil {
-			if sizer, ok := c.fetcher.(interface{ SetTreeSize(uint64) }); ok {
-				sizer.SetTreeSize(targetInputSize)
-			}
+	if mptPersistedSize < targetInputSize || !c.mptMgr.IsExact() {
+		replayStart := mptPersistedSize
+		if replayStart == targetInputSize {
+			replayStart = 0
 		}
+		var tipHash [sha256.Size]byte
+		if len(tipInCP.Hash) == sha256.Size {
+			tipHash = [sha256.Size]byte(tipInCP.Hash)
+		}
+		c.setFetcherTreeState(targetInputSize, tipHash)
 		if c.pipeline == nil && c.fetcher != nil && c.mapper != nil {
 			c.pipeline = ingest.NewPipeline(c.fetcher, c.cache, c.mapper, 0)
 			if c.fetchWorkers > 0 {
@@ -447,7 +582,7 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 		modifiedKeys := make(map[[sha256.Size]byte]struct{})
 
 		if c.pipeline != nil {
-			batchChan, errChan := c.pipeline.StreamBatches(ctx, mptPersistedSize, targetInputSize)
+			batchChan, errChan := c.pipeline.StreamBatches(ctx, replayStart, targetInputSize)
 			for batch := range batchChan {
 				for k := range batch.KeyMap {
 					modifiedKeys[k] = struct{}{}
@@ -475,6 +610,9 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 		if actualRoot != tipMapRoot {
 			klog.Errorf("Invariant violation: replayed MPT root %x != tip root %x at size %d", actualRoot, tipMapRoot, targetInputSize)
 			return fmt.Errorf("%w: replay reached root %x, want tip leaf root %x", ErrRootMismatch, actualRoot, tipMapRoot)
+		}
+		if err := c.mptMgr.Persist(); err != nil {
+			return fmt.Errorf("mptMgr.Persist failed during replay: %w", err)
 		}
 	}
 
@@ -505,77 +643,6 @@ func (c *Coordinator) Phase2(ctx context.Context, outSize uint64) error {
 		MapRoot:        tipMapRoot,
 	}
 	c.pub.SetServingState(state)
-	return nil
-}
-
-// Phase3 resumes steady-state ingestion from m_kv_size.
-func (c *Coordinator) Phase3(ctx context.Context) error {
-	outSize, err := c.outputLog.Size(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get output log size: %w", err)
-	}
-	if outSize == 0 {
-		return nil
-	}
-
-	rawTargetCP, err := c.db.GetMetadata(kvstore.KeyMetaTargetCheckpoint)
-	if err != nil {
-		return fmt.Errorf("failed to read m_target_checkpoint: %w", err)
-	}
-	if len(rawTargetCP) == 0 {
-		return nil
-	}
-
-	targetCP, err := tree.ParseCheckpointHeader(rawTargetCP)
-	if err != nil {
-		return fmt.Errorf("failed to parse m_target_checkpoint: %w", err)
-	}
-	metrics.InputTreeSize.Set(float64(targetCP.Size))
-
-	kvSize, err := c.db.GetUint64(kvstore.KeyMetaKVSize)
-	if err != nil {
-		return fmt.Errorf("failed to read m_kv_size: %w", err)
-	}
-
-	if kvSize < targetCP.Size && c.pipeline != nil {
-		if c.fetcher != nil {
-			if sizer, ok := c.fetcher.(interface{ SetTreeSize(uint64) }); ok {
-				sizer.SetTreeSize(targetCP.Size)
-			}
-		}
-		startTime := time.Now()
-		startProgressSize := kvSize
-		lastLogSize := kvSize
-		logInterval := uint64(102400)
-
-		batchSize := c.commitBatchSize
-		if batchSize == 0 {
-			batchSize = DefaultCommitBatchSize
-		}
-
-		err := c.streamAndIndex(ctx, kvSize, targetCP.Size, batchSize, func(drainCtx context.Context, batch *ingest.MappedBatch) error {
-			res, err := c.indexer.IndexMappedBatch(drainCtx, batch, rawTargetCP, targetCP.Size)
-			if err != nil {
-				return fmt.Errorf("phase 3 indexing catch-up failed: %w", err)
-			}
-			metrics.KVCommittedSize.Set(float64(res.NewKVSize))
-			metrics.LeavesIndexedTotal.Add(float64(batch.Count))
-			if res.NewKVSize-lastLogSize >= logInterval || res.NewKVSize == targetCP.Size {
-				elapsed := time.Since(startTime).Seconds()
-				rate := 0.0
-				if elapsed > 0 {
-					rate = float64(res.NewKVSize-startProgressSize) / elapsed
-				}
-				klog.Infof("Catch-up indexing progress: %d / %d leaves (%.1f leaves/sec)", res.NewKVSize, targetCP.Size, rate)
-				lastLogSize = res.NewKVSize
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -695,7 +762,7 @@ func (c *Coordinator) syncGenesisBackfill(ctx context.Context, targetCP *ingest.
 		return fmt.Errorf("%w: MPT durable size (%d) > m_kv_size (%d)", ErrInvariantViolation, mptPersistedSize, kvSize)
 	}
 
-	if mptPersistedSize < kvSize {
+	if mptPersistedSize < kvSize || (!c.mptMgr.IsExact() && kvSize > 0) {
 		if err := c.recoverGenesisBackfill(ctx); err != nil {
 			return fmt.Errorf("genesis dirty crash recovery failed: %w", err)
 		}
@@ -719,11 +786,7 @@ func (c *Coordinator) syncGenesisBackfill(ctx context.Context, targetCP *ingest.
 			c.pipeline.SetFetchBatchBundles(c.fetchBatchBundles)
 		}
 	}
-	if c.fetcher != nil {
-		if sizer, ok := c.fetcher.(interface{ SetTreeSize(uint64) }); ok {
-			sizer.SetTreeSize(targetCP.Size)
-		}
-	}
+	c.setFetcherTreeState(targetCP.Size, targetCP.Hash)
 
 type backfillFlushJob struct {
 	keys      map[[sha256.Size]byte][sha256.Size]byte
@@ -752,11 +815,6 @@ type backfillFlushJob struct {
 		for job := range flushChan {
 			flushStart := time.Now()
 			klog.Infof("Genesis backfill background worker: flushing %d deduplicated keys to MPT at leaf %d...", len(job.keys), job.watermark)
-			if err := c.db.Sync(); err != nil {
-				job.doneChan <- fmt.Errorf("genesis background db.Sync error: %w", err)
-				backgroundWorkerErr = err
-				return
-			}
 			if len(job.keys) > 0 {
 				if err := c.mptMgr.SetBatch(job.keys); err != nil {
 					job.doneChan <- fmt.Errorf("genesis background mpt.SetBatch error: %w", err)
@@ -817,6 +875,9 @@ type backfillFlushJob struct {
 		if backgroundWorkerErr != nil {
 			return backgroundWorkerErr
 		}
+		if err := c.db.Sync(); err != nil {
+			return fmt.Errorf("genesis flush db.Sync error: %w", err)
+		}
 		job := &backfillFlushJob{
 			keys:      activeBuffer,
 			watermark: newKVSize,
@@ -873,6 +934,13 @@ type backfillFlushJob struct {
 	workerWg.Wait()
 	if backgroundWorkerErr != nil {
 		return backgroundWorkerErr
+	}
+	if currentJob != nil {
+		if err, ok := <-currentJob.doneChan; ok && err != nil {
+			return err
+		}
+		lastCheckpointLeaf = currentJob.watermark
+		currentJob = nil
 	}
 
 	if streamErr != nil {

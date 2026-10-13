@@ -166,6 +166,9 @@ func (p *OutputPublisher) PublishBatch(ctx context.Context, modifiedSubRoots map
 	}
 	p.SetServingState(newState)
 	p.mptMgr.Unlock()
+	if err := p.mptMgr.Persist(); err != nil {
+		return nil, fmt.Errorf("mptMgr.Persist failed: %w", err)
+	}
 	return newState, nil
 }
 

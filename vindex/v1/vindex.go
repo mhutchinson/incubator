@@ -111,19 +111,18 @@ func FuncMapper(fn func(ctx context.Context, leaf []byte) ([]MappedEntry, error)
 
 // Engine encapsulates the full Verifiable Index storage, MPT, coordinator, and HTTP server subsystems.
 type Engine struct {
-	cfg      Config
-	db       *kvstore.DB
-	mptMgr   *tree.Manager
-	cache    *ingest.ManagedTileCache
-	indexer  *kvstore.KVIndexer
-	outLog   coordinator.OutputLogReader
-	pub      *tree.OutputPublisher
-	fetcher  ingest.TileFetcher
-	mapper   LeafMapper
-	pipeline *ingest.IngestionPipeline
-	coord    *coordinator.Coordinator
-	server   *server.ReadServer
-	reaper   *ingest.TileReaper
+	cfg     Config
+	db      *kvstore.DB
+	mptMgr  *tree.Manager
+	cache   *ingest.ManagedTileCache
+	indexer *kvstore.KVIndexer
+	outLog  coordinator.OutputLogReader
+	pub     *tree.OutputPublisher
+	fetcher ingest.TileFetcher
+	mapper  LeafMapper
+	coord   *coordinator.Coordinator
+	server  *server.ReadServer
+	reaper  *ingest.TileReaper
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
@@ -134,6 +133,12 @@ type Engine struct {
 
 // New initializes and wires all Engine subsystems.
 func New(cfg Config, mapper LeafMapper) (*Engine, error) {
+	if (cfg.OutputLogDir == "") != (cfg.OutputLogSignerKey == "") {
+		return nil, errors.New("both OutputLogDir and OutputLogSignerKey must be set for persistent output log, or both empty for ephemeral in-memory output log")
+	}
+	if cfg.OutputLogDir == "" && (len(cfg.WitnessURLs) > 0 || len(cfg.WitnessPubKeys) > 0) {
+		return nil, errors.New("witnesses cannot be configured with an ephemeral in-memory output log")
+	}
 	if cfg.ChunkSize == 0 {
 		cfg.ChunkSize = kvstore.ChunkSize
 	}
@@ -194,7 +199,17 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 		if origin == "" {
 			origin = signer.Name()
 		}
-		posixLog, err := tree.NewPOSIXOutputLog(context.Background(), cfg.OutputLogDir, signer, tree.WithOrigin(origin))
+		posixOpts := []tree.POSIXOption{tree.WithOrigin(origin)}
+		if len(cfg.WitnessURLs) > 0 || len(cfg.WitnessPubKeys) > 0 {
+			wg, err := tree.BuildWitnessGroup(cfg.WitnessURLs, cfg.WitnessPubKeys)
+			if err != nil {
+				_ = mptMgr.Close()
+				_ = db.Close()
+				return nil, fmt.Errorf("failed to build witness group: %w", err)
+			}
+			posixOpts = append(posixOpts, tree.WithDefaultWitnessGroup(wg))
+		}
+		posixLog, err := tree.NewPOSIXOutputLog(context.Background(), cfg.OutputLogDir, signer, posixOpts...)
 		if err != nil {
 			_ = mptMgr.Close()
 			_ = db.Close()
@@ -202,6 +217,12 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 		}
 		outLog = posixLog
 	} else {
+		kvSize, _ := db.GetUint64(kvstore.KeyMetaKVSize)
+		if kvSize > 0 || mptMgr.PersistedSize() > 0 || !mptMgr.IsExact() {
+			_ = mptMgr.Close()
+			_ = db.Close()
+			return nil, errors.New("cannot use ephemeral in-memory output log with existing persistent DB or MPT state; configure OutputLogDir and OutputLogSignerKey")
+		}
 		origin := cfg.OutputLogOrigin
 		if origin == "" {
 			origin = "vindex.memory.outputlog"
@@ -250,6 +271,10 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 
 	// 9. Initialize Coordinator
 	coord := coordinator.NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, cache, mapper)
+	coord.SetWorkers(cfg.Workers)
+	if pipeline != nil {
+		coord.SetPipeline(pipeline)
+	}
 	if cfg.FetchWorkers > 0 {
 		coord.SetFetchWorkers(cfg.FetchWorkers)
 	}
@@ -259,24 +284,25 @@ func New(cfg Config, mapper LeafMapper) (*Engine, error) {
 
 	// 10. Initialize HTTP Read Server
 	srv := server.NewReadServer(db, mptMgr, pub, cfg.ChunkSize)
+	srv.SetReadyChecker(coord.ReadinessCheck)
 
 	// 11. Initialize Tile Reaper
 	reaper := ingest.NewTileReaper(db, mptMgr, cache)
+	reaper.SetWatermarkFunc(coord.SafeWatermark)
 
 	return &Engine{
-		cfg:      cfg,
-		db:       db,
-		mptMgr:   mptMgr,
-		cache:    cache,
-		indexer:  indexer,
-		outLog:   outLog,
-		pub:      pub,
-		fetcher:  fetcher,
-		mapper:   mapper,
-		pipeline: pipeline,
-		coord:    coord,
-		server:   srv,
-		reaper:   reaper,
+		cfg:     cfg,
+		db:      db,
+		mptMgr:  mptMgr,
+		cache:   cache,
+		indexer: indexer,
+		outLog:  outLog,
+		pub:     pub,
+		fetcher: fetcher,
+		mapper:  mapper,
+		coord:   coord,
+		server:  srv,
+		reaper:  reaper,
 	}, nil
 }
 

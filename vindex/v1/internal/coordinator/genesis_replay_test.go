@@ -948,6 +948,7 @@ func TestGenesisReplay_SafeWatermark_Lifecycle(t *testing.T) {
 	// Stage 2: Coarse checkpoint at 2048, kv at 3500
 	_ = db.SetUint64(kvstore.KeyMetaKVSize, 3500)
 	_, _ = mpt.Snap(2048)
+	_ = mpt.Persist()
 	sw, err = coord.SafeWatermark(ctx)
 	if err != nil || sw != 2048 {
 		t.Fatalf("dirty crash sw = %d, want 2048", sw)
@@ -955,6 +956,7 @@ func TestGenesisReplay_SafeWatermark_Lifecycle(t *testing.T) {
 
 	// Stage 3: After recovery, MPT snapped at 3500
 	_, _ = mpt.Snap(3500)
+	_ = mpt.Persist()
 	sw, err = coord.SafeWatermark(ctx)
 	if err != nil || sw != 3500 {
 		t.Fatalf("post-recovery sw = %d, want 3500", sw)
@@ -963,6 +965,7 @@ func TestGenesisReplay_SafeWatermark_Lifecycle(t *testing.T) {
 	// Stage 4: Leaf 0 published with ServingState at 10000
 	_ = db.SetUint64(kvstore.KeyMetaKVSize, 10000)
 	_, _ = mpt.Snap(10000)
+	_ = mpt.Persist()
 	pub.SetServingState(&tree.ServingState{InputLogSize: 10000})
 	sw, err = coord.SafeWatermark(ctx)
 	if err != nil || sw != 10000 {

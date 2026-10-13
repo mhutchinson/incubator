@@ -491,5 +491,53 @@ func TestEngine_ConfigValidationErrors(t *testing.T) {
 	if _, err := vindex.New(cfg2, nil); err == nil {
 		t.Error("expected error for invalid InputLogURL, got nil")
 	}
+
+	// 3. Partial OutputLog config (OutputLogDir set without OutputLogSignerKey)
+	cfg3 := vindex.Config{
+		DBPath:       filepath.Join(rootDir, "db3"),
+		MPTDir:       filepath.Join(rootDir, "mpt3"),
+		OutputLogDir: filepath.Join(rootDir, "out3"),
+	}
+	if _, err := vindex.New(cfg3, nil); err == nil {
+		t.Error("expected error for OutputLogDir without OutputLogSignerKey, got nil")
+	}
+
+	// 4. Witnesses with ephemeral in-memory output log
+	cfg4 := vindex.Config{
+		DBPath:      filepath.Join(rootDir, "db4"),
+		MPTDir:      filepath.Join(rootDir, "mpt4"),
+		WitnessURLs: []string{"https://witness.example.com"},
+	}
+	if _, err := vindex.New(cfg4, nil); err == nil {
+		t.Error("expected error for WitnessURLs with ephemeral output log, got nil")
+	}
+
+	// 5. Ephemeral in-memory output log rejected when persistent DB/MPT already has state
+	db5 := filepath.Join(rootDir, "db5")
+	mpt5 := filepath.Join(rootDir, "mpt5")
+	out5 := filepath.Join(rootDir, "out5")
+	skey5, _, err := note.GenerateKey(rand.Reader, "test.out5")
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	eng5, err := vindex.New(vindex.Config{
+		DBPath:             db5,
+		MPTDir:             mpt5,
+		OutputLogDir:       out5,
+		OutputLogSignerKey: skey5,
+	}, nil)
+	if err != nil {
+		t.Fatalf("vindex.New persistent failed: %v", err)
+	}
+	_, _ = eng5.MPT().CommitWithVersion(nil, 10)
+	_ = eng5.MPT().Persist()
+	_ = eng5.Close()
+
+	if _, err := vindex.New(vindex.Config{
+		DBPath: db5,
+		MPTDir: mpt5,
+	}, nil); err == nil {
+		t.Error("expected error opening non-empty persistent DB/MPT with ephemeral in-memory output log, got nil")
+	}
 }
 

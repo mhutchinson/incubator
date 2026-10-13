@@ -603,6 +603,7 @@ func TestRecovery_InvariantViolations(t *testing.T) {
 		}
 		// Commit MPT at version 150 (> kv_size 100)
 		_, _ = mptMgr.CommitWithVersion(nil, 150)
+		_ = mptMgr.Persist()
 
 		coord := NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, nil, &simpleIdentityMapper{})
 		err := coord.Recover(ctx)
@@ -625,6 +626,7 @@ func TestRecovery_InvariantViolations(t *testing.T) {
 		}
 		// Commit MPT at version 75 (> tip 50)
 		_, _ = mptMgr.CommitWithVersion(nil, 75)
+		_ = mptMgr.Persist()
 
 		coord := NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, nil, &simpleIdentityMapper{})
 		err := coord.Recover(ctx)
@@ -650,6 +652,7 @@ func TestRecovery_InvariantViolations(t *testing.T) {
 		_, _ = mptMgr.CommitWithVersion(map[[32]byte][32]byte{
 			sha256.Sum256([]byte("k1")): sha256.Sum256([]byte("v1")),
 		}, 50)
+		_ = mptMgr.Persist()
 
 		coord := NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, nil, &simpleIdentityMapper{})
 		err := coord.Recover(ctx)
@@ -934,8 +937,9 @@ func TestRecover_Phase2PartialTileFetch(t *testing.T) {
 		t.Fatalf("Predict failed: %v", err)
 	}
 
-	// Output log tip is at size 50 with predicted root
-	rawInCP := []byte("example.com/inputlog\n50\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	// Output log tip is at size 50 with predicted root and authentic input log root
+	inRoot := kvstore.BatchRoot(bundle.Entries)
+	rawInCP := []byte("example.com/inputlog\n50\n" + base64.StdEncoding.EncodeToString(inRoot[:]) + "\n")
 	leafData := []byte(fmt.Sprintf("%x\n%s", predictedRoot, string(rawInCP)))
 	if _, _, err := outLog.Append(ctx, leafData); err != nil {
 		t.Fatalf("outLog.Append failed: %v", err)
@@ -950,7 +954,7 @@ func TestRecover_Phase2PartialTileFetch(t *testing.T) {
 	fetcher := ingest.NewTiledFetcherWithReader(reader, nil, "example.com/inputlog")
 	coord := NewCoordinator(db, mptMgr, outLog, pub, indexer, fetcher, nil, &simpleIdentityMapper{})
 
-	// Recover must successfully fetch partial tile (p=50) and complete Phase 2 replay
+	// Recover must successfully fetch partial tile (p=50), verify against inRoot, and complete Phase 2 replay
 	if err := coord.Recover(ctx); err != nil {
 		t.Fatalf("Recover failed during Phase 2 partial tile fetch: %v", err)
 	}
@@ -967,3 +971,78 @@ func TestRecover_Phase2PartialTileFetch(t *testing.T) {
 		t.Fatalf("state.MapRoot = %x, want %x", state.MapRoot, predictedRoot)
 	}
 }
+
+func TestRecovery_DirtyMPTAtEqualSize_ReplaysCleanly(t *testing.T) {
+	ctx := context.Background()
+	_, db, _, _, indexer, outLog, fetcher := setupRecoveryEnvironment(t)
+
+	// Step 1: Ingest 50 leaves into Pebble and commit clean MPT at version 50 on disk
+	mptDir := t.TempDir()
+	mptMgr, err := tree.Open(mptDir)
+	if err != nil {
+		t.Fatalf("tree.Open failed: %v", err)
+	}
+
+	keyMap := make(map[[32]byte][]uint64)
+	for i := 0; i < 50; i++ {
+		kh := sha256.Sum256([]byte(fmt.Sprintf("leaf_recovery_%d", i)))
+		keyMap[kh] = append(keyMap[kh], uint64(i))
+	}
+	batch := &ingest.MappedBatch{
+		BundleIdx:    0,
+		StartLeafIdx: 0,
+		EndLeafIdx:   50,
+		Count:        50,
+		KeyMap:       keyMap,
+	}
+	res, err := indexer.IndexBatch(ctx, batch, nil)
+	if err != nil {
+		t.Fatalf("IndexBatch failed: %v", err)
+	}
+
+	pub := tree.NewOutputPublisher(db, mptMgr, outLog, nil)
+	inRoot := kvstore.BatchRoot(fetcher.leaves[:50])
+	rawInCP := []byte("example.com/inputlog\n50\n" + base64.StdEncoding.EncodeToString(inRoot[:]) + "\n")
+	inputCP := &log.Checkpoint{Origin: "example.com/inputlog", Size: 50, Hash: inRoot[:]}
+	expectedState, err := pub.PublishBatch(ctx, res.ModifiedSubRoots, inputCP, rawInCP)
+	if err != nil {
+		t.Fatalf("PublishBatch failed: %v", err)
+	}
+	if err := mptMgr.Persist(); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	// Step 2: Simulate a dirty uncommitted SetBatch mutation on one of the keys in [0..50) before crash
+	k0 := sha256.Sum256([]byte("leaf_recovery_0"))
+	if err := mptMgr.SetBatch(map[[32]byte][32]byte{k0: sha256.Sum256([]byte("dirty_uncommitted_subroot"))}); err != nil {
+		t.Fatalf("SetBatch failed: %v", err)
+	}
+	if err := mptMgr.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Step 3: Reopen dirty MPT on disk (PersistedSize() == 50 == targetInputSize, IsExact() == false)
+	reopenedMPT, err := tree.Open(mptDir)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer func() { _ = reopenedMPT.Close() }()
+	if reopenedMPT.IsExact() {
+		t.Fatal("expected reopenedMPT.IsExact() == false")
+	}
+
+	newPub := tree.NewOutputPublisher(db, reopenedMPT, outLog, nil)
+	newCoord := NewCoordinator(db, reopenedMPT, outLog, newPub, indexer, fetcher, nil, &simpleIdentityMapper{})
+
+	// Recover must NOT fail with false-positive ErrRootMismatch; it must replay [0..50) and restore clean state
+	if err := newCoord.Recover(ctx); err != nil {
+		t.Fatalf("Recover failed on dirty MPT at equal size: %v", err)
+	}
+	if !reopenedMPT.IsExact() {
+		t.Fatal("expected reopenedMPT.IsExact() == true after Phase 2 replay")
+	}
+	if reopenedMPT.Root() != expectedState.MapRoot {
+		t.Fatalf("reopenedMPT.Root() = %x, want %x", reopenedMPT.Root(), expectedState.MapRoot)
+	}
+}
+

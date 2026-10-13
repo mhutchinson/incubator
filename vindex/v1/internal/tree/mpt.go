@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	torchmpt "filippo.io/torchwood/mpt"
 	"golang.org/x/sync/errgroup"
@@ -36,14 +37,18 @@ type Manager struct {
 	tree        torchmpt.Tree
 	mmapDir     string
 	currentRoot [sha256.Size]byte
+	durableSize atomic.Uint64
+	exact       atomic.Bool
 }
 
 // Open opens an existing MPT in the specified directory or creates a new one.
 // If mmapDir is empty or ":memory:", an in-memory tree is used.
 func Open(mmapDir string) (*Manager, error) {
 	var tree torchmpt.Tree
+	isNew := false
 	if mmapDir == "" || mmapDir == ":memory:" {
 		tree = torchmpt.NewMemTree()
+		isNew = true
 	} else {
 		if err := os.MkdirAll(mmapDir, 0o755); err != nil {
 			return nil, fmt.Errorf("failed to create mmap dir: %w", err)
@@ -61,22 +66,33 @@ func Open(mmapDir string) (*Manager, error) {
 				if createErr != nil {
 					return nil, fmt.Errorf("torchmpt.Create failed: %w", createErr)
 				}
+				isNew = true
 			} else {
 				return nil, fmt.Errorf("torchmpt.Open failed: %w", openErr)
 			}
 		}
 	}
 
+	initVer, initExact := tree.Version()
+
 	snap, err := tree.Snap(-1)
 	if err != nil {
 		return nil, fmt.Errorf("initial Snap failed: %w", err)
 	}
+	if isNew || (initVer == 0 && [sha256.Size]byte(snap.Hash) == sha256.Sum256(nil)) {
+		initExact = true
+	}
 
-	return &Manager{
+	mgr := &Manager{
 		tree:        tree,
 		mmapDir:     mmapDir,
 		currentRoot: [sha256.Size]byte(snap.Hash),
-	}, nil
+	}
+	if initVer > 0 {
+		mgr.durableSize.Store(uint64(initVer))
+	}
+	mgr.exact.Store(initExact)
+	return mgr, nil
 }
 
 // NewMem creates a new in-memory MPT manager.
@@ -258,6 +274,7 @@ func (m *Manager) SetBatch(mutations map[[sha256.Size]byte][sha256.Size]byte) er
 			return fmt.Errorf("tree.Set failed for key %x: %w", k, err)
 		}
 	}
+	m.exact.Store(false)
 	return nil
 }
 
@@ -274,6 +291,7 @@ func (m *Manager) Snap(version int64) ([sha256.Size]byte, error) {
 		return [sha256.Size]byte{}, fmt.Errorf("tree.Snap failed: %w", err)
 	}
 	m.currentRoot = [sha256.Size]byte(snap.Hash)
+	m.exact.Store(true)
 	return m.currentRoot, nil
 }
 
@@ -311,6 +329,7 @@ func (m *Manager) CommitKeyValsLocked(changes []torchmpt.KeyVal, version int64) 
 		return [sha256.Size]byte{}, fmt.Errorf("tree.Snap failed: %w", err)
 	}
 	m.currentRoot = [sha256.Size]byte(snap.Hash)
+	m.exact.Store(true)
 	return m.currentRoot, nil
 }
 
@@ -337,6 +356,7 @@ func (m *Manager) commitLocked(mutations map[[sha256.Size]byte][sha256.Size]byte
 		return [sha256.Size]byte{}, fmt.Errorf("tree.Snap failed: %w", err)
 	}
 	m.currentRoot = [sha256.Size]byte(snap.Hash)
+	m.exact.Store(true)
 	return m.currentRoot, nil
 }
 
@@ -362,7 +382,14 @@ func (m *Manager) Version() (int64, bool) {
 	defer m.writeMu.RUnlock()
 	m.treeMu.RLock()
 	defer m.treeMu.RUnlock()
-	return m.tree.Version()
+	v, _ := m.tree.Version()
+	return v, m.exact.Load()
+}
+
+// IsExact returns true if the MPT is at an exact committed snapshot without uncommitted SetBatch mutations.
+func (m *Manager) IsExact() bool {
+	_, exact := m.Version()
+	return exact
 }
 
 // PersistedVersion returns the version number of the MPT's last complete snapshot.
@@ -371,13 +398,9 @@ func (m *Manager) PersistedVersion() int64 {
 	return v
 }
 
-// PersistedSize returns the tree size corresponding to the persisted version.
+// PersistedSize returns the tree size corresponding to the durably synced version on disk.
 func (m *Manager) PersistedSize() uint64 {
-	v := m.PersistedVersion()
-	if v > 0 {
-		return uint64(v)
-	}
-	return 0
+	return m.durableSize.Load()
 }
 
 // Persist flushes changes to disk under writeMu without holding treeMu,
@@ -385,7 +408,17 @@ func (m *Manager) PersistedSize() uint64 {
 func (m *Manager) Persist() error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
-	return m.tree.Sync()
+	if err := m.tree.Sync(); err != nil {
+		return err
+	}
+	m.treeMu.RLock()
+	v, _ := m.tree.Version()
+	isExact := m.exact.Load()
+	m.treeMu.RUnlock()
+	if isExact && v > 0 {
+		m.durableSize.Store(uint64(v))
+	}
+	return nil
 }
 
 // Sync flushes changes to disk under writeMu (alias for Persist).

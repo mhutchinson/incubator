@@ -239,6 +239,62 @@ func TestMPT_SetBatchAndSnap(t *testing.T) {
 	if mgr.PersistedVersion() != 200 {
 		t.Fatalf("PersistedVersion = %d, want 200", mgr.PersistedVersion())
 	}
+	if mgr.PersistedSize() != 0 {
+		t.Fatalf("PersistedSize before Persist() = %d, want 0", mgr.PersistedSize())
+	}
+	if err := mgr.Persist(); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+	if mgr.PersistedSize() != 200 {
+		t.Fatalf("PersistedSize after Persist() = %d, want 200", mgr.PersistedSize())
+	}
+}
+
+func TestMPT_DirtyCrashPreservesNonExactFlag(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	if !mgr.IsExact() {
+		t.Fatal("freshly opened MPT should have IsExact() == true")
+	}
+
+	// Commit an initial clean version 10 and persist to disk
+	k0 := sha256.Sum256([]byte("clean_key"))
+	v0 := sha256.Sum256([]byte("clean_val"))
+	if _, err := mgr.CommitWithVersion(map[[32]byte][32]byte{k0: v0}, 10); err != nil {
+		t.Fatalf("CommitWithVersion failed: %v", err)
+	}
+	if err := mgr.Persist(); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+	if !mgr.IsExact() {
+		t.Fatal("after CommitWithVersion + Persist, IsExact() should be true")
+	}
+
+	// Mutate via SetBatch without Snap to simulate dirty crash mid-write
+	k := sha256.Sum256([]byte("dirty_key"))
+	v := sha256.Sum256([]byte("dirty_val"))
+	if err := mgr.SetBatch(map[[32]byte][32]byte{k: v}); err != nil {
+		t.Fatalf("SetBatch failed: %v", err)
+	}
+	if mgr.IsExact() {
+		t.Fatal("after SetBatch without Snap, IsExact() should be false")
+	}
+	if err := mgr.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen: Open must inspect tree.Version() before calling Snap(-1) so IsExact() remains false!
+	mgr2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer func() { _ = mgr2.Close() }()
+	if mgr2.IsExact() {
+		t.Fatal("reopened dirty MPT must preserve IsExact() == false so Coordinator triggers replay")
+	}
 }
 
 func TestMPT_DiskPersistence_Reopen(t *testing.T) {

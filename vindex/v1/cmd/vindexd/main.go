@@ -58,6 +58,8 @@ var (
 	outputLogDir       = flag.String("output_log_dir", "", "Path for local Output Log storage.")
 	outputLogOrigin    = flag.String("output_log_origin", "", "Origin string for Output Log. If unset, defaults to signer name.")
 	outputLogSignerKey = flag.String("output_log_signer_key", "", "Note signer string or path to private key for signing Output Log checkpoints.")
+	witnessURLs        = flag.String("witness_urls", "", "Comma-separated list of witness HTTP base URLs for Output Log cosigning.")
+	witnessPubKeys     = flag.String("witness_pubkeys", "", "Comma-separated list of witness verifier public keys matching --witness_urls.")
 	outputLogURL       = flag.String("output_log_url", "", "Base URL of Output Log to verify (auditor/verifier mode).")
 	outputLogPubKey    = flag.String("output_log_pubkey", "", "Public key for Output Log checkpoint verification (auditor/verifier mode).")
 	serveMirror        = flag.Bool("serve_mirror", false, "Enable verified mirror serving mode on listen_addr (auditor/verifier mode).")
@@ -223,14 +225,55 @@ func runPublisher(ctx context.Context) error {
 	}
 	defer func() { _ = db.Close() }()
 
-	// 2. Open MPT Manager
+	// 2. Start Metrics & Read HTTP Servers immediately so /healthz (200 OK) and /readyz (503 JSON)
+	// respond while MPT mmap files are opening and 3-phase crash recovery is running.
+	if *metricsAddr != "" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		metricsMux.HandleFunc("/debug/pprof/", pprof.Index)
+		metricsMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		metricsMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		metricsMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		metricsMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		metricsServer := &http.Server{
+			Addr:    *metricsAddr,
+			Handler: metricsMux,
+		}
+		go func() {
+			klog.Infof("Serving Prometheus metrics at http://%s/metrics", *metricsAddr)
+			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				klog.Errorf("Metrics server error: %v", err)
+			}
+		}()
+		defer func() { _ = metricsServer.Close() }()
+	}
+
+	readSrv := server.NewReadServer(db, nil, nil, *chunkSize)
+	readSrv.SetEnableUI(*enableUI)
+	readSrv.SetPathPrefix(*pathPrefix)
+	readMux := http.NewServeMux()
+	readSrv.RegisterRoutesWithOutputLog(readMux, *outputLogDir)
+	httpServer := &http.Server{
+		Addr:    *listenAddr,
+		Handler: readMux,
+	}
+
+	go func() {
+		klog.Infof("Serving VIndex Read API at http://%s", *listenAddr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			klog.Errorf("Read server error: %v", err)
+		}
+	}()
+	defer func() { _ = httpServer.Close() }()
+
+	// 3. Open MPT Manager
 	mptMgr, err := tree.Open(*mptDir)
 	if err != nil {
 		return fmt.Errorf("failed to open MPT at %q: %w", *mptDir, err)
 	}
 	defer func() { _ = mptMgr.Close() }()
 
-	// 3. Setup Mapper
+	// 4. Setup Mapper
 	if *wasmPath == "" {
 		return errors.New("--wasm_path flag is required")
 	}
@@ -242,7 +285,7 @@ func runPublisher(ctx context.Context) error {
 		defer closeMapper()
 	}
 
-	// 4. Setup Output Log
+	// 5. Setup Output Log
 	if *outputLogDir == "" {
 		return errors.New("--output_log_dir flag is required in publisher mode")
 	}
@@ -264,6 +307,15 @@ func runPublisher(ctx context.Context) error {
 	if *outputLogOrigin != "" {
 		posixOpts = append(posixOpts, tree.WithOrigin(*outputLogOrigin))
 	}
+	if strings.TrimSpace(*witnessURLs) != "" || strings.TrimSpace(*witnessPubKeys) != "" {
+		urls := splitNonEmptyCSV(*witnessURLs)
+		pubKeys := splitNonEmptyCSV(*witnessPubKeys)
+		wg, err := tree.BuildWitnessGroup(urls, pubKeys)
+		if err != nil {
+			return fmt.Errorf("failed to build witness group: %w", err)
+		}
+		posixOpts = append(posixOpts, tree.WithDefaultWitnessGroup(wg))
+	}
 
 	outputLog, err := tree.NewPOSIXOutputLog(ctx, *outputLogDir, signer, posixOpts...)
 	if err != nil {
@@ -275,7 +327,7 @@ func runPublisher(ctx context.Context) error {
 	idxer := kvstore.NewKVIndexer(db, *chunkSize)
 	idxer.SetNumWorkers(resBudget.KVIndexerWorkers)
 
-	// Setup Tile Cache & Fetcher
+	// 6. Setup Tile Cache & Fetcher
 	if *tileCacheDir == "" {
 		klog.Warning("--tile_cache_dir is not set; local disk tile caching is disabled. Historical crash recovery will require re-fetching from upstream.")
 	}
@@ -325,54 +377,16 @@ func runPublisher(ctx context.Context) error {
 		fetcher = tf
 	}
 
-	// 5. Start Metrics HTTP Server
-	if *metricsAddr != "" {
-		metricsMux := http.NewServeMux()
-		metricsMux.Handle("/metrics", promhttp.Handler())
-		metricsMux.HandleFunc("/debug/pprof/", pprof.Index)
-		metricsMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		metricsMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		metricsMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		metricsMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		metricsServer := &http.Server{
-			Addr:    *metricsAddr,
-			Handler: metricsMux,
-		}
-		go func() {
-			klog.Infof("Serving Prometheus metrics at http://%s/metrics", *metricsAddr)
-			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				klog.Errorf("Metrics server error: %v", err)
-			}
-		}()
-		defer func() { _ = metricsServer.Close() }()
-	}
-
-	// 6. Start Read Server
-	readSrv := server.NewReadServer(db, mptMgr, pub, *chunkSize)
-	readSrv.SetEnableUI(*enableUI)
-	readSrv.SetPathPrefix(*pathPrefix)
-	readMux := http.NewServeMux()
-	readSrv.RegisterRoutesWithOutputLog(readMux, *outputLogDir)
-	httpServer := &http.Server{
-		Addr:    *listenAddr,
-		Handler: readMux,
-	}
-
-	go func() {
-		klog.Infof("Serving VIndex Read API at http://%s", *listenAddr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			klog.Errorf("Read server error: %v", err)
-		}
-	}()
-	defer func() { _ = httpServer.Close() }()
-
 	// 7. Run 3-Phase Crash Recovery
 	coord := coordinator.NewCoordinator(db, mptMgr, outputLog, pub, idxer, fetcher, tileCache, leafMapper)
+	coord.SetWorkers(resBudget.WASMWorkers)
 	coord.SetFetchWorkers(resBudget.FetchWorkers)
 	coord.SetFetchBatchBundles(resBudget.FetchBatchBundles)
 	coord.SetPipelineChannelCapacity(resBudget.PipelineChannelCapacity)
-	if *backfillMaxPendingKeys > 0 {
+	if isFlagPassed("backfill_max_pending_keys") && *backfillMaxPendingKeys > 0 {
 		coord.SetBackfillMaxPendingKeys(uint64(*backfillMaxPendingKeys))
+	} else if resBudget.GenesisKeyBufferSize > 0 {
+		coord.SetBackfillMaxPendingKeys(resBudget.GenesisKeyBufferSize)
 	}
 	if isFlagPassed("coarse_checkpoint_interval") && *coarseCheckpointInterval > 0 {
 		coord.SetCoarseCheckpointInterval(uint64(*coarseCheckpointInterval))
@@ -380,15 +394,19 @@ func runPublisher(ctx context.Context) error {
 		coord.SetCoarseCheckpointInterval(resBudget.CoarseCheckpointInterval)
 	}
 	coord.SetCommitBatchSize(resBudget.CommitBatchSize)
+	readSrv.SetReadyChecker(coord.ReadinessCheck)
+
 	klog.Info("Running 3-phase startup recovery...")
 	if err := coord.Recover(ctx); err != nil {
 		return fmt.Errorf("startup recovery failed: %w", err)
 	}
+	readSrv.SetBackend(mptMgr, pub)
 	klog.Info("Startup recovery completed successfully.")
 
 	// 8. Start Background Tile Reaper
 	if !*disableReaper {
 		tileReaper := ingest.NewTileReaper(db, mptMgr, tileCache)
+		tileReaper.SetWatermarkFunc(coord.SafeWatermark)
 		go func() {
 			_ = tileReaper.Run(ctx, 60*time.Second)
 		}()
@@ -507,6 +525,21 @@ func resolveKey(keyOrPath string) (string, error) {
 		return string(bytes.TrimSpace(data)), nil
 	}
 	return keyOrPath, nil
+}
+
+func splitNonEmptyCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func isFlagPassed(name string) bool {

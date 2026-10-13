@@ -36,11 +36,12 @@ type TreeSizeReader interface {
 }
 
 // TileReaper periodically deletes pruned cached tile files below the SafeWatermark.
-// SafeWatermark = min(m_kv_size, MPT.PersistedVersion()).
+// SafeWatermark = min(m_kv_size, MPT.PersistedSize()).
 type TileReaper struct {
-	kvReader   KVSizeReader
-	treeReader TreeSizeReader
-	cache      TilePruner
+	kvReader    KVSizeReader
+	treeReader  TreeSizeReader
+	cache       TilePruner
+	watermarkFn func(context.Context) (uint64, error)
 }
 
 // NewTileReaper creates a new TileReaper instance.
@@ -52,13 +53,21 @@ func NewTileReaper(kvReader KVSizeReader, treeReader TreeSizeReader, cache TileP
 	}
 }
 
+// SetWatermarkFunc configures a coordinator-governed watermark provider (e.g. Coordinator.SafeWatermark).
+func (r *TileReaper) SetWatermarkFunc(fn func(context.Context) (uint64, error)) {
+	r.watermarkFn = fn
+}
+
 // New creates a new TileReaper instance (alias for NewTileReaper).
 func New(kvReader KVSizeReader, treeReader TreeSizeReader, cache TilePruner) *TileReaper {
 	return NewTileReaper(kvReader, treeReader, cache)
 }
 
-// SafeWatermark returns min(m_kv_size, MPT.PersistedVersion()).
-func (r *TileReaper) SafeWatermark(_ context.Context) (uint64, error) {
+// SafeWatermark returns min(m_kv_size, MPT.PersistedSize()).
+func (r *TileReaper) SafeWatermark(ctx context.Context) (uint64, error) {
+	if r.watermarkFn != nil {
+		return r.watermarkFn(ctx)
+	}
 	if r.kvReader == nil {
 		return 0, nil
 	}

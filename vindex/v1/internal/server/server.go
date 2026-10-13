@@ -57,6 +57,7 @@ func CleanPathPrefix(prefix string) string {
 
 // ReadServer serves HTTP lookup and checkpoint queries.
 type ReadServer struct {
+	backendMu     sync.RWMutex
 	store         kvstore.IndexStore
 	mptMgr        *tree.Manager
 	publisher     *tree.OutputPublisher
@@ -85,6 +86,20 @@ func NewReadServer(store kvstore.IndexStore, mptMgr *tree.Manager, pub *tree.Out
 	}
 }
 
+// SetBackend attaches or updates the MPT Manager and OutputPublisher after asynchronous initialization.
+func (s *ReadServer) SetBackend(mptMgr *tree.Manager, pub *tree.OutputPublisher) {
+	s.backendMu.Lock()
+	defer s.backendMu.Unlock()
+	s.mptMgr = mptMgr
+	s.publisher = pub
+}
+
+func (s *ReadServer) getBackend() (*tree.Manager, *tree.OutputPublisher) {
+	s.backendMu.RLock()
+	defer s.backendMu.RUnlock()
+	return s.mptMgr, s.publisher
+}
+
 // ChunkSize returns the configured chunk capacity.
 func (s *ReadServer) ChunkSize() uint64 {
 	if s.chunkSize == 0 {
@@ -110,7 +125,8 @@ func (s *ReadServer) PathPrefix() string {
 
 // Publisher returns the underlying OutputPublisher.
 func (s *ReadServer) Publisher() *tree.OutputPublisher {
-	return s.publisher
+	_, pub := s.getBackend()
+	return pub
 }
 
 // SetHealthChecker registers a dynamic health check callback for /healthz. If hc is nil,
@@ -213,8 +229,15 @@ func (s *ReadServer) HandleCheckpoint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	state := s.publisher.GetServingState()
+	_, pub := s.getBackend()
+	if pub == nil {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "checkpoint not ready", http.StatusServiceUnavailable)
+		return
+	}
+	state := pub.GetServingState()
 	if state == nil || len(state.RawCheckpoint) == 0 {
+		w.Header().Set("Retry-After", "30")
 		http.Error(w, "checkpoint not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -229,8 +252,15 @@ func (s *ReadServer) HandleInputLogCheckpoint(w http.ResponseWriter, r *http.Req
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	state := s.publisher.GetServingState()
+	_, pub := s.getBackend()
+	if pub == nil {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "input log checkpoint not ready", http.StatusServiceUnavailable)
+		return
+	}
+	state := pub.GetServingState()
 	if state == nil || len(state.RawInputLogCP) == 0 {
+		w.Header().Set("Retry-After", "30")
 		http.Error(w, "input log checkpoint not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -276,6 +306,7 @@ func (s *ReadServer) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 	s.healthMu.RUnlock()
 	if rc != nil {
 		if err := rc(); err != nil {
+			w.Header().Set("Retry-After", "30")
 			type jsonDiagnosticsProvider interface {
 				JSONDiagnostics() []byte
 			}
@@ -289,8 +320,17 @@ func (s *ReadServer) HandleReadyz(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	state := s.publisher.GetServingState()
+	mptMgr, pub := s.getBackend()
+	if mptMgr == nil || pub == nil {
+		w.Header().Set("Retry-After", "30")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"mpt_initializing","genesis_backfill":false}` + "\n"))
+		return
+	}
+	state := pub.GetServingState()
 	if state == nil || len(state.RawCheckpoint) == 0 {
+		w.Header().Set("Retry-After", "30")
 		http.Error(w, "serving state not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -341,15 +381,29 @@ func (s *ReadServer) HandleLookup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Snapshot Serving State & MPT proof under unified lock
-	s.mptMgr.RLock()
-	state := s.publisher.GetServingState()
-	if state == nil {
-		s.mptMgr.RUnlock()
+	mptMgr, pub := s.getBackend()
+	if mptMgr == nil || pub == nil {
+		w.Header().Set("Retry-After", "30")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"mpt_initializing","genesis_backfill":false}` + "\n"))
+		return
+	}
+	if pub.GetServingState() == nil {
+		w.Header().Set("Retry-After", "30")
 		http.Error(w, "serving state not initialized", http.StatusServiceUnavailable)
 		return
 	}
-	proof, _, exists, err := s.mptMgr.ProveLocked(keyHash)
-	s.mptMgr.RUnlock()
+	mptMgr.RLock()
+	state := pub.GetServingState()
+	if state == nil {
+		mptMgr.RUnlock()
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, "serving state not initialized", http.StatusServiceUnavailable)
+		return
+	}
+	proof, _, exists, err := mptMgr.ProveLocked(keyHash)
+	mptMgr.RUnlock()
 
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to generate MPT proof: %v", err), http.StatusInternalServerError)

@@ -168,6 +168,65 @@ func TestReadServer_HealthAndReadiness(t *testing.T) {
 	}
 }
 
+func TestReadServer_AsyncBackendAndGenesisBackfillDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	db, err := kvstore.Open(dir, &pebble.Options{})
+	if err != nil {
+		t.Fatalf("kvstore.Open failed: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// 1. Start ReadServer before MPT/OutputPublisher are attached (mptMgr == nil, pub == nil)
+	srv := NewReadServer(db, nil, nil, 256)
+
+	// /healthz must immediately return 200 OK
+	hW := httptest.NewRecorder()
+	srv.HandleHealthz(hW, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if hW.Code != http.StatusOK {
+		t.Fatalf("HandleHealthz before backend attach = %d, want 200", hW.Code)
+	}
+
+	// /readyz, /syncz, and /vindex/v1/lookup/ must return 503 with Retry-After: 30 and JSON mpt_initializing
+	for _, endpoint := range []struct {
+		path    string
+		handler http.HandlerFunc
+	}{
+		{"/readyz", srv.HandleReadyz},
+		{"/syncz", srv.HandleReadyz},
+		{"/vindex/v1/lookup/" + strings.Repeat("a", 64), srv.HandleLookup},
+	} {
+		w := httptest.NewRecorder()
+		endpoint.handler(w, httptest.NewRequest(http.MethodGet, endpoint.path, nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s before backend attach = %d, want 503", endpoint.path, w.Code)
+		}
+		if w.Header().Get("Retry-After") != "30" {
+			t.Fatalf("%s Retry-After = %q, want 30", endpoint.path, w.Header().Get("Retry-After"))
+		}
+		if !strings.Contains(w.Body.String(), `"status":"mpt_initializing"`) {
+			t.Fatalf("%s body = %q, want mpt_initializing JSON", endpoint.path, w.Body.String())
+		}
+	}
+
+	// 2. Attach backend and ReadyChecker simulating Genesis Backfill in progress
+	mptMgr := tree.NewMem()
+	outLog := &mockOutputLog{origin: "example.com/output"}
+	pub := tree.NewOutputPublisher(db, mptMgr, outLog, nil)
+	srv.SetReadyChecker(func() error {
+		return fmt.Errorf(`{"status":"genesis_backfill","genesis_backfill":true,"leaves_indexed":500,"target_leaves":10000}`)
+	})
+	srv.SetBackend(mptMgr, pub)
+
+	rW := httptest.NewRecorder()
+	srv.HandleReadyz(rW, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rW.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz during genesis backfill = %d, want 503", rW.Code)
+	}
+	if !strings.Contains(rW.Body.String(), `"genesis_backfill":true`) {
+		t.Fatalf("/readyz body = %q, want genesis_backfill JSON", rW.Body.String())
+	}
+}
+
 func TestReadServer_ValidationErrors(t *testing.T) {
 	srv, _, _, pub := setupTestServer(t, 256)
 	rawInCP := []byte("example.com/input\n500\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")

@@ -78,6 +78,22 @@ func TestNewPOSIXOutputLog_Validation(t *testing.T) {
 			t.Fatal("expected error with mismatched origin, got nil")
 		}
 	})
+
+	t.Run("BuildWitnessGroup validation", func(t *testing.T) {
+		_, vkey, err := note.GenerateKey(rand.Reader, "witness.test")
+		if err != nil {
+			t.Fatalf("GenerateKey failed: %v", err)
+		}
+		if _, err := tree.BuildWitnessGroup([]string{"https://witness.example.com/"}, []string{vkey}); err != nil {
+			t.Fatalf("BuildWitnessGroup valid failed: %v", err)
+		}
+		if _, err := tree.BuildWitnessGroup([]string{"https://witness.example.com/"}, nil); err == nil {
+			t.Fatal("expected error for mismatched urls/pubKeys length, got nil")
+		}
+		if _, err := tree.BuildWitnessGroup([]string{"://bad_url"}, []string{vkey}); err == nil {
+			t.Fatal("expected error for invalid witness URL, got nil")
+		}
+	})
 }
 
 func TestPOSIXOutputLog_LifecycleAndVerification(t *testing.T) {
