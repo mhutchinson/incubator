@@ -12,19 +12,19 @@ These examples demonstrate how external developers can implement and compile cus
    - Parses Go Checksum Database (`go.sum`) leaves.
    - Validates module path and semver formats.
    - Filters out ephemeral pseudo-versions.
-   - Emits canonical 32-byte SHA-256 hashes of module paths.
+   - Emits canonical case-escaped Go module paths (`module.EscapePath`) via `sdk.RegisterEmit`.
 
 2. **`ct`** (`mapfn/examples/ct`):
    - Parses Certificate Transparency (RFC 6962) `MerkleTreeLeaf`, raw X.509 DER certificates, and PreCertificates.
    - Extracts Subject Common Name (CN) and Subject Alternative Names (SANs).
-   - Generates hierarchical domain sub-roots down to eTLD+1 using `publicsuffix`.
-   - Emits sorted, deterministic 32-byte SHA-256 hashes.
+   - Normalizes domains (IDNA2008 Punycode, lowercase) into reversed-label canonical keys with a mandatory trailing dot (`com.google.mail.`, `com.google.*.`), without map-time parent expansion.
+   - Emits canonical domain keys via `sdk.RegisterEmit` for direct MPT prefix/point indexing.
 
 3. **`mtc`** (`mapfn/examples/mtc`):
    - Parses Merkle Tree Certificates (MTC) Type 1 `TBSCertificateLogEntry` ASN.1 DER leaves.
-   - Extracts Subject Alternative Names (SANs).
-   - Generates hierarchical domain sub-roots down to eTLD+1 using `publicsuffix`.
-   - Emits canonical preimages to host runtime.
+   - Extracts Subject Common Name (CN) and Subject Alternative Names (SANs).
+   - Normalizes domains (IDNA2008 Punycode, lowercase) into reversed-label canonical keys with a mandatory trailing dot (`com.google.mail.`, `com.google.*.`), without map-time parent expansion.
+   - Emits canonical domain keys to the host runtime via `sdk.RegisterEmit`.
 
 4. **`starter`** (`mapfn/examples/starter`):
    - Minimal boilerplate demonstrating zero-allocation leaf ingestion and key emission.

@@ -8,7 +8,7 @@ This backlog consolidates open architectural refinements, documentation alignmen
 | :--- | :--- | :--- | :--- |
 | **M1: Core Storage, Recovery & Pipeline Hardening** | ✅ Complete | Orthogonal engine & storage fixes: `kvstore` (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`), `ingest` & WASM slab safety (`2.1.1`–`2.1.5`, `2.2.1`, `2.2.2`, `2.2.4`), `tree`/`coordinator` recovery & durability (`1.1.4`, `2.4.1`, `2.4.2`, `2.5.1`–`2.5.4`, `2.6.5`), and `auditor` (`2.7.1`–`2.7.4`). | [`docs/milestones/milestone-01-engine-hardening.md`](docs/milestones/milestone-01-engine-hardening.md) |
 | **M2: True Prefix Lookups & Two-Endpoint Read Protocol** | ✅ Complete | Variable-length `[]byte` MPT keys (`filippo.io/torchwood/mpt`), `/vindex/v1/keys/{key...}` + `/vindex/v1/entries/{key...}` split, server-side eTLD+1 & `maxPrefixKeys` guardrails, reversed-label trailing-dot CT/MTC mappers, and client verification (`1.1.0`, `1.1.1`, `2.2.3`, `2.6.1`–`2.6.3`). | [`docs/milestones/milestone-02-prefix-lookups.md`](docs/milestones/milestone-02-prefix-lookups.md) ([`docs/PREFIX_LOOKUPS.md`](docs/PREFIX_LOOKUPS.md)) |
-| **M3: Package Decoupling & C2SP `tlog-vindex` Spec Alignment** | 🚧 In Progress | Split `internal/mpt` vs `internal/publish` (`1.2.1`, `2.6.4`), extract `mapfn/host` (`1.2.2`) and shared `wire/` (`1.2.3`), isolate `internal/mtc` (`1.2.4`), and align all Type A/B docs (`1.3.1`–`1.3.7`). | [`docs/milestones/milestone-03-decoupling-and-spec-alignment.md`](docs/milestones/milestone-03-decoupling-and-spec-alignment.md) |
+| **M3: Package Decoupling & C2SP `tlog-vindex` Spec Alignment** | ✅ Complete | Split `internal/mpt` vs `internal/publish` (`1.2.1`, `2.6.4`), extract `mapfn/host` (`1.2.2`) and shared `wire/` (`1.2.3`), isolate `internal/mtc` (`1.2.4`), and align all Type A/B docs (`1.3.1`–`1.3.7`). | [`docs/milestones/milestone-03-decoupling-and-spec-alignment.md`](docs/milestones/milestone-03-decoupling-and-spec-alignment.md) |
 
 > **Performance Commit Policy**: Every performance improvement (`1.1.2`, `1.1.3`, `2.3.1`–`2.3.3`, etc.) MUST include unit tests and Go benchmarks (`go test -bench=... -benchmem`), and cite the **before/after performance scores (`ns/op`, `B/op`, `allocs/op`) directly in the commit message**.
 
@@ -64,19 +64,19 @@ It is organized into three categories:
 
 ### 1.2 Subcomponent Splitting & Package Decoupling
 
-- [ ] **1.2.1 Split `internal/tree` into Pure State Trie (`internal/mpt`) and Output Log Publisher (`internal/publish`)**
+- [x] **1.2.1 Split `internal/tree` into Pure State Trie (`internal/mpt`) and Output Log Publisher (`internal/publish`)**
   - **Problem**: `internal/tree` currently bundles the pure Sparse Merkle Patricia Trie wrapper (`mpt.go`) with the stateful `OutputPublisher` and `POSIXOutputLog` (`publisher.go`, `posix.go`, `outputlog.go`). Because `OutputPublisher` imports `internal/kvstore` (`cockroachdb/pebble`) and `tessera`, any package importing `internal/tree` for stateless MPT proof verification (`tree.Verify`)—including [`client/client.go`](client/client.go)—transitively drags in `pebble` and `tessera`.
   - **Action**: Split `internal/tree` into a pure trie package (`internal/mpt`) and a stateful publication package (`internal/publish`), severing `client`'s transitive dependency on `pebble`.
 
-- [ ] **1.2.2 Split `internal/ingest` into Upstream Tile Ingestion (`internal/ingest`) and Host WASM Sandbox (`mapfn/host` or `internal/wasmhost`)**
+- [x] **1.2.2 Split `internal/ingest` into Upstream Tile Ingestion (`internal/ingest`) and Host WASM Sandbox (`mapfn/host` or `internal/wasmhost`)**
   - **Problem**: `internal/ingest` (2,648 non-test lines) combines HTTP/file tile fetching and disk caching (`fetcher.go`, `cache.go`, `reaper.go`) with the 923-line Wazero host sandbox and `map_bundle` slab ABI unpacker (`wasm.go`). Tools like `cmd/vindex-wasm` that only test `.wasm` plugins must import the entire network tile-fetching stack.
   - **Action**: Extract `wasm.go` into `mapfn/host` (or `internal/wasmhost`) alongside `mapfn/sdk` so both sides of the `input_buffer` / `map_bundle` binary slab contract live together.
 
-- [ ] **1.2.3 Extract Shared C2SP Wire Format & Proof Primitives (`wire/` or `internal/wire`)**
+- [x] **1.2.3 Extract Shared C2SP Wire Format & Proof Primitives (`wire/` or `internal/wire`)**
   - **Problem**: C2SP multi-section response serialization (`internal/server/format.go`) and parsing (`client/client.go`), Output Log leaf formatting/parsing (`internal/tree/outputlog.go`), and RFC 6962 mini-log leaf/interior hashing (`internal/kvstore/compact.go` vs `client/client.go`) are duplicated or scattered across 4 packages.
   - **Action**: Extract a zero-dependency wire/proof package shared by `server`, `client`, and `auditor`.
 
-- [ ] **1.2.4 Isolate Ecosystem-Specific `internal/mtc` Leaf Mapping Out of Core Engine Internals**
+- [x] **1.2.4 Isolate Ecosystem-Specific `internal/mtc` Leaf Mapping Out of Core Engine Internals**
   - **Problem**: [`internal/mtc/mtc.go`](internal/mtc/mtc.go) combines MTC checkpoint signature verification (`MTCVerifier`) with ASN.1 DER certificate domain mapping (`MTCLeafMapper`, which imports `internal/ingest` and duplicates `mapfn/examples/mtc`).
   - **Action**: Move `MTCLeafMapper` to the MTC personality (`cmd/mtcindex` / `mapfn/examples/mtc`) and keep only checkpoint signature verification in `internal/verifier`.
 
@@ -84,25 +84,25 @@ It is organized into three categories:
 
 ### 1.3 Design Document Alignment & Hygiene
 
-- [ ] **1.3.1 Deduplicate Auditor Section in `docs/ARCHITECTURE.md`**
+- [x] **1.3.1 Deduplicate Auditor Section in `docs/ARCHITECTURE.md`**
   - [`docs/ARCHITECTURE.md §3`](docs/ARCHITECTURE.md) duplicates the threat vector matrix, mismatch halt sequence, and 5-step operational runbook from [`internal/auditor/README.md §2.3–2.7`](internal/auditor/README.md) almost verbatim. Condense `ARCHITECTURE.md §3` to a high-level architectural summary and link to `internal/auditor/README.md`.
 
-- [ ] **1.3.2 Qualify Cold-Start Recovery SLO in `ARCHITECTURE.md`, `coordinator/README.md`, and `tree/README.md`**
+- [x] **1.3.2 Qualify Cold-Start Recovery SLO in `ARCHITECTURE.md`, `coordinator/README.md`, and `tree/README.md`**
   - [`docs/ARCHITECTURE.md §2.2`](docs/ARCHITECTURE.md) and [`internal/coordinator/README.md §1.3 & §2.5`](internal/coordinator/README.md) claim `< 5ms` warm start and `< 500ms` dirty recovery without noting that `tree.Open()` currently replays uncompacted `torchwood/mpt` journal frames before `coord.Recover()` runs (see [3.1](#31-filippoiotorchwoodmpt--redundant-synchronous-disk-writes-on-journal-replay-22m-pwrite-syscalls)). Document this constraint and link to [`docs/BENCHMARKS.md §5`](docs/BENCHMARKS.md#5-post-run-empirical-evaluation--cold-startup-investigation-2026-09-22).
 
-- [ ] **1.3.3 Standardize Checkpoint Field Names Across All Design Docs**
+- [x] **1.3.3 Standardize Checkpoint Field Names Across All Design Docs**
   - [`docs/ARCHITECTURE.md §0.2`](docs/ARCHITECTURE.md) uses `Output_CP.Leaf.InputLogSize` and `Serving_CP.InputLogSize`, whereas [`coordinator/README.md`](internal/coordinator/README.md), [`kvstore/README.md`](internal/kvstore/README.md), [`tree/README.md`](internal/tree/README.md), [`server/README.md`](internal/server/README.md), and `ARCHITECTURE.md §3.3` use `Output_CP.InputSize` and `Serving_CP.InputSize`. Standardize on one naming convention across all docs.
 
-- [ ] **1.3.4 Clarify Tip vs. Continuation Verification in `client/README.md §2.2`**
+- [x] **1.3.4 Clarify Tip vs. Continuation Verification in `client/README.md §2.2`**
   - Explicitly distinguish Step 3a (Tip query `before == nil`: verify `SubRoot` against `MapRoot` via MPT proof) from Step 3b (Continuation query `before != nil`: verify reconstructed page compact range root against the prior page's `prefix-compact-range-v1` root).
 
-- [ ] **1.3.5 Document `internal/budget` and `internal/verifier` in Architecture & Repository Map**
+- [x] **1.3.5 Document `internal/budget` and `internal/verifier` in Architecture & Repository Map**
   - Add [`internal/budget`](internal/budget/budget.go) (resource budget resolution across RAM/CPUs) and [`internal/verifier`](internal/verifier/verifier.go) to [`README.md §8`](README.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-- [ ] **1.3.6 Clean Up Legacy Route and Internal Symbol References in `hammer/README.md`**
+- [x] **1.3.6 Clean Up Legacy Route and Internal Symbol References in `hammer/README.md`**
   - Update `GET /vindex/lookup/{keyhash}` in [`hammer/README.md §2.4`](hammer/README.md) to `GET /vindex/v1/lookup/{keyhash}`, and replace internal mutex/code snippets (`treeMu.Lock()`) with prose contract descriptions.
 
-- [ ] **1.3.7 Add Executable Verification Gates and Design Logs to Type A/B Specs**
+- [x] **1.3.7 Add Executable Verification Gates and Design Logs to Type A/B Specs**
   - Add explicit exit-0 CLI verification gate commands (`go test -race ./...`) and a bottom `Design Log` section to the canonical Type A and Type B design documents.
 
 ---
@@ -256,7 +256,7 @@ It is organized into three categories:
   - **Bug**: On *any* error from `c.client.Lookup`—including a cryptographic proof failure—`VIndexClient.Lookup` falls back to `GET /lookup/{keyhash}` (legacy JSON) and `VerifyLookupResponse`, which further falls back to accepting a plain linear `sha256` hash over raw 8-byte indices if RFC 6962 compact range verification fails.
   - **Fix**: Remove the legacy JSON endpoint fallback and linear SHA-256 hash fallback from `client/client.go`, and have `VIndexClient.Lookup` call `c.client.LookupAll`.
 
-- [ ] **2.6.4 Missing Checkpoint Signature Verification, Witness Quorum (`tlog-policy`), & Step 5 History Check in `client/`**
+- [x] **2.6.4 Missing Checkpoint Signature Verification, Witness Quorum (`tlog-policy`), & Step 5 History Check in `client/`**
   - **Location**: [`client/client.go:73-78, 135-147, 190-202, 581-631`](client/client.go#L73-L78)
   - **Bug**:
     1. If `OutputLogVerifier == nil` or `InputLogVerifier == nil`, `VerifyResponse` silently skips signature verification (`tree.ParseCheckpointHeader`).

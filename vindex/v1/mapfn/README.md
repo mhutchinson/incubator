@@ -9,8 +9,8 @@ This document defines the WebAssembly guest ABI, developer contract, memory mana
 ### 1.1 Architectural Separation: User Callback vs. Guest SDK vs. Host Runtime
 Mapping in VIndex operates across three decoupled layers:
 1. **User Logic (`MapFn`)**: The pure Go function implementing the streaming callback (`func(leaf []byte, emit func(key []byte))`) written by ecosystem developers. It has no knowledge of WebAssembly, linear memory pointers, or host runtimes.
-2. **Guest SDK (`mapfn/sdk`)**: The runtime harness compiled into the guest `.wasm` binary alongside `MapFn`. It exports the low-level `map_bundle` ABI, manages linear memory slabs, iterates through leaf crates, invokes `MapFn`, and serializes output preimages via `emit`.
-3. **Host Ingest Runtime (`internal/ingest`)**: The host-side Wazero worker pool that loads the compiled `.wasm` plugin, executes `map_bundle` over 256-leaf tiles, and computes 32-byte key hashes using native CPU SIMD instructions.
+2. **Guest SDK (`mapfn/sdk`)**: The runtime harness compiled into the guest `.wasm` binary alongside `MapFn`. It exports the low-level `map_bundle` and `input_buffer` ABIs, manages linear memory slabs, iterates through leaf crates, invokes `MapFn`, and serializes output canonical keys via `emit`.
+3. **Host Sandbox Runtime (`mapfn/host` & `internal/ingest`)**: `mapfn/host` provides the standalone, WASI-free Wazero sandbox pool (`InstantiateModule`) that loads the compiled `.wasm` plugin, executes `map_bundle` over 256-leaf tiles, preserves the emitted canonical keys for the MPT, and computes 32-byte key hashes using native CPU SIMD instructions for Pebble storage.
 
 ### 1.2 Problem Statement & Real-World Friction
 Every transparency ecosystem indexes different payloads (e.g. DER X.509 certificates in Certificate Transparency, newline-delimited strings in Go SumDB, or JSON provenance records in Sigstore). VIndex must allow ecosystem authors to define custom extraction logic without compromising node security, crashing the host process, or causing state divergence across independent monitors.
@@ -258,3 +258,22 @@ While WebAssembly provides sandboxed memory safety and cross-platform determinis
 | **Projected Wall Time (1B Leaves)** | 18.9 hours | **2.53 hours** | **-16.37 hours (-86.6%)** |
 
 Across all 10,240 real Static-CT certificates in the evaluation dataset, the targeted scanner produced output 100% bitwise identical to `crypto/x509` (0 mismatches).
+
+---
+
+## 4. Verification Gate
+
+All guest SDK, sandbox host (`mapfn/host`), example mapper (`ct`, `mtc`, `sumdb`), and `vindex-wasm` CLI tests are verified via:
+
+```bash
+go test -race ./vindex/v1/mapfn/... ./vindex/v1/cmd/vindex-wasm/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined `EmitMapFunc`, `input_buffer` / `map_bundle` pack-and-wipe slabs, and targeted ASN.1 CT scanner. |
+| 2026-10-14 | M1–M3 | Fixed guest `input_buffer` pointer cache and output overflow trap (`ErrWASMFatalTrap`) (M1), updated CT/MTC mappers to reversed-label trailing-dot canonical keys and Go SumDB case-escaping (M2), and extracted standalone `mapfn/host` sandbox package (M3). |

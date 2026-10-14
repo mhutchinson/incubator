@@ -44,8 +44,9 @@ The VIndex topology bounds search indexing between two append-only logs—a stru
 | **Output Log** | Cryptographic anchor committing to index state (`MapRoot` + Input Log checkpoint). | Append-only log of state commitments signed and monitored by an independent witness network. |
 
 ### Core System Guarantees
-- **O(1) Point Lookups**: Constant-time key lookups returning targeted lists of leaf pointers.
-- **Omission Resistance**: Every query response delivers cryptographic inclusion proofs (for matching keys) or non-inclusion proofs (for absent keys) against witnessed checkpoints.
+- **O(1) Point Lookups & Subtree Prefix Lookups**: Constant-time point lookups and bounded prefix scans (`?prefix=true`) over variable-length canonical keys (`1..1024` bytes), returning verified mini-log roots and targeted lists of leaf pointers.
+- **Two-Endpoint Read Protocol**: Separates state commitment & MPT proof generation (`GET /vindex/v1/keys/{key...}`) from lock-free Pebble entry pagination (`GET /vindex/v1/entries/{key...}?before=X`).
+- **Omission Resistance**: Every query response delivers cryptographic inclusion proofs, non-inclusion proofs, or two-sided prefix proofs against witnessed checkpoints.
 - **Decoupled Security**: VIndex operates as a secondary search overlay. If an indexer halts, corrupts, or falls behind, the underlying Input Log's consensus and security remain completely unaffected.
 
 ### Input Log Checkpoint Verification Schemes
@@ -69,9 +70,9 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 ## 4. Non-Negotiable System Scope
 
 1. **Strictly Single-Machine Deployment**: VIndex operates strictly within a single process on a single host. It avoids internal clustering, distributed consensus (Raft/Paxos), or multi-node replication. High availability is achieved externally: independent monitors and mirrors run standalone VIndex instances against the shared Input Log.
-2. **Point Lookups by 32-Byte Key Hashes**: The production serving plane provides point queries exclusively over exact 32-byte key hashes (`KeyHash = SHA256(CanonicalSubject)`). Cross-key scans, substring matches, full-text queries, and arbitrary regex searches are out of scope.
+2. **Canonical Key & Bounded Prefix Lookups**: The production serving plane provides point queries and policy-guarded prefix queries (`?prefix=true`) over canonical printable ASCII keys (`1..1024` bytes, `0x21..0x7E`), alongside legacy 32-byte key-hash point lookups. Unbounded full-tree scans, arbitrary substring matches, and regex searches are out of scope.
 3. **Strictly Append-Only (Zero Tombstones)**: The index state progresses strictly forward. The system supports no deletions, key un-mappings, rollbacks, or tombstones.
-4. **Hermetic, Deterministic Mapping**: The WebAssembly guest plugin operates in a restricted sandbox with zero host I/O, zero network access, and deterministic clocks. Any runtime trap, memory fault, or unhandled exception triggers an immediate `HALT` to prevent unverified state divergence across nodes.
+4. **Hermetic, Deterministic Mapping**: The WebAssembly guest plugin operates in a restricted WASI-free sandbox (`mapfn/host`) with zero host I/O, zero network access, and deterministic execution. Any runtime trap, memory fault, or unhandled exception triggers an immediate `HALT` to prevent unverified state divergence across nodes.
 
 ---
 
@@ -79,12 +80,12 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 
 - **Input Log**: The authoritative, append-only source transparency log containing the raw entries to be indexed.
 - **Claim Subject**: The specific entity or identifier a log entry is about (e.g. domain name in CT, module path in Go SumDB, or artifact digest in Sigstore).
-- **Canonical Preimage**: The normalized byte or string representation of a Claim Subject (e.g. lowercase Punycode domain `example.com`) extracted from a raw leaf by the `MapFn` callback before host-side hashing.
+- **Canonical Key (Preimage)**: The normalized printable ASCII representation (`1..1024` bytes in `0x21..0x7E`, e.g. reversed-label domain `com.google.mail.` or case-escaped Go module path) extracted from a raw leaf by `MapFn`. Canonical keys are stored directly in the Sparse Merkle Patricia Trie (`internal/mpt`) to support both point and prefix proofs, and hashed via `SHA-256(key)` into 32-byte keys for Pebble inverted chunk storage (`internal/kvstore`).
 - **MapFn**: A pure Go developer function (`type EmitMapFunc func(leaf []byte, emit func(key []byte))`) defining domain-specific key extraction logic via streaming callback without WebAssembly or runtime dependencies.
 - **WASM Guest SDK (`mapfn/sdk`)**: The in-guest runtime harness compiled into the `.wasm` plugin that implements `map_bundle`, manages linear memory slabs, and invokes the user's `MapFn`.
-- **WASM Mapper (`internal/ingest`)**: The host-side worker pool that executes `.wasm` plugins inside Wazero sandboxes, extracts canonical preimages, and hashes them via native CPU SIMD instructions.
+- **WASM Sandbox Host (`mapfn/host`)**: The standalone, WASI-free Wazero worker pool that executes `.wasm` plugins deterministically, shared by the ingestion pipeline (`internal/ingest`) and offline developer CLI (`cmd/vindex-wasm`).
 - **Inverted Chunk (`^chunkNum`)**: An LSM-tree partition storing up to 65,536 occurrence indices under a bitwise-inverted key number, placing the active append chunk lexicographically first.
-- **Sparse Merkle Patricia Trie (MPT)**: An authenticated binary trie mapping 32-byte key hashes to 32-byte mini-log roots, supporting logarithmic inclusion and non-inclusion proofs.
+- **Sparse Merkle Patricia Trie (MPT, `internal/mpt`)**: An authenticated binary trie (`filippo.io/torchwood/mpt`) mapping variable-length canonical keys (`1..1024` bytes) to 32-byte mini-log roots, supporting point inclusion, point non-inclusion, and two-sided prefix subtree proofs.
 - **Witnessed Output Log**: A secondary append-only Merkle log (`tlog-tiles`) that commits to the cryptographic state (`MapRoot` + Input Log checkpoint) and is cosigned by an independent witness network.
 - **Independent Auditor / Mirror**: A standalone daemon (`vindex-auditor`) that re-indexes both logs from leaf 0, asserts root equality, halts forward sync and freezes database files on disk upon mismatches, raises critical alerts, and by default keeps serving lookups pinned to the last verified checkpoint (`Serving_CP`) with an opt-in fail-closed mode (`--fail_closed=true`).
 
@@ -119,21 +120,23 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 
 ### Core Architecture & Ecosystems
 - [**System Architecture**](./docs/ARCHITECTURE.md): Primary pipeline flow, subsystem map, system-wide invariants, Zero-WAL crash consistency, operational sizing, and retired alternatives.
-- [**Applications & Ecosystem Specifications**](./docs/APPLICATIONS.md): Universal Claim Subject Map model, canonicalization profiles, host hardware SIMD hashing, forward-compatible prefix tries, and ecosystem specifications (CT, MTC, Go SumDB, Sigstore, Sigsum).
+- [**True Prefix Lookups & Two-Endpoint Protocol**](./docs/PREFIX_LOOKUPS.md): Variable-length canonical MPT keys, two-sided prefix proofs, reversed-label domain canonicalization, eTLD+1 policy guardrails, and the two-endpoint C2SP read protocol (`/vindex/v1/keys/` and `/vindex/v1/entries/`).
+- [**Applications & Ecosystem Specifications**](./docs/APPLICATIONS.md): Universal Claim Subject Map model, canonicalization profiles, host hardware SIMD hashing, and ecosystem specifications (CT, MTC, Go SumDB, Sigstore, Sigsum).
 - [**Benchmarks & Empirical Evaluation**](./docs/BENCHMARKS.md): Empirical telemetry on 24-core NVMe hardware, full Go SumDB ingestion (up to 295k leaves/sec sustained / 258k leaves/sec overall), read latency distributions, MapFn FFI profiling (< 1% CPU), and capacity planning guidelines.
 
 ### Client & Subsystem Specifications
-- [**Client SDK & Query Proof Verification**](./client/README.md): Public, stateless Go client library, C2SP response parsing, 5-step cryptographic verification sequence, and backward pagination chains.
+- [**Client SDK & Query Proof Verification**](./client/README.md): Public, stateless Go client library, two-endpoint C2SP verification, two-sided prefix proofs, witness policies, monotonic history ratcheting, and backward pagination chains.
+- [**C2SP Wire Format & Merkle Codecs**](./wire/wire.go): Public, zero-I/O C2SP multi-section parser/formatter, Output Log leaf codecs, and RFC 6962 mini-log compact range root computation.
 - [**Ingestion Pipeline & Tile Cache**](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, WASM worker pool, host SIMD hashing, monotonic resequencing, and safe cache pruning.
-- [**WASM Guest SDK & Plugin Interface**](./mapfn/README.md): Guest SDK runtime harness, pack-and-wipe linear memory slabs, high-level developer experience, bytecode immutability, and `vindex-wasm` verification tooling.
+- [**WASM Guest SDK & Plugin Interface**](./mapfn/README.md): Guest SDK runtime harness (`mapfn/sdk`), WASI-free Wazero sandbox host (`mapfn/host`), pack-and-wipe linear memory slabs, and `vindex-wasm` verification tooling.
 - [**Inverted Chunk Storage Engine**](./internal/kvstore/README.md): Embedded Pebble LSM engine, inverted chunk keys (`'c' + KeyHash + ^chunkNum`), 33-byte prefix Bloom filters, delimitless 16-bit offset serialization, and the `pebble-tests` empirical suite.
-- [**Authenticated State Commitment (MPT & Publisher)**](./internal/tree/README.md): Binary Sparse Merkle Patricia Trie in `mmap`, non-blocking root prediction, 3-step atomic commitment dance, and split-locking concurrency (< 5ms critical section).
-- [**Read Serving & C2SP Query Protocol**](./internal/server/README.md): C2SP HTTP REST endpoints, multi-section plaintext wire format, inductive backward verification protocol, and reader snapshot isolation.
+- [**Authenticated State Commitment (MPT & Publisher)**](./internal/tree/README.md): Variable-length binary Sparse Merkle Patricia Trie (`internal/mpt`), non-blocking root prediction, 3-step atomic commitment dance (`internal/tree`), and split-locking concurrency (< 5ms critical section).
+- [**Read Serving & C2SP Query Protocol**](./internal/server/README.md): Two-endpoint C2SP HTTP REST protocol (`/vindex/v1/keys/` and lock-free `/vindex/v1/entries/`), prefix policy guardrails, inductive backward verification, and reader snapshot isolation.
 - [**Coordinator & Lifecycle Engine**](./internal/coordinator/README.md): Batch loop orchestration, checkpoint progression chain, moving-goalpost prevention (freezing target sync checkpoints), and 3-phase Zero-WAL crash recovery.
 - [**Independent Log Auditor & Verified Mirror**](./internal/auditor/README.md): Full-log audit verification from leaf 0, root mismatch alerting, state-preserving forensic halts, pinned last-known-good checkpoint serving (`Serving_CP`), opt-in fail-closed revocation (`--fail_closed=true`), and verified mirror serving.
 
 ### Tooling & Verification
-- [**Hammer Load Testing Framework**](./hammer/README.md): Integration testbed, Zipfian synthetic generator, Tessera POSIX sequencer, drip-feed proxy schedules, and verifying concurrent readers.
+- [**Hammer Load Testing Framework**](./hammer/README.md): Integration load generator, Zipfian workload synthesizer, and concurrent verifying reader harness.
 
 ---
 
@@ -142,22 +145,28 @@ When configuring `vindexd` or `vindex` CLI, `--input_log_pubkey` (or `--in_log_p
 ### Repository Structure
 The `vindex/v1/` repository layout reflects the decoupled modular architecture:
 
-- [`client/`](./client/README.md): Public, stateless client verification SDK and cryptographic proof validation pipeline.
+- [`client/`](./client/README.md): Public, lightweight client verification SDK and HTTP client (decoupled from `pebble` and `wazero`).
+- [`wire/`](./wire/): Public C2SP `tlog-vindex` multi-section wire framing, Output Log leaf codecs, and RFC 6962 mini-log root calculation.
 - [`cmd/`](./cmd/): Command-line developer utilities and operational binaries.
-  - [`vindex-wasm/`](./cmd/vindex-wasm/): CLI tooling for inspecting, testing, and benchmarking WASM mapping plugins.
-- [`docs/`](./docs/): Authoritative specifications, system architecture designs, application profiles, and empirical benchmarks.
-- [`hammer/`](./hammer/README.md): Synthetic Zipfian load generator, drip-feed proxy scheduler, and closed-loop verification harness.
+  - [`vindex-wasm/`](./cmd/vindex-wasm/): Offline CLI tooling for inspecting, testing, and benchmarking WASM mapping plugins (decoupled from `net/http` and `tessera`).
+- [`docs/`](./docs/): Authoritative specifications, system architecture designs, prefix lookup specs, application profiles, and empirical benchmarks.
+- [`hammer/`](./hammer/README.md): Synthetic Zipfian load generator and closed-loop verification harness.
 - [`internal/`](./internal/): Private core engine subsystems:
   - [`auditor/`](./internal/auditor/README.md): Full-log independent auditor, root mismatch detection, and verified mirror engine.
+  - [`budget/`](./internal/budget/): Host resource budget calculation across system RAM, CPU cores, and storage caches.
   - [`coordinator/`](./internal/coordinator/README.md): Batch loop orchestration, watermark synchronization, and Zero-WAL crash recovery.
-  - [`ingest/`](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, and concurrent WASM worker pool.
+  - [`ingest/`](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, and concurrent mapping pipeline.
   - [`kvstore/`](./internal/kvstore/README.md): Embedded Pebble LSM inverted chunk storage engine with bitwise chunk inversion.
   - [`metrics/`](./internal/metrics/): Prometheus metrics registration, latency histograms, and engine telemetry instrumentation.
-  - [`server/`](./internal/server/README.md): C2SP HTTP read server and multi-section plaintext response serialization.
-  - [`tree/`](./internal/tree/README.md): Sparse Merkle Patricia Trie (MPT), mmap allocation, and Output Log publisher.
-- [`mapfn/`](./mapfn/README.md): WebAssembly guest SDK, memory arena runtime, and example mapping plugins:
+  - [`mpt/`](./internal/mpt/): Variable-length `torchwood/mpt` manager, canonical key validation, and point/prefix proof verification.
+  - [`mtc/`](./internal/mtc/): Merkle Tree Certificate (MTC) binary parser, X.509 SAN/CN extractor, and reversed-label domain canonicalizer.
+  - [`server/`](./internal/server/README.md): C2SP HTTP read server (`/vindex/v1/keys/`, `/vindex/v1/entries/`, `/vindex/v1/lookup/`) and prefix policy enforcement.
+  - [`tree/`](./internal/tree/README.md): Output Log publisher, Tessera POSIX log integration, and 3-step state commitment.
+  - [`verifier/`](./internal/verifier/): Public key verifier parsers supporting RFC 6962/SumDB notes and MTC cosigned subtree signatures.
+- [`mapfn/`](./mapfn/README.md): WebAssembly guest SDK, sandbox host runtime, and example mapping plugins:
   - [`sdk/`](./mapfn/sdk/): In-guest runtime harness, pack-and-wipe memory slabs, and low-level ABI bindings.
-  - [`examples/`](./mapfn/examples/): Example mapping plugins for transparency ecosystems (SumDB, Certificate Transparency, starter).
+  - [`host/`](./mapfn/host/): Standalone WASI-free Wazero sandbox host and deterministic memory pool.
+  - [`examples/`](./mapfn/examples/): Example mapping plugins for transparency ecosystems (SumDB, Certificate Transparency, MTC, starter).
 - [`vindex.go`](./vindex.go): Top-level engine lifecycle orchestrator (`Engine`) and public Go API entrypoint.
 
 ### Spec-Driven Development Workflow

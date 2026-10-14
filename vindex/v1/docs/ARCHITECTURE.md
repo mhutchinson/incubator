@@ -7,7 +7,7 @@ This document defines the core architecture, load-bearing invariants, verified p
 ## 0. High Level Overview
 
 ### 0.0 Architectural Context
-VIndex operates as a **Map Sandwich** bounded between an **Input Log** (the immutable source of truth) and a **Witnessed Output Log** (the cryptographic state anchor). For the foundational problem statement, non-negotiable system scope (single-machine deployment, 32-byte key hashes, append-only, hermetic WASM), and development workflow, see the top-level [VIndex README](../README.md).
+VIndex operates as a **Map Sandwich** bounded between an **Input Log** (the immutable source of truth) and a **Witnessed Output Log** (the cryptographic state anchor). For the foundational problem statement, non-negotiable system scope (single-machine deployment, canonical key & bounded prefix lookups, append-only, hermetic WASM), and development workflow, see the top-level [VIndex README](../README.md) and [Prefix Lookups Specification](./PREFIX_LOOKUPS.md).
 
 This document specifies the technical system architecture: the 5-stage pipeline, checkpoint promotion and ratcheting invariants, crash consistency guarantees, operational sizing, and retired design branches.
 
@@ -17,12 +17,12 @@ Data progresses sequentially through 5 modular stages, coordinated by the coordi
 | # | Pipeline Stage | Subsystem Directory | Physical Responsibility & Transition |
 | :- | :--- | :--- | :--- |
 | **1** | **Ingest & Tile Cache** | [`internal/ingest/`](../internal/ingest/README.md) | Polls upstream Input Log checkpoints, downloads and authenticates 256-leaf tiles into local disk cache, and reaps tiles below the safe pruning watermark. |
-| **2** | **Sandboxed Mapping** | [`mapfn/`](../mapfn/README.md) & [`internal/ingest/`](../internal/ingest/README.md) | Ingestion host worker pool executes guest WASM plugins built with the Guest SDK (`mapfn/`), extracts canonical preimages via `map_bundle`, and executes host SIMD SHA-256 hashing. |
+| **2** | **Sandboxed Mapping** | [`mapfn/`](../mapfn/README.md), [`mapfn/host/`](../mapfn/host/), & [`internal/ingest/`](../internal/ingest/README.md) | WASI-free Wazero sandbox pool (`mapfn/host`) executes guest WASM plugins built with the Guest SDK (`mapfn/sdk`), extracts canonical keys via `map_bundle`, and computes host SIMD SHA-256 key hashes for Pebble storage. |
 | **3** | **Inverted Storage** | [`internal/kvstore/`](../internal/kvstore/README.md) | Computes mini-log sub-roots across key partitions in memory, batches updates into Pebble LSM inverted chunks (`'c'`), and executes a blocking disk sync at the target checkpoint barrier. |
-| **4** | **State Commitment** | [`internal/tree/`](../internal/tree/README.md) | Predicts candidate `MapRoot` under a shared read lock, appends state commitment to the Tessera Output Log, collects witness cosignatures, and ratchets the in-memory trie pointer. |
-| **5** | **Read Serving** | [`internal/server/`](../internal/server/README.md) | Serves multi-section C2SP HTTP lookups (`/vindex/v1/lookup/{keyhash}`), RFC 6962 prefix compact ranges, and inductive backward pagination (`before=X`), strictly isolated to witnessed checkpoints. |
-| *(Orch)* | **Coordinator** | [`internal/coordinator/`](../internal/coordinator/README.md) | Drives the batch loop across stages 1–4, freezes target input checkpoint, tracks watermarks, and executes Zero-WAL startup recovery. |
-| *(Client)* | **Client SDK** | [`client/`](../client/README.md) | Stateless public Go client for querying nodes and cryptographically verifying lookup responses against witnessed checkpoints. |
+| **4** | **State Commitment** | [`internal/mpt/`](../internal/mpt/) & [`internal/tree/`](../internal/tree/README.md) | Predicts candidate `MapRoot` over variable-length canonical keys in the MPT (`internal/mpt`) under a shared read lock, appends state commitment to the Tessera Output Log (`internal/tree`), collects witness cosignatures, and ratchets the in-memory trie pointer. |
+| **5** | **Read Serving** | [`internal/server/`](../internal/server/README.md) & [`wire/`](../wire/) | Serves two-endpoint C2SP HTTP lookups (`GET /vindex/v1/keys/{key...}[?prefix=true]` and lock-free `GET /vindex/v1/entries/{key...}?before=X`), legacy `/vindex/v1/lookup/{keyhash}`, RFC 6962 prefix compact ranges, and inductive backward pagination (`before=X`), strictly isolated to witnessed checkpoints. |
+| *(Orch)* | **Coordinator & Resource Budget** | [`internal/coordinator/`](../internal/coordinator/README.md) & [`internal/budget/`](../internal/budget/) | Drives the batch loop across stages 1–4, freezes target input checkpoint, tracks watermarks, resolves host RAM/CPU resource budgets (`internal/budget`), and executes Zero-WAL startup recovery. |
+| *(Client)* | **Client SDK & Verifiers** | [`client/`](../client/README.md) & [`internal/verifier/`](../internal/verifier/) | Stateless public Go client (`client/`) and checkpoint verifier parsers (`internal/verifier/`) for querying nodes and cryptographically verifying point, non-inclusion, and two-sided prefix proofs against witnessed checkpoints. |
 | *(Audit)* | **Auditor & Mirror** | [`internal/auditor/`](../internal/auditor/README.md) | Audits published Output Log roots from leaf 0, alerts on root mismatches, triggers state-preserving halts, and optionally serves verified mirror lookups. |
 
 ### 0.2 Checkpoint Promotion & Monotonic Ratcheting
@@ -38,18 +38,18 @@ Progress is governed by two complementary rules: **promoting checkpoints forward
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`Target_CP`** | Input Log | `Target_CP.Size` | Durable (synced in Pebble metadata) | Upstream poll & origin note verification | Upper goalpost for current sync cycle; prevents moving-goalpost starvation. |
 | **`KV_CP`** | Input Log | `KV_CP.Size` | Durable (synced in Pebble LSM) | Atomic flush of `'c'` chunk records | Durably binds indexed `'c'` chunk records to the verified Input Log state they cover. |
-| **`Output_CP`** | Output Log | Output Log tree size (`Output_CP.Size`) committing Input Log size (`InputLogSize` in leaf) | Durable (Tessera Output Log storage) | Append commitment leaf & witness cosigning | Cryptographically commits to index root (`MapRoot` + covered Input Log checkpoint). **Size Distinction**: `Output_CP.Size` represents the tree size (number of commitment leaves) of the Output Log itself, whereas the committed Input Log size covered by the index is stored inside the Output Log leaf payload (`InputLogSize`). |
-| **`Serving_CP`** | Output Log Leaf | `Serving_CP.InputLogSize` | Volatile (In-memory atomic pointer) | Pointer swap under exclusive writer lock (< 5ms) | Active state exposed to client HTTP readers. |
+| **`Output_CP`** | Output Log | Output Log tree size (`Output_CP.Size`) committing Input Log size (`Output_CP.InputSize` in leaf) | Durable (Tessera Output Log storage) | Append commitment leaf & witness cosigning | Cryptographically commits to index root (`MapRoot` + covered Input Log checkpoint). **Size Distinction**: `Output_CP.Size` represents the tree size (number of commitment leaves) of the Output Log itself, whereas the committed Input Log size covered by the index is stored inside the Output Log leaf payload (`Output_CP.InputSize`). |
+| **`Serving_CP`** | Output Log Leaf | `Serving_CP.InputSize` | Volatile (In-memory atomic pointer) | Pointer swap under exclusive writer lock (< 5ms) | Active state exposed to client HTTP readers. |
 
 **The Checkpoint Monotonic Progression Invariant**:
 ```text
-Target_CP.Size >= KV_CP.Size >= Output_CP.Leaf.InputLogSize >= Serving_CP.InputLogSize
+Target_CP.Size >= KV_CP.Size >= Output_CP.InputSize >= Serving_CP.InputSize
 ```
 Every relation in the chain is `>=`:
 - `Target_CP.Size >= KV_CP.Size`: Batches accumulate and commit in discrete chunks toward the target goalpost.
-- `KV_CP.Size >= Output_CP.Leaf.InputLogSize`: Inverted chunk storage writes must complete a durable disk sync before Output Log append begins.
-- `Output_CP.Leaf.InputLogSize >= Serving_CP.InputLogSize`: Appending to the Output Log and collecting witness signatures occur outside reader locking; `Output_CP` is naturally ahead until the writer acquires the exclusive writer lock to swap the serving pointer.
-Because storage persistence strictly precedes Output Log publication (`KV_CP.Size >= Output_CP.Leaf.InputLogSize`), startup recovery is mathematically guaranteed never to encounter an Output Log commitment referencing uncommitted or missing KV chunks.
+- `KV_CP.Size >= Output_CP.InputSize`: Inverted chunk storage writes must complete a durable disk sync before Output Log append begins.
+- `Output_CP.InputSize >= Serving_CP.InputSize`: Appending to the Output Log and collecting witness signatures occur outside reader locking; `Output_CP` is naturally ahead until the writer acquires the exclusive writer lock to swap the serving pointer.
+Because storage persistence strictly precedes Output Log publication (`KV_CP.Size >= Output_CP.InputSize`), startup recovery is mathematically guaranteed never to encounter an Output Log commitment referencing uncommitted or missing KV chunks.
 
 ### 0.3 Concurrency Architecture: Competing Pressures & Dynamic Backpressure
 
@@ -127,7 +127,7 @@ The KV storage engine persists search keys and their occurrence lists efficientl
 3. **Synchronous Commit Barrier**: Storage updates across a target sync cycle are durably flushed to disk before the coordinator publishes the new state commitment to the Output Log.
 
 - **[Correctness Invariant] Synchronous Persistence Barrier**:
-  - *Rule*: Storage writes must durably flush all modified chunk records and the updated `KV_CP` to disk before the Output Log publication phase is permitted to begin (`KV_CP.Size >= Output_CP.Leaf.InputLogSize`).
+  - *Rule*: Storage writes must durably flush all modified chunk records and the updated `KV_CP` to disk before the Output Log publication phase is permitted to begin (`KV_CP.Size >= Output_CP.InputSize`).
   - *Rationale*: Guarantees that the physical database never lags behind publicly published commitments across crashes or power loss.
   - *Consequence ("Or Else")*: If the node published a state commitment to the Output Log but crashed before storage was synced, the published root would reference missing KV chunks, permanently breaking proof generation for witnessed checkpoints.
 
@@ -172,13 +172,16 @@ Following data preparation, the commitment plane executes a 3-step atomic commit
   - *Impact*: HTTP lookup throughput sustains over 670,000 reads/second during active disk commits, compared to severe stalls under coarse global locking.
 
 ### 1.5 Stage 5: Read Serving ([`internal/server/`](../internal/server/README.md))
-The HTTP read server exposes verifiable point lookups adhering to Community Cryptography Specification Project ([C2SP](https://c2sp.org/)) conventions.
+The HTTP read server exposes verifiable point and prefix lookups adhering to Community Cryptography Specification Project ([C2SP](https://c2sp.org/)) conventions (see [`docs/PREFIX_LOOKUPS.md`](./PREFIX_LOOKUPS.md) for the full wire specification):
 
-1. **Lookup Routing**: Serves point queries by key hash (`GET /vindex/v1/lookup/{keyhash}`) and publishes current index checkpoints (`GET /vindex/v1/checkpoint`).
-2. **Cryptographic Proof Packaging**: Packages an authenticated Merkle non-inclusion or inclusion proof against the active `MapRoot`, reads matching leaf indices from storage, and includes prefix compact ranges for client verification.
+1. **Two-Endpoint Read Protocol**:
+   - **Key Discovery & State Commitment (`GET /vindex/v1/keys/{key...}[?prefix=true]`)**: Acquires a brief shared read lock on the MPT (`internal/mpt`), evaluates point inclusion/non-inclusion (`ProveKey`) or prefix subtree scans (`ProvePrefix`), and returns the state commitment (`vindex/v1`, `output-log-leaf-v1`, `output-log-proof-v1`), `mpt-proof-v1 <inclusion|non-inclusion|prefix>`, and `keys-v1` (`<canonical_key> <subRootHex>`).
+   - **Lock-Free Entry Pagination (`GET /vindex/v1/entries/{key...}?before=X[&limit=Y]`)**: Evaluates `KeyHash = SHA256(key)` directly against Pebble inverted chunks (`'c'`) with **zero MPT lock acquisition**, returning `prefix-compact-range-v1` and `indices-v1`.
+   - **Legacy Point Lookup (`GET /vindex/v1/lookup/{keyhash}`)**: Combined single-request point lookup for 64-character hex key hashes.
+2. **Prefix Policy Guardrails**: Prefix queries (`?prefix=true`) are validated against an optional `PrefixPolicy` (such as `DomainETLDP1PrefixPolicy`, rejecting bare TLD/public-suffix scans with `HTTP 400`) and bounded by `--max_prefix_keys` (default `1000`, returning `HTTP 413 Content Too Large` if exceeded).
 
 - **[Correctness Invariant] Serving Isolation Invariant**:
-  - *Rule*: Client queries are strictly isolated to data committed by the active serving checkpoint (`Serving_CP.InputLogSize <= Output_CP.Leaf.InputLogSize`). Any in-flight storage writes ahead of `Serving_CP` must be invisible to readers.
+  - *Rule*: Client queries are strictly isolated to data committed by the active serving checkpoint (`Serving_CP.InputSize <= Output_CP.InputSize`). Any in-flight storage writes ahead of `Serving_CP` must be invisible to readers.
   - *Rationale*: Ensures that every response returned by the server can be mathematically proven against the currently witnessed checkpoint.
   - *Consequence ("Or Else")*: Readers would observe unwitnessed or uncommitted future entries, causing client-side Merkle proof verification to fail.
 
@@ -198,24 +201,24 @@ The HTTP read server exposes verifiable point lookups adhering to Community Cryp
 ### 2.1 The Universal Crash Invariant
 Because storage persistence strictly precedes Output Log publication:
 ```text
-KV_CP.Size >= Output_CP.Leaf.InputLogSize   (persisted KV storage watermark >= Output_Leaf.InputLogSize)
+KV_CP.Size >= Output_CP.InputSize   (persisted KV storage watermark >= Output_CP.InputSize)
 ```
-This invariant holds under all crash, kill, and power loss scenarios. Note the distinction between the Output Log's own Merkle tree size (`Output_CP.Size`) and the committed Input Log size inside each Output Log leaf payload (`Output_CP.Leaf.InputLogSize`). Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted or missing KV store chunks. If a crash occurs after storage sync but before Output Log publishing, `KV_CP.Size > Output_CP.Leaf.InputLogSize`; startup recovery safely ignores chunks beyond `Output_CP.Leaf.InputLogSize` using point-in-time sub-root reconstruction bounded at `Output_CP.Leaf.InputLogSize`.
+This invariant holds under all crash, kill, and power loss scenarios. Note the distinction between the Output Log's own Merkle tree size (`Output_CP.Size`) and the committed Input Log size inside each Output Log leaf payload (`Output_CP.InputSize`). Startup recovery is mathematically guaranteed never to encounter an Output Log entry referencing uncommitted or missing KV store chunks. If a crash occurs after storage sync but before Output Log publishing, `KV_CP.Size > Output_CP.InputSize`; startup recovery safely ignores chunks beyond `Output_CP.InputSize` using point-in-time sub-root reconstruction bounded at `Output_CP.InputSize`.
 
 ### 2.2 Zero-WAL Startup Recovery Sequence
-On daemon launch, the coordinator executes a 3-phase Zero-WAL recovery sequence before opening read and write interfaces:
+On daemon launch, `vindexd` binds the HTTP listener immediately so `/healthz` returns `200 OK` and `/readyz` + lookup endpoints return `503 Service Unavailable` (`Retry-After: 30`, `"status": "mpt_initializing"`) while `mpt.Open()` replays any uncompacted `torchwood/mpt` journal frames on disk (see [`docs/BENCHMARKS.md §5`](./BENCHMARKS.md#5-post-run-empirical-evaluation--cold-startup-investigation-2026-09-22) for cold-start journal replay telemetry). Once `mpt.Open()` completes, the coordinator executes a 3-phase Zero-WAL recovery sequence (`coord.Recover()`) before promoting the read server to `200 OK`:
 
-1. **Phase 1: Instant Warm Start (< 5ms)**:
-   - Evaluates whether the persisted MPT size equals the latest committed Output Log state (`Output_CP.Leaf.InputLogSize`) and the trie root matches the published leaf commitment (`MapRoot`).
+1. **Phase 1: Instant Warm Start (< 5ms after `mpt.Open`)**:
+   - Evaluates whether the durable MPT watermark (`MPT_Durable_Size` with `IsExact() == true`) equals the latest committed Output Log state (`Output_CP.InputSize`) and the trie root matches the published leaf commitment (`MapRoot`).
    - If true, clean shutdown is verified. Activates the latest published checkpoint as `Serving_CP`, and **opens the HTTP Read Server immediately (< 5ms)**.
-2. **Phase 2: Fast-Forward Tile Replay (< 500ms)**:
+2. **Phase 2: Fast-Forward Tile Replay (< 500ms after `mpt.Open`)**:
    - If the persisted MPT lags behind the latest Output Log commitment (dirty crash recovery):
      - Streams missing historical tiles across the lag window directly from the local disk cache.
      - Maps replayed tiles to identify modified search keys.
-     - Reconstructs mini-log sub-roots for modified keys up to `Output_CP.Leaf.InputLogSize` (where each occurrence leaf is an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00) with **zero database writes**.
+     - Reconstructs mini-log sub-roots for modified keys up to `Output_CP.InputSize` (where each occurrence leaf is an 8-byte big-endian absolute leaf index hashed with RFC 6962 leaf domain separator 0x00) with **zero database writes**.
      - Updates in-memory trie nodes, asserts that the resulting root strictly matches the Output Log commitment, flushes trie persistence to disk, activates `Serving_CP`, and **opens the Read Server (< 500ms)**.
 3. **Phase 3: Background Catchup**:
-   - Resumes forward ingestion from `Serving_CP.InputLogSize` toward `Target_CP`.
+   - Resumes forward ingestion from `Serving_CP.InputSize` toward `Target_CP`.
 
 ### 2.3 Moving-Goalpost Prevention & Mini-Log Determinism
 When indexing high-velocity logs, the upstream log head advances continuously. Polling unverified checkpoints on every batch risks synchronization starvation. The coordinator freezes verified target sync checkpoints into durable database metadata prior to batch processing, ensuring that the ingestion pipeline processes fixed ranges to completion before advancing to a new target.
@@ -249,47 +252,16 @@ To resolve this without complicating the live serving state machine, VIndex exec
 
 ## 3. Independent Auditor & Verified Mirror Architecture ([`internal/auditor/`](../internal/auditor/README.md))
 
-The auditor subsystem audits the VIndex operator's published Output Log roots from genesis, detects equivocation, and optionally serves verified mirror lookups.
+The auditor subsystem audits the VIndex operator's published Output Log roots from genesis, detects equivocation, and optionally serves verified mirror lookups. For the full continuous audit loop, threat vector matrix, forensic state-freeze mechanics, and operational mismatch runbook, see the [`internal/auditor/` Type B Specification](../internal/auditor/README.md).
 
 ### 3.1 Verification Boundaries
 1. **Client / Query Verification (`client/`)**: Evaluates individual query responses (`mpt-proof-v1` + `prefix-compact-range-v1`) against witnessed Output Log checkpoints via the public, stateless client SDK ([`client/`](../client/README.md)).
 2. **Full-Log Independent Auditor (`internal/auditor/`)**: A standalone daemon (`vindex-auditor`) that continuously tails the Output Log, extracts the committed Input Log checkpoint from each Output Log commitment leaf, downloads and authenticates the corresponding Input Log tiles from leaf 0, executes mapping independently, reconstructs its own local MPT, and asserts that its locally computed `MapRoot` strictly matches the published `MapRoot` in each Output Log commitment.
 
-### 3.2 Root Mismatch Alerting & State-Preserving Halt
-If the locally computed `MapRoot` diverges from the published Output Log commitment, or an upstream sync divergence occurs, the auditor executes a coordinated containment response:
-1. **Sync Engine Halt**: The background audit sync engine immediately halts forward sync. Watermarks are not advanced in Pebble DB.
-2. **Forensic State Freeze**: Database files and MPT state are frozen on disk in-place, preserving uncorrupted cryptographic evidence for root-cause analysis and public equivocation disclosure.
-3. **Metrics & Structured Logging**: Increments `vindex_verifier_root_mismatches_total`, sets alert gauge `vindex_verifier_root_mismatch = 1`, and emits a critical error log containing the divergent leaf index, target input size, locally computed root, and committed root.
-4. **Serving Engine (Default Pinned Behavior)**: In mirror mode (`--serve_mirror=true`), the serving engine does **not** revoke serving state (does not clear the active serving state or fail lookups with `HTTP 503`). Instead, it remains pinned to the last known good verified Output Log checkpoint (`Serving_CP`), continuing to serve point lookups backed by cryptographically valid Merkle proofs up to that verified checkpoint. This preserves read availability and partition resilience: downstream readers continue receiving consistent, authentic responses rather than experiencing an immediate denial-of-service outage caused by an upstream index bug or signer divergence.
-5. **Fail-Closed Mode (Opt-In)**: For operational environments requiring an absolute hard cutoff over stale serving, the optional flag `--fail_closed=true` is provided. When enabled, root divergence triggers immediate serving state revocation, causing all incoming lookup requests to return **HTTP 503 Service Unavailable**.
-6. **Health and Readiness Probes**:
-   - `/healthz`: Remains **HTTP 200 OK** as long as the process is alive and serving authentic, cryptographically valid state. This prevents container orchestrators (such as Kubernetes liveness probes) and upstream load balancers from prematurely terminating or de-routing traffic from a healthy mirror node.
-   - `/readyz` or `/syncz`: Returns **HTTP 503 Service Unavailable** (or degraded sync status) with structured JSON diagnostics once sync halts, alerting traffic routers and monitoring systems that background auditing has stalled.
-
-### 3.3 Verified Mirror Serving Engine
-When `--serve_mirror=true` is enabled on the auditor:
-- Evaluates lookups against the locally verified MPT and storage database under reader snapshot isolation.
-- Guarantees readers only observe data that has been completely re-indexed and cryptographically verified against the Output Log.
-- Enforces serving bounded strictly by `Serving_CP.InputSize`. Any uncommitted or divergent writes are completely isolated from readers.
-- On upstream divergence, the mirror prioritizes client availability without compromising cryptographic integrity: by continuing to serve the pinned `Serving_CP`, it guarantees that every returned proof remains authentic and witnessed. If operators demand zero tolerance for stale checkpoints, enabling `--fail_closed=true` enforces immediate revocation.
-
-### 3.4 Adversarial Threat Vector Matrix
-
-| Threat Vector | Adversary Action | Detection Mechanism | System Action |
-| :--- | :--- | :--- | :--- |
-| **Publisher Equivocation** | Publisher serves conflicting Output Log checkpoints to different nodes. | Witness signature verification; Merkle consistency proofs between checkpoints. | Background sync halts immediately; alert logged; database frozen; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`). |
-| **Log Rollback / Regression** | Publisher serves an Output Log checkpoint smaller than the previously verified output size. | Strict monotonic tree size assertions during audit sync. | Sync halts; watermarks frozen; `/healthz` remains HTTP 200; `/readyz`/`/syncz` reports degraded sync; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`). |
-| **Forged Map Root** | Publisher commits to an invalid or falsified `MapRoot` in an Output Log leaf. | Local MPT re-computation from input leaves; root equality assertion against the Output Log leaf. | Sets `vindex_verifier_root_mismatch = 1`; freezes disk state; `/readyz`/`/syncz` reports degraded sync; continues serving pinned `Serving_CP` (or revokes serving if `--fail_closed=true`); alerts witnesses. |
-| **Corrupted Input Leaves** | Network attacker or corrupted storage alters raw log entries. | Upstream tile Merkle verification fails against verified checkpoint root. | Pipeline aborts tile ingestion; retries from alternative mirrors. |
-| **Omission Attack** | Publisher selectively drops a certificate or package from the index. | Local MPT computation includes the missing key; computed root mismatches published root. | Instant root mismatch alert (`vindex_verifier_root_mismatch = 1`); sync engine halts and freezes disk state; forensic bundle generated for public disclosure; mirror continues serving authentic proofs up to `Serving_CP` (or revokes serving if `--fail_closed=true`). |
-
-### 3.5 Operational Runbook: Responding to Mismatches
-When a root mismatch alert fires (`vindex_verifier_root_mismatch == 1` or `/readyz`/`/syncz` returning degraded sync status):
-1. **Triage & Containment**: The auditor has already frozen disk state and halted forward sync, while safely continuing to serve cryptographically valid proofs pinned to `Serving_CP` (unless `--fail_closed=true` was specified). Do not restart the auditor process with cleared storage, as the disk contains crucial forensic data.
-2. **Inspect Structured Logs**: Examine the auditor logs for the `CRITICAL ROOT MISMATCH DETECTED` entry to identify the divergent output leaf index, target input size, local root, and committed root.
-3. **Forensic State Extraction**: Inspect local Pebble DB inverted chunks (`'c'`) and compare against raw Input Log leaves across the divergent leaf window to determine whether the publisher omitted leaves, altered keys, or encountered a non-deterministic `MapFn` bug.
-4. **Reproduce via Standalone CLI**: Run `vindex-auditor --oneshot` with an isolated temporary directory against the target checkpoint to confirm the mismatch is 100% reproducible.
-5. **Publish Equivocation Bundle**: If the `MapFn` and input log entries are valid, publish the cryptographic proof bundle (signed Output Log checkpoint, leaf inclusion proof, raw leaf payload, signed Input Log checkpoint) to transparency witnesses and public coordination channels.
+### 3.2 State-Preserving Forensic Halt & Verified Mirror Serving
+- **Atomic Staging & Forensic State Freeze**: Each Output Log leaf is staged via `KVIndexer.StageMappedBatch` before predicting the candidate `MapRoot`. If the candidate `MapRoot` diverges from the published Output Log commitment, the auditor closes the unapplied Pebble batch without committing, clears the in-memory chunk cache, halts forward sync (`vindex_verifier_root_mismatch = 1`), and freezes database/MPT files on disk in-place to preserve uncorrupted forensic evidence.
+- **Verified Mirror Serving (`--serve_mirror=true`)**: Evaluates two-endpoint (`/vindex/v1/keys/`, `/vindex/v1/entries/`) and legacy (`/vindex/v1/lookup/`) queries against the locally verified MPT and Pebble database under reader snapshot isolation (`Serving_CP.InputSize`).
+- **Pinned Last-Known-Good vs. Fail-Closed**: On upstream divergence, `/healthz` remains `HTTP 200 OK` (preventing orchestrator liveness kills), `/readyz` and `/syncz` return `HTTP 503` with structured JSON diagnostics, and the mirror remains pinned to the last verified checkpoint (`Serving_CP`) by default so downstream readers continue receiving authentic proofs. Operators requiring an immediate hard cutoff can pass `--fail_closed=true` to revoke `Serving_CP` and return `HTTP 503` on all lookups. See [`internal/auditor/README.md §2.3–2.7`](../internal/auditor/README.md) for the complete threat matrix and 5-step incident response runbook.
 
 ---
 
@@ -303,20 +275,20 @@ Deploying MPT working files and Pebble DB on separate physical NVMe SSDs is reco
 Physical separation isolates heavy sequential MPT compaction writes from Pebble LSM memtable flushes, preventing write stalls during sustained bulk ingestion.
 
 ### 4.2 Resource Sizing & Memory Footprint Scaling Matrix
-Because key hashes are uniformly distributed, MPT updates touch scattered trie branches. Active MPT nodes must remain resident in RAM/mmap:
+`filippo.io/torchwood/mpt` (`v0.10.1+`) reserves a 16 TiB virtual address space (`mmap` with `PROT_NONE`, zero physical RAM overhead) and commits physical pages on demand using fixed-size 32-byte node records (`nodeSize = 32`) plus append-only variable-length key/value leaf logs (`leaves` file). Active MPT internal and leaf nodes remain resident in the OS page cache:
 
-| Scale (Unique Keys) | MPT Memory (`mmap`) | MPT Leaf Disk | Pebble Disk | Recommended RAM | Recommended GCP VM |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Small (10M)** | ~1.04 GB | ~320 MB | ~1 GB | 8 GB | `e2-standard-2` |
-| **Medium (100M)** | ~10.4 GB | ~3.2 GB | ~10 GB | 64 GB | `n2-highmem-8` |
-| **Large (1B)** | ~104 GB | ~32 GB | ~100 GB | 256 GB | `n2-megamem-16` |
-| **Very Large (2B)** | ~208 GB | ~64 GB | ~200 GB | 512+ GB | `m4-megamem-64` |
+| Scale (Unique Keys) | MPT Node Working Set (`nodes` + `leaves`) | Pebble Disk (`'c'` chunks) | Recommended Host RAM | Recommended GCP VM |
+| :--- | :--- | :--- | :--- | :--- |
+| **Small (10M)** | ~1.0 – 1.5 GB | ~1 GB | 8 GB | `e2-standard-2` |
+| **Medium (100M)** | ~10 – 15 GB | ~10 GB | 64 GB | `n2-highmem-8` |
+| **Large (1B)** | ~100 – 150 GB | ~100 GB | 256 GB | `n2-megamem-16` |
+| **Very Large (2B)** | ~200 – 300 GB | ~200 GB | 512+ GB | `m4-megamem-64` |
 
-### 4.3 Future Work (Non-v1 Scope): Auxiliary Prefix-Trie Indexing
+### 4.3 Variable-Length Canonical Keys & Two-Sided Prefix Proofs (`internal/mpt`)
 
-> **Note**: VIndex v1 implements exact 32-byte point lookups exclusively. Auxiliary prefix-trie indexing and subtree searches are non-v1 future design considerations.
-
-While VIndex v1 provides point lookups by 32-byte key hashes, guest plugins emit raw canonical Claim Subject preimages. This allows future VIndex versions to construct auxiliary prefix-trie indices for hierarchical or namespace subtree queries without altering guest WASM ABIs.
+VIndex v1 indexes variable-length canonical keys (`1..1024` printable ASCII bytes `0x21..0x7E`, validated via `mpt.ValidateCanonicalKey`) directly in a single unified Sparse Merkle Patricia Trie (`filippo.io/torchwood/mpt`):
+- **Hybrid Keying**: The MPT stores raw variable-length canonical keys (`mpt.Key`) so common string prefixes share a dedicated subtrie, while Pebble DB (`internal/kvstore`) keys inverted chunks by fixed 32-byte `SHA256(key)` hashes to preserve 41-byte LSM keys and 33-byte prefix Bloom filters.
+- **Two-Sided Prefix Proofs**: `GET /vindex/v1/keys/{prefix...}?prefix=true` scans the MPT subtree via `Tree.Scan(prefix)`, proves the subtree boundary via `mpt.ProvePrefix`, and allows clients (`mpt.VerifyPrefix`) to verify both **soundness** (every returned key has `prefix` and maps to its authenticated `SubRoot`) and **completeness** (zero matching keys in the global trie were omitted). See [`docs/PREFIX_LOOKUPS.md`](./PREFIX_LOOKUPS.md) for full details.
 
 ### 4.4 Prometheus Metrics & SLO Thresholds
 The daemon exports Prometheus metrics covering the entire lifecycle:
@@ -371,3 +343,22 @@ The daemon exports Prometheus metrics covering the entire lifecycle:
 - **Proposed**: Backing the inverted chunk store with a distributed NoSQL database.
 - **Theoretical Rejection**: The authenticated MPT already requires single-host physical RAM/mmap locality; remote RPC hops degrade bulk ingestion throughput by orders of magnitude without solving tree state replication.
 - **Resolution**: Embedded Pebble LSM storage engine.
+
+---
+
+## 6. Verification Gate
+
+All architectural invariants, package dependency boundaries, and end-to-end pipeline flows are verified via:
+
+```bash
+go test -race ./vindex/v1/...
+```
+
+---
+
+## 7. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Established 5-stage Map Sandwich architecture, Zero-WAL recovery, and Genesis Backfill lifecycle. |
+| 2026-10-14 | M1–M3 | Hardened storage/ingestion/recovery invariants (M1), added variable-length canonical keys & two-endpoint prefix lookups (M2), and decoupled `wire`, `internal/mpt`, `mapfn/host`, and `internal/verifier` packages (M3). |

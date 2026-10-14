@@ -20,17 +20,17 @@ The client SDK functions like a bank customer verifying an itemized transaction 
 
 ### 1.3 Goals & Non-Goals
 - **Goals**:
-  - Provide a lightweight, zero-dependency public Go package (`vindex/v1/client`) usable by external applications, CLIs, and monitoring services.
-  - Implement strict cryptographic verification for all query responses (`/vindex/v1/lookup/{keyhash}` and `/vindex/v1/checkpoint`).
-  - Verify Output Log checkpoint note signatures and witness cosignatures against a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`).
+  - Provide a lightweight public Go package (`vindex/v1/client`) usable by external applications, CLIs, and monitoring services.
+  - Implement strict cryptographic verification for the two-endpoint protocol (`LookupKeys`, `LookupPrefix`, `LookupEntries`, `LookupKey`, `LookupAllKey`, `LookupPrefixAll`), legacy point lookups (`Lookup`, `LookupAll`), and checkpoint endpoints (`GetCheckpoint`, `GetInputLogCheckpoint`).
+  - Verify Output Log and Input Log checkpoint signatures and optional K-of-N witness cosignature policies (`WitnessPolicy`, `RequireVerifiers`).
   - Verify Output Log Merkle inclusion proofs for the committed `MapRoot`.
-  - Verify MPT inclusion and non-inclusion proofs for requested 32-byte key hashes.
-  - Reconstruct and assert RFC 6962 compact ranges for mini-log sub-roots against returned occurrence indices.
-  - Verify history monotonicity across paginated and consecutive queries on identical keys.
-  - Zero heavy dependencies: completely decoupled from storage engines (`pebble`), WebAssembly runtimes (`wazero`), and local tile caches.
+  - Verify MPT inclusion, non-inclusion, and two-sided prefix proofs (`internal/mpt.VerifyKey`, `VerifyPrefix`) for canonical keys.
+  - Reconstruct and assert RFC 6962 compact ranges (`wire.ComputeMiniLogRoot`) for mini-log sub-roots against returned occurrence indices across initial and backward continuation pages (`NextExpectedSubRoot`).
+  - Enforce monotonic checkpoint history ratcheting (`ErrCheckpointRegressed`) rejecting log size regressions or split-view root hash divergences.
+  - Decoupled dependency graph: zero dependencies on storage engines (`pebble`), WebAssembly runtimes (`wazero`), or internal ingestion packages (`internal/ingest`, `internal/kvstore`).
 - **Non-Goals**:
   - **No Full Log Auditing**: The client does not re-index raw Input Log leaves or reconstruct global MPT state; full audits are delegated to `internal/auditor`.
-  - **No Storage Mutations**: The client is 100% stateless and executes strictly in memory.
+  - **No Storage Mutations**: The client executes strictly in memory.
 
 ### 1.4 Known Constraints & Trade-Offs
 - **Witness Trust Floor**: The client's security is bounded by the integrity of the witness signatures on the Output Log checkpoint. If witnesses equivocate or cosign fraudulent checkpoints without detection, the client will accept proofs consistent with that checkpoint until an independent auditor detects the fraud.
@@ -42,52 +42,45 @@ The client SDK functions like a bank customer verifying an itemized transaction 
 
 ### 2.1 Public Architecture & Package Decoupling
 
-The client library is completely decoupled from the indexing and audit subsystems:
+The client library is completely decoupled from the indexing and storage subsystems:
 
-| Responsibility | Scope | External Dependencies |
+| Responsibility | Package | External Dependencies |
 | :--- | :--- | :--- |
-| **HTTP Transport & Wire Framing** | Communicates with VIndex nodes (`GET /vindex/v1/lookup/{keyhash}`, `GET /vindex/v1/checkpoint`) and parses the multi-section plaintext wire format into structured proof sections. | Go standard library (`net/http`, `bufio`, `bytes`, `strconv`). |
-| **Stateless Proof Verification** | Executes pure cryptographic assertions over parsed checkpoint notes, Output Log inclusion proofs, Sparse Merkle Tree paths, and RFC 6962 compact ranges. | Standard `crypto/sha256`, `github.com/transparency-dev/formats/log`. |
+| **HTTP Transport & Verification Orchestration** | `vindex/v1/client` | `net/http`, `vindex/v1/wire`, `vindex/v1/internal/mpt`, `vindex/v1/internal/verifier`. |
+| **C2SP Multi-Section Wire & Mini-Log Codecs** | `vindex/v1/wire` | Standard `crypto/sha256`, `github.com/transparency-dev/formats/log`, `github.com/transparency-dev/merkle`. |
+| **MPT Point & Prefix Proof Verification** | `vindex/v1/internal/mpt` | `filippo.io/torchwood/mpt`, `vindex/v1/wire`. |
+| **Checkpoint Signature & MTC Verifiers** | `vindex/v1/internal/verifier` | `golang.org/x/mod/sumdb/note`, `crypto/ed25519`. |
 
 ### 2.2 The 5-Step Query Verification Sequence
 
-For every lookup request, the client SDK executes the following deterministic 5-step verification sequence:
+For every lookup request, the client SDK executes the following deterministic 5-step verification sequence, explicitly distinguishing initial key/tip queries (**Step 3a**) from backward entry continuation pages (**Step 3b**):
 
 | Step | Phase | Operations | Mathematical Assertion |
 | :--- | :--- | :--- | :--- |
-| **1** | **Checkpoint Authentication** | Verifies note format and cryptographic signatures on the Output Log checkpoint. | Enforces origin verification and witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). |
+| **1** | **Checkpoint Authentication** | Verifies note format, origin, primary signature, and optional `WitnessPolicy` K-of-N threshold on Output Log and Input Log checkpoints. | Enforces `VerifierConfig` origin, verifier, `RequireVerifiers`, and `WitnessPolicy` cosignature quorum. |
 | **2** | **Output Log Merkle Proof** | Verifies the Merkle inclusion proof committing `MapRoot` into the Output Log. | Recomputes the Output Log leaf hash from the committed `MapRoot` and signed Input Log checkpoint, asserting inclusion under the authenticated Output Log root. |
-| **3** | **MPT Proof Verification** | Evaluates the bitwise Sparse Merkle Tree path traversal against `MapRoot`. | **Inclusion**: Proves the mini-log `SubRoot` exists at `KeyHash`.<br>**Non-Inclusion**: Proves the path terminates in an empty node or a leaf with a different key hash. |
-| **4** | **Mini-Log Compact Range** | Reconstructs the RFC 6962 compact range from returned leaf indices and any historical prefix compact range. | Reconstructed compact range root equals the authenticated MPT `SubRoot`. |
-| **5** | **Monotonic History Check** | When evaluating consecutive queries on the same key across non-decreasing checkpoint sizes: | Newly returned occurrence history contains the previously verified occurrences as an exact prefix (historical indices cannot mutate or disappear). |
+| **3a** | **Tip / Keys Query (`GET /vindex/v1/keys/` or `before == nil`)** | Evaluates the `torchwood/mpt` proof against `MapRoot` (`mpt.VerifyKey` / `mpt.VerifyPrefix`). | **Inclusion**: Proves `SubRoot` exists at `Key`.<br>**Non-Inclusion**: Proves `Key` is absent.<br>**Prefix**: Two-sided proof (`HasPrefix` + strict ascending `Key.Compare` + `TreeHash` + `mpt.VerifyPrefix`). |
+| **3b** | **Continuation Query (`GET /vindex/v1/entries/?before=X` or `before != nil`)** | Evaluates the page's compact range directly against the preceding page's expected `SubRoot` (`NextExpectedSubRoot()`). | Bypasses redundant MPT/Output Log verification on continuation pages; asserts inductive continuity against the prior page's `prefix-compact-range-v1` root. |
+| **4** | **Mini-Log Compact Range** | Reconstructs the RFC 6962 compact range from `prefix-compact-range-v1` and `indices-v1` (`wire.ComputeMiniLogRoot`). | Asserts non-truncation (`NextBefore` invariants), index bounds/ordering, and equality with the authenticated `SubRoot` (from Step 3a) or `expectedSubRoot` (from Step 3b). |
+| **5** | **Monotonic History Ratchet** | Tracks highest verified `OutputLogSize`/`InputLogSize` and root hashes on `Verifier`. | Rejects any checkpoint regression or same-size split-view hash divergence with `ErrCheckpointRegressed`. |
 
 #### Step Details:
-1. **Checkpoint Authentication**: Fetches and parses the checkpoint note. Asserts that the origin string matches expectations and enforces witness cosignature quorum via a configured [C2SP Transparency Log Policy](https://c2sp.org/tlog-policy) (`tlog-policy`). If the checkpoint note fails to satisfy the witness quorum or origin requirements defined by the policy, it is rejected immediately.
+1. **Checkpoint Authentication**: Parses and verifies the Output Log and Input Log checkpoint notes (`VerifyOutputLogCheckpoint`, `VerifyInputLogCheckpoint`). Asserts that origin strings match expectations and enforces primary verifier signatures plus K-of-N witness cosignature quorum via `WitnessPolicy` (`OutputLogWitnessPolicy`, `InputLogWitnessPolicy`).
 2. **Output Log Merkle Inclusion**: Reconstructs the canonical Output Log leaf bytes (`"<64-char-lowercase-hex-mapRoot>\n<right-newline-trimmed-rawInputLogCP>\n"`), hashes the leaf using RFC 6962 leaf domain separation (`0x00`), and verifies the Merkle inclusion proof against the authenticated Output Log root.
-3. **Sparse Merkle Tree Verification**: Evaluates the 256-bit path for the 32-byte key hash:
-   - For an **inclusion proof**, asserts that hashing up the provided sibling nodes reproduces the committed `MapRoot`, proving that the returned `SubRoot` is authentically bound to the key.
-   - For a **non-inclusion proof**, asserts that the trie path terminates at an empty branch or a conflicting leaf node, mathematically proving that no records exist for the key hash at this checkpoint.
-4. **Mini-Log Compact Range Reconstruction**: Reconstructs the mini-log root using RFC 6962 tree hashing:
+3. **Step 3a (Tip / Keys Query) vs. Step 3b (Continuation Query)**:
+   - **Step 3a (`VerifyKeysResponse` or `VerifyResponse` with `before == nil`)**: Evaluates the `torchwood/mpt` path against `MapRoot` (`internal/mpt.VerifyKey` or `VerifyPrefix`), authenticating each returned key's 32-byte `SubRoot` (or proving non-inclusion / empty prefix subtree).
+   - **Step 3b (`VerifyEntriesResponse` or `VerifyResponse` with `before != nil`)**: Evaluates continuation pages against the `expectedSubRoot` carried forward from the preceding page's `prefix-compact-range-v1` (`EntriesResult.NextExpectedSubRoot()`), requiring zero MPT or Output Log proofs on continuation pages.
+4. **Mini-Log Compact Range Reconstruction**: Reconstructs the mini-log root using RFC 6962 tree hashing (`wire.ComputeMiniLogRoot`):
    - Mini-log leaf hashing: each absolute occurrence index is encoded as an 8-byte big-endian unsigned integer and hashed with RFC 6962 leaf domain separator `0x00`.
-   - The verifier incrementally accumulates leaf hashes over the returned occurrence indices in strictly ascending order.
-   - If paginating, it seeds the compact range from the `prefix-compact-range-v1` hashes committing to all preceding historical occurrences, then appends the page's occurrence indices.
-   - The resulting compact range root is asserted to match the authenticated MPT `SubRoot`.
-5. **Monotonic History Assertion**: If the caller maintains a historical query cache for a key, it asserts that subsequent queries at larger or equal checkpoints contain the previous indices as an exact prefix.
+   - Seeds the compact range from `prefix-compact-range-v1` (committing to `PrefixCoveredSz` preceding occurrences), appends the page's strictly ascending `indices-v1` (< `before`), enforces non-truncation (`NextBefore != nil` and `Indices[0] == *NextBefore` whenever `PrefixCoveredSz > 0`), and asserts that the resulting root equals the expected `SubRoot`.
+5. **Monotonic History Ratchet**: `Verifier` tracks the maximum verified `OutputLogSize` and `InputLogSize` (and their corresponding root hashes), rejecting any subsequent response that regresses in log size or presents a conflicting root hash at the same size (`ErrCheckpointRegressed`).
 
-### 2.3 Backward Pagination Protocol
+### 2.3 Two-Endpoint & Backward Pagination Protocol
 
-When a key has more occurrence records than fit in a single response (or when paginating using `?before={cursor}`):
-1. **Initial Tip Query**: The client queries `GET /vindex/v1/lookup/{keyhash}` without a cursor.
-   - Response contains the latest page of occurrence indices, the MPT proof against `MapRoot`, and an optional `prefix-compact-range-v1` section if older entries exist.
-   - If more historical occurrences exist, the response includes a `next_before` cursor header parameter on `indices-v1`.
-2. **Backward Continuation Query**: The client queries `GET /vindex/v1/lookup/{keyhash}?before={cursor}`.
-   - Response contains earlier occurrences and an updated `prefix-compact-range-v1` committing to records preceding this page.
-3. **Incremental Compact Range Accumulation**:
-   - Rather than relying on a separate hash chain, verification uses incremental RFC 6962 compact range accumulation.
-   - The verifier initializes a compact range from `prefix-compact-range-v1` (covering the declared prefix leaf count), then appends the returned occurrence indices (each encoded as an 8-byte big-endian index hashed with RFC 6962 leaf domain separator `0x00`).
-   - For initial tip queries (no `before` cursor), the accumulated compact range root is directly asserted against the authenticated MPT `SubRoot`.
-   - For backward pagination, continuity is verified inductively by ensuring each page's indices and prefix range reproduce the compact range commitment expected by the subsequent page, terminating only when the prefix leaf count reaches zero.
-4. **Integrity Guarantee**: Inductive compact range accumulation guarantees that historical pages cannot be altered, reordered, or truncated by the server across multiple HTTP requests.
+1. **Key / Prefix Discovery (`LookupKeys` / `LookupPrefix`)**: The client queries `GET /vindex/v1/keys/{key...}[?prefix=true]` and verifies the Output Log checkpoint, Output Log inclusion proof, and MPT inclusion/non-inclusion/prefix proof via `VerifyKeysResponse`, obtaining each matching key's `SubRoot` and `InputLogSize`.
+2. **Initial Entry Page (`LookupEntries` with `before = InputLogSize`)**: For each matching key, the client queries `GET /vindex/v1/entries/{key...}?before={InputLogSize}&limit={limit}` and verifies the returned `prefix-compact-range-v1` and `indices-v1` against the authenticated `SubRoot` via `VerifyEntriesResponse(respBytes, InputLogSize, SubRoot)`.
+3. **Backward Continuation Pages (`LookupEntries` with `before = *NextBefore`)**: While `NextBefore != nil`, the client computes `expectedSubRoot := prevPage.NextExpectedSubRoot()` from the current page's `prefix-compact-range-v1`, queries `GET /vindex/v1/entries/{key...}?before={*NextBefore}&limit={limit}`, and verifies the next page against `expectedSubRoot` until `PrefixCoveredSz == 0`.
+4. **High-Level Helpers (`LookupKey`, `LookupAllKey`, `LookupPrefixAll`)**: Combine Steps 1–3 automatically in a single call. Legacy `/vindex/v1/lookup/{keyhash}` queries (`Lookup`, `LookupAll`) remain supported for backward compatibility.
 
 ### 2.4 In-Situ Invariants & Performance Optimizations
 
@@ -148,4 +141,23 @@ The client library provides a stateless query interface implementing strict zero
 - **Architectural Rejection**:
   - `internal/` packages cannot be imported by external Go applications.
   - The full-log auditor requires heavy storage engines (`pebble`), WebAssembly runtimes (`wazero`), and multi-gigabyte disk caches. Forcing client applications to import these heavy dependencies violates lightweight client architecture.
-- **Chosen Design**: Decouple completely: a public, zero-dependency `client` package for query proof verification, and an `internal/auditor` package for full-log background auditing.
+- **Chosen Design**: Decouple completely: a public, zero-dependency `client` package (`vindex/v1/client`) and `wire` package (`vindex/v1/wire`) for query proof verification, and an `internal/auditor` package for full-log background auditing.
+
+---
+
+## 4. Verification Gate
+
+All client proof verification, witness policy, monotonic history, and package dependency boundary tests are verified via:
+
+```bash
+go test -race ./vindex/v1/client/... ./vindex/v1/wire/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined stateless light client SDK and 5-step proof verification sequence. |
+| 2026-10-14 | M2–M3 | Added two-endpoint verification (`VerifyKeysResponse`, `VerifyEntriesResponse`, `LookupPrefixAll`), `GetCheckpoint` verification, `WitnessPolicy`, monotonic history ratcheting (`ErrCheckpointRegressed`), and decoupled `client` from `pebble`/`wazero`. |

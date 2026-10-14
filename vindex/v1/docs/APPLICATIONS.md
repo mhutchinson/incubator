@@ -16,8 +16,8 @@ The core security property of a Claim Subject Map is **Discoverability**: a veri
 ### 0.1 Mental Models: The Phonebook and the Fanout Multiplier
 - **The "Universal Phonebook"**: VIndex is agnostic to the internal structure of the underlying log payload. It does not parse or interpret payloads during serving; it only requires an unambiguous canonical preimage (the "name" in the phonebook) and index pointers to construct authenticated inclusion proofs.
 - **The "Fanout Multiplier"**: Different ecosystems exhibit radically different mapping cardinality:
-  - In **Go SumDB**, each entry maps to **at most one** module path (`0..1` keys per leaf; pseudo-versions are filtered out and emit zero keys, while tagged release entries emit one deduplicated module path).
-  - In **Certificate Transparency (CT)**, a single certificate frequently contains dozens of Subject Alternative Names and expands each domain up its parent hierarchy to the eTLD+1 (1-to-N fanout). A single certificate can map to 50+ domain keys, multiplying Pebble write volume and requiring strict host-side per-leaf deduplication.
+  - In **Go SumDB**, each entry maps to **at most one** module path (`0..1` keys per leaf; pseudo-versions are filtered out and emit zero keys, while tagged release entries emit one deduplicated case-escaped module path).
+  - In **Certificate Transparency (CT)** and **Merkle Tree Certificates (MTC)**, a single certificate contains a Subject Common Name (CN) and multiple Subject Alternative Names (SANs). Each unique DNS name is emitted once in reversed-label trailing-dot notation (`"com.google.mail."`, `"com.google.*."`) without parent-domain expansion at map time; hierarchical subdomain discovery is performed at query time via MPT prefix lookups (`?prefix=true`).
 
 ---
 
@@ -41,14 +41,14 @@ To guarantee that verifiers can independently discover records, the indexer (`Ma
 
 ### 1.1 Universal Canonicalization Reference Profiles
 
-| Application | Claim Subject Type | Canonical Preimage Extraction Profile (Guest WASM) | Host KeyHash Formula | Cardinality Profile |
+| Application | Claim Subject Type | Canonical Key Extraction Profile (Guest WASM -> MPT Key) | Host Storage KeyHash Formula | Cardinality Profile |
 | :--- | :--- | :--- | :--- | :--- |
-| **Certificate Transparency** | Domain Name & Parent Suffixes | Strip leading wildcard (`*.` / `*`) and trailing dot (`.`); ASCII lowercase; IDNA2008 / UTS #46 Punycode (`xn--...`); expand parent domain suffixes down to the registrable eTLD+1 boundary. | `SHA256(canonical_domain_ascii_bytes)` | 1-to-N (1 to 100+ keys/leaf) |
-| **Merkle Tree Certificates** | Domain Name & Parent Suffixes | Same as CT: strip leading wildcard and trailing dot, lowercase Punycode, and expand parent suffixes down to the eTLD+1 boundary. | `SHA256(canonical_domain_ascii_bytes)` | 1-to-N (typically 1 to 15 keys/leaf) |
-| **Go Software Supply Chain** | Module Path | Filter out untagged pseudo-versions (`vX.Y.Z-yyyymmddhhmmss-abcdefabcdef`); apply canonical Go module path case-escaping (`!` + lowercase for uppercase letters). | `SHA256(canonical_module_path_bytes)` | At most 1-to-1 (`0..1` keys/leaf) |
+| **Certificate Transparency** | Reversed-Label Domain Name | Extract Subject CN + SAN `dNSName`; IDNA2008 Punycode (`xn--...`); ASCII lowercase; reverse labels with mandatory trailing dot (`*.mail.google.com` -> `com.google.mail.*.`). No map-time parent expansion. | `SHA256(canonical_reversed_domain_bytes)` | 1-to-N (1 per unique SAN/CN) |
+| **Merkle Tree Certificates** | Reversed-Label Domain Name | Same as CT: extract Subject CN + SAN `dNSName`, IDNA2008 Punycode, lowercase, reverse labels with mandatory trailing dot (`com.google.mail.`). No map-time parent expansion. | `SHA256(canonical_reversed_domain_bytes)` | 1-to-N (1 per unique SAN/CN) |
+| **Go Software Supply Chain** | Escaped Module Path | Filter out untagged pseudo-versions (`vX.Y.Z-yyyymmddhhmmss-abcdefabcdef`); apply canonical Go module path case-escaping via `module.EscapePath` (`!` + lowercase for uppercase letters). | `SHA256(escaped_module_path_bytes)` | At most 1-to-1 (`0..1` keys/leaf) |
 | **Sigstore** | Artifact Digest | Lowercase hex string prefixed with algorithm: `sha256:<64_hex_digits>`. | `SHA256("sha256:" + lowercase_hex)` | 1-to-N (digest + identities) |
 | **Sigstore** | Signer Identity | Lowercase, whitespace-trimmed OIDC email or URI string. | `SHA256(canonical_identity_bytes)` | 1-to-N (digest + identities) |
-| **Sigsum** | Ed25519 Key | Raw 32-byte public key bytes. | `SHA256(raw_pubkey_bytes)` | 1-to-1 (exactly 1 key/leaf) |
+| **Sigsum** | Ed25519 Key | Lowercase 64-character hex string of 32-byte public key hash. | `SHA256(canonical_key_bytes)` | 1-to-1 (exactly 1 key/leaf) |
 
 ---
 
@@ -68,19 +68,16 @@ In Certificate Transparency, domain owners must monitor all certificates issued 
 CT logs store RFC 6962 / `static-ct` entries consisting of serialized X.509 certificates and precertificates (`x509_entry` / `precert_entry`). Leaf payloads contain ASN.1 DER-encoded `TBSCertificate` structures with Subject Common Names (CN) and Subject Alternative Name (SAN) extensions (`dNSName`).
 
 #### MapFn Key Extraction & Normalization
-The WASM `MapFn` parses the DER certificate or precertificate, extracts the Subject CN and all SAN `dNSName` entries, normalizes each domain, and expands parent domain suffixes:
-1. Strip leading wildcard prefix (`*.example.com` or `*example.com` -> `example.com`) and trailing dot (`example.com.` -> `example.com`).
-2. ASCII lowercase normalization.
-3. Convert Internationalized Domain Names (IDN) to Punycode via IDNA2008: `bücher.example` -> `xn--bcher-kva.example`.
-4. **Parent Domain Suffix Expansion (up to eTLD+1)**: Determine the registrable domain via the Public Suffix List (eTLD+1) and emit the full domain along with every intermediate parent domain down to the eTLD+1 (e.g., `a.b.example.co.uk` emits `a.b.example.co.uk`, `b.example.co.uk`, and `example.co.uk`, stopping before the public suffix `co.uk`).
-
-Each leaf produces a 1-to-N fanout mapping, and duplicate emissions within the same leaf (such as two SANs sharing `example.com`) are deduplicated by the host KV store so each certificate index is recorded at most once per domain key.
+The WASM `MapFn` parses the DER certificate or precertificate, extracts the Subject CN and all SAN `dNSName` entries, and normalizes each domain into a reversed-label canonical key with a mandatory trailing dot (`ToReversedDomainKey`):
+1. Trim ASCII whitespace and any trailing dot (`example.com.` -> `example.com`).
+2. Preserve leading wildcard labels (`*.example.com`) as a terminal wildcard label (`*`), while rejecting bare `*` or partial-label wildcards (`*foo.example.com`).
+3. Convert Internationalized Domain Names (IDN) to Punycode via IDNA2008 (`idna.Lookup.ToASCII`) and lowercase ASCII characters: `Bücher.Example.com` -> `xn--bcher-kva.example.com`.
+4. **Reverse Labels with Trailing Dot (Zero Map-Time Parent Expansion)**: Reverse the domain labels and append a mandatory trailing `.` (`mail.google.com` -> `com.google.mail.`, `*.google.com` -> `com.google.*.`). Parent suffixes are **not** expanded at map time; instead, subdomain hierarchy discovery is served natively via MPT prefix queries (`?prefix=true`).
 
 #### Verifier Query & Verification Flow
-1. **Query**: A domain owner queries `GET /vindex/v1/lookup/{KeyHash}?before=X&limit=M` where `KeyHash = SHA256("example.com")`. Because of parent suffix expansion during indexing, querying `example.com` returns all certificates issued for `example.com` as well as any subdomain `*.example.com`.
-2. **Response**: VIndex returns a compact, append-only list of leaf indices in the CT log, along with an MPT inclusion proof against `MapRoot` and a sub-log Merkle compact range proof.
-3. **Verification**: The verifier validates the cryptographic proof against the witnessed Output Log checkpoint, ensuring the list of indices is complete.
-4. **Certificate Retrieval**: The monitor fetches the raw certificates from the CT log using the returned indices to inspect validity dates, public keys, and revocation status via OCSP/CRL.
+1. **Prefix / Point Discovery (`GET /vindex/v1/keys/com.google.?prefix=true`)**: A domain owner queries the reversed registrable domain prefix `com.google.` with `?prefix=true` (guarded on the server by `DomainETLDP1PrefixPolicy` to reject bare TLD scans like `com.`). VIndex returns the signed Output Log state commitment, a two-sided MPT prefix proof (`mpt-proof-v1 prefix`), and `keys-v1` listing every matching subdomain and wildcard key (`com.google.`, `com.google.*.`, `com.google.mail.`, etc.) with its 32-byte `SubRoot`.
+2. **Entry Retrieval (`GET /vindex/v1/entries/{key...}?before=X&limit=M`)**: For each matched key in `keys-v1`, the client fetches the occurrence indices from the lock-free `/vindex/v1/entries/` endpoint and verifies that the reconstructed RFC 6962 compact range equals the key's authenticated `SubRoot`.
+3. **Certificate Retrieval**: The monitor fetches the raw certificates from the CT log using the verified indices to inspect validity dates, public keys, and revocation status.
 
 ---
 
@@ -97,7 +94,7 @@ Merkle Tree Certificates replace traditional WebPKI X.509 signatures with Merkle
 MTC logs store compact binary assertions containing domain names, public keys, and validity windows. Leaf payloads are significantly smaller than X.509 certificates but are issued at 10x–50x the frequency of classic CT.
 
 #### MapFn Key Extraction & Normalization
-The WASM `MapFn` parses the binary assertion, extracts the domain labels, and applies the same canonical domain normalization and eTLD+1 parent suffix expansion rules as CT (strip leading wildcard and trailing dot, lowercase, IDNA2008 Punycode, and emit parent suffixes down to the registrable eTLD+1 boundary).
+The WASM `MapFn` parses the Type 1 `TBSCertificateLogEntry` DER payload, extracts both Subject Common Name (CN) and SAN `dNSName` entries, and applies the identical reversed-label trailing-dot canonicalization (`ToReversedDomainKey`: lowercase, IDNA2008 Punycode, reversed labels + trailing `.`, preserving `*.` as terminal `*.`, with zero map-time parent suffix expansion).
 
 #### Interaction with Log Pruning
 MTC logs rely on aggressive log pruning to discard expired certificates. VIndex supports this operational model:
@@ -134,8 +131,8 @@ The WASM `MapFn` scans the lines of the SumDB record, extracts the module path a
   - *Impact*: Eliminated `reflect`, `regexp`, and Unicode tables inside `sumdb.wasm`, reducing guest binary size by 24% (from 2.5 MB to 1.9 MB) and accelerating mapping throughput.
 
 #### Verifier Query & Verification Flow
-1. **Query**: A developer queries `GET /vindex/v1/lookup/{KeyHash}?limit=100` where `KeyHash = SHA256("github.com/google/uuid")`.
-2. **Response**: VIndex returns the list of all Input Log indices where tagged versions of `github.com/google/uuid` appeared.
+1. **Point or Prefix Query**: A developer queries `GET /vindex/v1/keys/github.com/google/uuid` for an exact module or `GET /vindex/v1/keys/github.com/google/?prefix=true` to discover all modules under `github.com/google/`.
+2. **Entry Retrieval**: Using the authenticated `SubRoot` from `keys-v1`, the client queries `GET /vindex/v1/entries/github.com/google/uuid?before={InputLogSize}&limit=100` to retrieve and verify the list of all Input Log indices where tagged versions of `github.com/google/uuid` appeared.
 3. **Audit**: The developer fetches the corresponding leaves from `sum.golang.org` to enumerate every release tag ever committed for that module.
 
 ---
@@ -185,15 +182,13 @@ The WASM `MapFn` extracts the 32-byte public key hash directly from the fixed bi
 
 ---
 
-## 3. Future Work (Non-v1 Scope): Prefix-Trie & Subtree Indexing
+## 3. Native Prefix-Trie & Subtree Indexing (`docs/PREFIX_LOOKUPS.md`)
 
-> **Note**: VIndex v1 implements exact 32-byte point lookups exclusively. While CT and MTC plugins support parent domain discovery in v1 by expanding domain suffixes up to eTLD+1 at mapping time, arbitrary prefix-trie and organizational namespace subtree searches without map-time expansion remain future design concepts.
+Because `MapFn` plugins emit variable-length canonical keys (`1..1024` printable ASCII bytes `0x21..0x7E`) directly into the `filippo.io/torchwood/mpt` Sparse Merkle Patricia Trie, VIndex v1 natively supports cryptographic prefix and subtree queries without map-time suffix expansion:
 
-While VIndex v1 provides point lookups by exact 32-byte key hashes, preserving raw canonical Claim Subject preimages across the `map_bundle` guest-host boundary provides critical forward compatibility for future search extensions:
-
-1. **Arbitrary Hierarchy Discovery Without Map-Time Fanout**: Instead of emitting every parent suffix as a separate key at map time, a prefix-trie index can support arbitrary subdomain or hierarchy queries directly.
-2. **Namespace / Organization Discovery (`github.com/org/*`)**: In Go SumDB and Sigstore, developers need to enumerate all modules or container images published under an organizational namespace.
-3. **Zero Guest ABI Changes**: Because plugins output canonical string preimages rather than one-way hashes, a future VIndex version can construct auxiliary prefix-trie indices (radix trees or patricia tries) directly from the preserved preimages without requiring guest WASM plugin authors to recompile or update their mapping logic.
+1. **Hierarchy Discovery Without Map-Time Fanout**: Reversed-label trailing-dot domain keys (`com.google.mail.`, `com.google.*.`) allow querying `GET /vindex/v1/keys/com.google.?prefix=true` to discover the apex domain and every subdomain/wildcard in a single two-sided MPT prefix proof (`mpt.ProvePrefix` / `mpt.VerifyPrefix`), avoiding map-time write amplification across parent labels.
+2. **Namespace / Organization Discovery (`github.com/org/`)**: In Go SumDB, developers can query `GET /vindex/v1/keys/github.com/org/?prefix=true` to cryptographically enumerate all indexed modules published under an organizational namespace.
+3. **Prefix Policy Guardrails**: Server operators can attach a `PrefixPolicy` (such as `DomainETLDP1PrefixPolicy` for CT/MTC logs) to reject overly broad TLD or public-suffix scans (`com.`, `co.uk.`) with `HTTP 400 Bad Request`, alongside `--max_prefix_keys` (`HTTP 413 Content Too Large`). See [`docs/PREFIX_LOOKUPS.md`](./PREFIX_LOOKUPS.md) for the complete specification.
 
 ---
 
@@ -216,3 +211,22 @@ While VIndex v1 provides point lookups by exact 32-byte key hashes, preserving r
 - **Proposed**: Compiling SHA-256 cryptographic hashing directly into guest WebAssembly bytecode.
 - **Empirical Rejection**: Consumed ~55% of total CPU time inside the sandbox due to the lack of hardware vector instructions.
 - **Resolution**: Delegated hashing to the Go host runtime using hardware vector instructions (SHA-NI / ARMv8 Crypto).
+
+---
+
+## 6. Verification Gate
+
+All application mapping profiles (`ct`, `mtc`, `sumdb`) and canonicalization tests are verified via:
+
+```bash
+go test -race ./vindex/v1/mapfn/... ./vindex/v1/cmd/...
+```
+
+---
+
+## 7. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined Universal Claim Subject Map model and canonicalization profiles for CT, MTC, SumDB, Sigstore, and Sigsum. |
+| 2026-10-14 | M2–M3 | Replaced map-time parent domain expansion with reversed-label trailing-dot keys (`ToReversedDomainKey`) and query-time MPT prefix lookups (`?prefix=true`). |

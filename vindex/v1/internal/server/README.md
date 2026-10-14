@@ -21,12 +21,13 @@ The serving engine mirrors the inverted storage structure established in the KV 
 
 ### 1.3 Goals & Non-Goals
 - **Goals**:
-  - Provide constant-time point lookups over exact 32-byte key hashes.
-  - Return verifiable inclusion proofs for existing keys and cryptographic non-inclusion proofs for absent keys.
+  - Provide a two-endpoint C2SP read protocol separating key/prefix proof generation (`GET /vindex/v1/keys/{key...}[?prefix=true]`) from lock-free Pebble entry pagination (`GET /vindex/v1/entries/{key...}?before=X[&limit=Y]`), alongside legacy single-request point lookups (`GET /vindex/v1/lookup/{keyhash}`).
+  - Return verifiable point inclusion proofs, non-inclusion proofs, and two-sided prefix proofs (`mpt-proof-v1 <inclusion|non-inclusion|prefix>`) with `keys-v1` mappings.
+  - Enforce configurable prefix policies (`PrefixPolicy` such as `DomainETLDP1PrefixPolicy` -> `HTTP 400`) and key-count caps (`--max_prefix_keys` -> `HTTP 413`).
   - Enforce strict reader snapshot isolation: readers observe state strictly bounded by witnessed Output Log checkpoints.
-  - Stream responses using direct plaintext formatting without JSON reflection or intermediate heap allocations.
+  - Stream responses using direct plaintext formatting (`vindex/v1/wire`) without JSON reflection or intermediate heap allocations.
 - **Non-Goals**:
-  - **No Cross-Key Prefix Scans**: Lexical scanning across different key prefixes is out of scope.
+  - **No Unbounded Full-Tree Scans**: Prefix scans are guarded by `PrefixPolicy` and `--max_prefix_keys`.
   - **No Uncommitted / Read-Uncommitted Mode**: Lookups never observe un-witnessed or in-flight entries ahead of the latest published checkpoint.
   - **No In-Server Client Verification**: The server generates proofs; cryptographic verification is executed exclusively by the client SDK ([`client/`](../../client/README.md)).
 
@@ -47,7 +48,9 @@ The server exposes the following HTTP endpoints:
 
 | Endpoint | Method | Purpose & Parameters |
 | :--- | :--- | :--- |
-| `/vindex/v1/lookup/{keyhash}` | `GET` | Look up occurrences for a 32-byte hex-encoded key hash.<br>Query params: `before` (optional `uint64`), `limit` (optional `uint64`, default 100, max 1000). Evaluated against `Serving_CP`. Supported backward compatibility aliases: `/vindex/lookup/{keyhash}` and `/lookup/{keyhash}`. |
+| `/vindex/v1/keys/{key...}` | `GET` | Point or prefix key lookup over variable-length canonical keys (`1..1024` printable ASCII bytes).<br>Query params: `prefix=true` (optional boolean). Returns `vindex/v1`, `output-log-leaf-v1`, `output-log-proof-v1`, `mpt-proof-v1 <inclusion\|non-inclusion\|prefix>`, and `keys-v1`. Returns `HTTP 400` if `PrefixPolicy` rejects the prefix, or `HTTP 413` if matched keys exceed `--max_prefix_keys`. Aliases: `/vindex/keys/{key...}`, `/keys/{key...}`. |
+| `/vindex/v1/entries/{key...}` | `GET` | Lock-free mini-log entry pagination for `{key...}` (`KeyHash = SHA256(key)`).<br>Query params: `before` (**required** `uint64` > 0), `limit` (optional `uint64`, default 100, max 1000). Acquires **zero MPT locks**; returns `prefix-compact-range-v1` (if `covered_size > 0`) and `indices-v1 [<next_before>]`. Aliases: `/vindex/entries/{key...}`, `/entries/{key...}`. |
+| `/vindex/v1/lookup/{keyhash}` | `GET` | Legacy combined point lookup for a 32-byte hex-encoded key hash.<br>Query params: `before` (optional `uint64`), `limit` (optional `uint64`, default 100, max 1000). Evaluated against `Serving_CP`. Aliases: `/vindex/lookup/{keyhash}` and `/lookup/{keyhash}`. |
 | `/vindex/v1/checkpoint` | `GET` | Returns the latest signed, witnessed Output Log checkpoint note from `Serving_CP`. Supported backward compatibility alias: `/checkpoint`. |
 | `/vindex/v1/inputlog_checkpoint` | `GET` | Returns the raw signed Input Log checkpoint note from `Serving_CP`. Supported backward compatibility alias: `/inputlog_checkpoint`. |
 | `/healthz` | `GET` | Liveness probe. Returns **HTTP 200 OK** (`ok\n`) as long as the process is alive. |
@@ -56,8 +59,9 @@ The server exposes the following HTTP endpoints:
 
 ### 2.2 Multi-Section Plaintext Response Wire Format
 
-Responses use the C2SP multi-section plaintext format, where sections are delimited by blank lines (`\n\n`) and framed by section headers `— <section-name>[ <args>] —`:
+Responses use the C2SP multi-section plaintext format (`vindex/v1/wire`), where sections are delimited by blank lines (`\n\n`) and framed by section headers `— <section-name>[ <args>] —`.
 
+#### A. `/vindex/v1/keys/{key...}[?prefix=true]` Response:
 ```text
 — vindex/v1 —
 origin example.com/vindex
@@ -73,11 +77,18 @@ k2g...
 
 — output-log-proof-v1 —
 MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
-ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=
 
-— mpt-proof-v1 inclusion —
+— mpt-proof-v1 prefix —
 AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
 
+— keys-v1 —
+com.google. 8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4
+com.google.*. 2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+com.google.mail. 4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a
+```
+
+#### B. `/vindex/v1/entries/{key...}?before=98765&limit=100` Response:
+```text
 — prefix-compact-range-v1 65536 —
 MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
 
@@ -86,6 +97,9 @@ MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
 1089
 1150
 ```
+
+#### C. Legacy `/vindex/v1/lookup/{keyhash}` Response:
+Combines `vindex/v1`, `output-log-leaf-v1`, `output-log-proof-v1`, `mpt-proof-v1 <inclusion|non-inclusion>`, optional `prefix-compact-range-v1`, and `indices-v1` in a single payload.
 
 #### Section Breakdown:
 1. `— vindex/v1 —`: Raw signed Output Log checkpoint note from `Serving_CP`, containing tree size, root hash, and witness cosignatures.
@@ -202,3 +216,22 @@ The read serving subsystem exposes point lookups and checkpoint retrieval over H
   - Readiness and sync status probes (`/readyz` or `/syncz`) report degraded status.
   - Liveness probe (`/healthz`) remains HTTP 200, and the serving engine continues serving lookups pinned to the last verified checkpoint (`Serving_CP`), preserving read availability and partition resilience.
   - Operators strictly preferring total downtime over serving stale state can opt in via `--fail_closed=true`.
+
+---
+
+## 4. Verification Gate
+
+All server endpoint, prefix policy, and C2SP wire response tests are verified via:
+
+```bash
+go test -race ./vindex/v1/internal/server/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined C2SP plaintext wire format, backward pagination, and reader snapshot isolation. |
+| 2026-10-14 | M1–M3 | Added asynchronous startup (`mpt_initializing` `503` on `/readyz`), two-endpoint protocol (`/vindex/v1/keys/` and lock-free `/vindex/v1/entries/`), `DomainETLDP1PrefixPolicy` (`400`), `--max_prefix_keys` (`413`), and shared `vindex/v1/wire` formatting. |

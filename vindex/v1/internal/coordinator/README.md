@@ -29,7 +29,7 @@ The Coordinator serves as the **single source of truth** for system lifecycle an
   - Drive the steady-state batch processing loop across all pipeline stages in strictly monotonic sequence.
   - Prevent moving-goalpost starvation by freezing target sync checkpoints prior to batch ingestion.
   - Enforce the synchronous handoff: persist the KV checkpoint to disk, ratchet forward, predict the MPT change, and promote the checkpoint to the Output Log.
-  - Guarantee deterministic, network-free Zero-WAL crash recovery (< 5ms clean start, < 500ms dirty crash recovery).
+  - Guarantee deterministic, network-free Zero-WAL crash recovery inside `coord.Recover()` (< 5ms clean start, < 500ms dirty crash recovery after `mpt.Open()` completes its `torchwood/mpt` journal replay; see [`docs/BENCHMARKS.md §5`](../../docs/BENCHMARKS.md#5-post-run-empirical-evaluation--cold-startup-investigation-2026-09-22)).
 - **Non-Goals**:
   - **No Distributed Consensus**: Operates strictly within a single process; does not run Raft, Paxos, or distributed leader election.
   - **No Direct In-Memory Mutation**: The Coordinator does not touch trie nodes or LSM chunk bytes directly; it coordinates subsystem boundaries.
@@ -92,13 +92,13 @@ On high-traffic transparency logs, the log head advances continuously. If the co
 The Coordinator prevents this by writing the verified target checkpoint note into Pebble DB metadata (`Target_CP`) prior to batch processing. The entire pipeline processes that fixed slice to completion before the coordinator advances to a new target.
 
 ### 2.5 Zero-WAL Startup Recovery Sequence & Uncommitted KV Writes
-On daemon launch, the coordinator executes a deterministic 3-phase recovery sequence before opening network endpoints:
+On daemon launch, `vindexd` binds the HTTP server immediately (returning `200 OK` on `/healthz` and `503 Service Unavailable` with `"status": "mpt_initializing"` on `/readyz` and lookup endpoints) while `mpt.Open()` replays any uncompacted `torchwood/mpt` journal frames on disk (see [`docs/BENCHMARKS.md §5`](../../docs/BENCHMARKS.md#5-post-run-empirical-evaluation--cold-startup-investigation-2026-09-22)). Once `mpt.Open()` finishes, the coordinator executes a deterministic 3-phase recovery sequence (`coord.Recover()`) before promoting network endpoints to `200 OK`:
 
-1. **Phase 1: Instant Warm Start (< 5ms)**:
-   - Compares the persisted MPT size on disk (`MPT_Durable_Size`) against the latest committed Output Log state (`Output_CP.InputSize`), and verifies that the trie root matches the Output Log leaf commitment.
+1. **Phase 1: Instant Warm Start (< 5ms after `mpt.Open`)**:
+   - Compares the persisted MPT size on disk (`MPT_Durable_Size` with `IsExact() == true`) against the latest committed Output Log state (`Output_CP.InputSize`), and verifies that the trie root matches the Output Log leaf commitment.
    - If true, clean shutdown is verified. Activates `Serving_CP`, initializes watermarks, and **opens the HTTP Read Server immediately (< 5ms)**.
-2. **Phase 2: Fast-Forward Tile Replay (< 500ms)**:
-   - If the persisted MPT lags behind the latest Output Log commitment (`MPT_Durable_Size < Output_CP.InputSize`) due to a dirty kill:
+2. **Phase 2: Fast-Forward Tile Replay (< 500ms after `mpt.Open`)**:
+   - If the persisted MPT lags behind the latest Output Log commitment (`MPT_Durable_Size < Output_CP.InputSize` or `!IsExact()`) due to a dirty kill:
      - Streams missing historical tiles across the lag window `[MPT_Durable_Size .. Output_CP.InputSize)` directly from the local disk tile cache.
      - Maps replayed tiles via `map_bundle` to identify modified search keys.
      - Reconstructs mini-log sub-roots for modified keys up to `Output_CP.InputSize` with **zero writes to the database**.
@@ -162,12 +162,12 @@ The coordinator automatically executes the **Genesis Backfill** lifecycle under 
    - To accelerate initial tree density while preventing heap bloat, the flush threshold ramps progressively up to tens of millions of keys (or tens of millions of leaves per coarse checkpoint interval).
    - Intermediate root predictions, Output Log appends, and witness signatures are completely bypassed.
 
-3. **Asynchronous Coarse Checkpoint Flush**:
-   - When the active buffer reaches its key threshold or the coarse checkpoint leaf interval, the coordinator swaps buffers and dispatches a coarse flush job to a background MPT worker goroutine (on graceful shutdown `SIGINT`/`SIGTERM`, any already-dispatched background flush finishes while uncommitted in-flight batch work is skipped so startup resumes from the last durable coarse checkpoint):
-     1. **Pebble Durability Barrier**: Executes a synchronous KV flush, guaranteeing that all KV chunk records up to the flush watermark are physically flushed to disk.
-     2. **MPT Batch Application & Snapshot**: Applies the coalesced sub-root batch to the MPT and creates a versioned trie snapshot, hashing dirty trie branches and recording the snapshot watermark in the MPT header.
-     3. **MPT Durability Sync**: Flushes mmap patch frames and executes `fsync` on the underlying tree files.
-   - **Durability Invariant**: Step 1 must strictly precede Steps 2 and 3, guaranteeing `KV_CP.Size >= MPT_Durable_Size` across all crash scenarios.
+3. **Asynchronous Coarse Checkpoint Flush (`syncGenesisBackfill`)**:
+   - When the active buffer (`keySubRootBufA`) reaches its key threshold or the coarse checkpoint leaf interval, the coordinator executes a synchronous Pebble durability barrier (`c.db.Sync()`) on the main goroutine *before* swapping `keySubRootBufA`/`keySubRootBufB` and dispatching the flush job to the background MPT worker goroutine (`mptChan`):
+     1. **Synchronous Pebble Durability Barrier (`c.db.Sync()`)**: Executed synchronously in `dispatchFlush` on the main goroutine before sending to `mptChan`, guaranteeing that all KV chunk records up to `flushSize` are physically flushed to disk without racing concurrent Pebble batch writes.
+     2. **MPT Batch Application & Snapshot (`CommitKeyWithVersion`)**: The background MPT worker applies the coalesced canonical-key sub-root batch (`[]mpt.PrefixKeyVal`) to the MPT and creates a versioned trie snapshot, hashing dirty trie branches and recording `flushSize` in the MPT version watermark.
+     3. **MPT Durability Sync (`Persist`)**: The background MPT worker flushes mmap patch frames (`Sync`) and advances `durableSize = flushSize` (`IsExact() == true`), then updates the tile cache pruning watermark (`min(KV_CP.Size, MPT_Durable_Size)`).
+   - **Durability Invariant**: Step 1 strictly precedes Steps 2 and 3, guaranteeing `KV_CP.Size >= MPT_Durable_Size` across all crash scenarios.
 
 4. **Bounded Crash Recovery**:
    - On startup when `Output_CP.Size == 0` and `KV_CP.Size > MPT_Durable_Size`:
@@ -206,3 +206,22 @@ The coordinator automatically executes the **Genesis Backfill** lifecycle under 
   - The MPT already requires single-host RAM/mmap locality; clustering the coordinator adds immense operational complexity without solving tree state synchronization.
   - High availability is achieved externally: independent mirrors run standalone VIndex instances against the shared Input Log.
 - **Chosen Design**: Single-process, single-host embedded coordinator.
+
+---
+
+## 4. Verification Gate
+
+All coordinator recovery, genesis backfill, and batch loop invariants are verified via:
+
+```bash
+go test -race ./vindex/v1/internal/coordinator/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined 6-step master batch loop, 3-phase Zero-WAL recovery, and Genesis Backfill. |
+| 2026-10-14 | M1–M3 | Fixed durable MPT watermark tracking (`IsExact()`), removed duplicate Phase 3 replay, enforced synchronous Pebble barrier in `syncGenesisBackfill`, and added canonical key MPT indexing. |

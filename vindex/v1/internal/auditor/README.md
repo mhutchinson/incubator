@@ -115,7 +115,7 @@ If the candidate local `MapRoot` differs from the committed `MapRoot`, or upstre
 
 ### 2.4 Verified Mirror Serving Engine (`--serve_mirror`)
 When deployed with `--serve_mirror=true`, the verifier acts as a production-grade read replica:
-- Exposes standard C2SP query endpoints (`/vindex/v1/lookup/{keyhash}`, `/vindex/v1/checkpoint`, `/vindex/v1/inputlog_checkpoint`).
+- Exposes standard C2SP query endpoints (`/vindex/v1/keys/{key...}`, `/vindex/v1/entries/{key...}`, `/vindex/v1/lookup/{keyhash}`, `/vindex/v1/checkpoint`, `/vindex/v1/inputlog_checkpoint`).
 - Lookups are evaluated against the locally verified MPT and Pebble database under reader snapshot isolation.
 - Guarantees that clients querying the mirror never observe unverified data or commitments from an untrusted operator.
 - If upstream divergence occurs, the mirror freezes forward sync but continues serving valid proofs pinned to the last verified Output Log checkpoint (`Serving_CP`), protecting downstream clients from an immediate denial of service while ensuring they never consume unverified or fraudulent results. If the operator configures `--fail_closed=true`, the server instead immediately clears serving state and returns `HTTP 503`.
@@ -190,3 +190,22 @@ The auditor subsystem provides continuous full-log verification and optional rea
 - **Proposed**: Having the verifier immediately clear the active serving state and return `HTTP 503` on all queries upon encountering a root mismatch or sync divergence.
 - **Operational & Availability Rejection**: In production mirror deployments, upstream glitches, signer delays, or isolated bugs converted immediately into total denial of service for all downstream applications. Downstream systems were starved of verified answers despite holding thousands of previously authenticated entries. Furthermore, load balancers de-routed or killed healthy mirrors due to failing health checks.
 - **Chosen Design**: Safe state-preserving halt with pinned last-known-good serving: background sync halts immediately, disk state is frozen for forensic triage, and alerts fire, while the serving engine safely continues answering lookups pinned to the last verified checkpoint (`Serving_CP`). Deployments strictly requiring total shutdown can opt into hard revocation via `--fail_closed=true`.
+
+---
+
+## 4. Verification Gate
+
+All auditor verification, root mismatch forensic freeze, and mirror serving tests are verified via:
+
+```bash
+go test -race ./vindex/v1/internal/auditor/... ./vindex/v1/cmd/vindex-auditor/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined continuous full-log audit loop, root mismatch halt, and verified mirror serving. |
+| 2026-10-14 | M1–M3 | Added `StageMappedBatch` pre-commit staging for forensic state freeze, `mptMgr` snapshot lock isolation in mirror mode, `/healthz` liveness decoupling (M1), and canonical key/prefix mirror serving (M2–M3). |

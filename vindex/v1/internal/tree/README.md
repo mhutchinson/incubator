@@ -1,13 +1,17 @@
 # Sub-Design: Authenticated State Commitment (MPT & Publisher)
 
-This document defines the cryptographic commitment engine, tree synchronization protocols, concurrency model, load-bearing invariants, and verified performance optimizations for the **Tree Subsystem** (`vindex/v1/internal/tree`).
+This document defines the cryptographic commitment engine, tree synchronization protocols, concurrency model, load-bearing invariants, and verified performance optimizations for the **MPT Subsystem** (`vindex/v1/internal/mpt`) and **Output Log Publisher Subsystem** (`vindex/v1/internal/tree`).
 
 ---
 
 ## 1. Context & Objectives
 
-### 1.1 Problem Statement & Concurrency Dilemma
-The tree subsystem binds the search index into an authenticated 32-byte cryptographic root (`MapRoot`), anchors it in an immutable Output Log, and serves cryptographic inclusion and non-inclusion proofs to HTTP readers.
+### 1.1 Problem Statement, Package Decoupling & Concurrency Dilemma
+The commitment plane is split into two focused packages:
+- **`vindex/v1/internal/mpt`**: Houses the `filippo.io/torchwood/mpt` variable-length Sparse Merkle Patricia Trie (`Manager`), canonical key validation (`ValidateCanonicalKey`), point proof generation/verification (`ProveKey`/`VerifyKey`), and two-sided prefix proof generation/verification (`ProvePrefix`/`VerifyPrefix`), with zero dependencies on `pebble` or `tessera` so it can be imported by `vindex/v1/client`.
+- **`vindex/v1/internal/tree`**: Houses the `OutputPublisher`, Tessera POSIX Output Log (`PosixOutputLog`), and 3-step atomic commitment lifecycle, while re-exporting `internal/mpt` types as aliases for server subsystems.
+
+The tree subsystem binds the search index into an authenticated 32-byte cryptographic root (`MapRoot`), anchors it in an immutable Output Log, and serves cryptographic inclusion, non-inclusion, and prefix proofs to HTTP readers.
 
 Because readers must verify proofs against a coherent snapshot, all mutations to the in-memory Sparse Merkle Patricia Trie (MPT) require taking an exclusive publisher lock. This creates a severe operational dilemma:
 1. **The Reader Starvation Trap**: A full commit requires computing tree updates, persisting MPT files to disk (5–20ms), appending a state commitment entry to the Output Log, and awaiting cosignatures from external witnesses over the network (50–200ms). If the writer lock is held across this entire sequence, concurrent HTTP readers are starved. Under heavy traffic, query availability collapses and lookups time out.
@@ -28,19 +32,20 @@ Because readers must verify proofs against a coherent snapshot, all mutations to
 - **Dependencies**: Binary Sparse Merkle Patricia Trie via `filippo.io/torchwood/mpt`, Tessera Output Log writer, and external witness clients.
 - **Known Pain Points ("Warts and All")**:
   - **Fatal Halt on Prediction Divergence**: If an in-memory calculation defect causes the committed trie root to differ from the predicted root that was just appended to the Output Log, the node halts immediately. Because the Output Log is append-only, there is no graceful in-memory rollback path.
-  - **RAM Sizing for Branch Locality**: Uniform 32-byte key hash distribution scatters updates across the 256-bit trie keyspace. While leaf data resides in `mmap` files, active branch nodes must remain resident in RAM (scaling from ~1 GB for 10M keys to 100+ GB for 1B keys).
+  - **RAM Sizing for Branch Locality**: Variable-length canonical keys and uniform key hashes scatter updates across the trie keyspace. While leaf data (`leaves`) and node records (`nodes`) reside in `mmap` files, active branch nodes remain resident in the OS page cache (scaling from ~1–1.5 GB for 10M keys to 100–150 GB for 1B keys).
+  - **Cold-Start Journal Replay Latency**: On process restart, `mpt.Open()` replays uncompacted `torchwood/mpt` journal frames on disk before `coord.Recover()` begins (see [`docs/BENCHMARKS.md §5`](../../docs/BENCHMARKS.md#5-post-run-empirical-evaluation--cold-startup-investigation-2026-09-22)). To prevent connection refusals during journal replay, `vindexd` binds the HTTP server immediately (`200 OK` on `/healthz`, `503` `"status": "mpt_initializing"` on `/readyz`) while `mpt.Open()` runs asynchronously.
   - **External Witness Network Latency**: Waiting for witness cosignatures introduces commit cycle latency, though non-blocking root prediction insulates HTTP readers from this delay.
 
 ---
 
 ## 2. Detailed Design
 
-### 2.1 The Binary Sparse Merkle Patricia Trie (`torchwood/mpt`)
-The commitment plane maps 32-byte key hashes (`KeyHash`) to 32-byte mini-log roots (`SubRoot`):
+### 2.1 The Variable-Length Binary Sparse Merkle Patricia Trie (`internal/mpt`)
+The commitment plane maps variable-length canonical keys (`1..1024` printable ASCII bytes `0x21..0x7E`, or 64-character lowercase hex strings for hash-only mappers) to 32-byte mini-log roots (`SubRoot`):
 
-1. **Binary Radix Structure**: Keys represent 256-bit paths from the root. Non-existent subtrees are represented by implicit zero-hash nodes, allowing concise non-inclusion proofs.
-2. **Memory-Mapped Storage**: Tree nodes and leaves are stored in append-only files managed via memory mapping (`mmap`), allowing fast lookups without loading entire historical trees into the Go heap.
-3. **SubRoot Values**: The value committed at each leaf is the RFC 6962 mini-log root computed by the KV storage layer, authenticating all occurrences of that key in the Input Log.
+1. **Variable-Length Radix Structure**: `filippo.io/torchwood/mpt` (`v0.10.1+`) stores variable-length keys (`mpt.Key`, up to 1024 bytes) in bitwise big-endian paths. Keys sharing a common byte prefix share a single subtrie, enabling both point proofs (`ProveKey` / `VerifyKey`) and two-sided prefix subtree proofs (`ProvePrefix` / `VerifyPrefix`).
+2. **Memory-Mapped Storage**: Tree nodes (`nodes`, 32 bytes/node) and variable-length leaf records (`leaves`) are stored in append-only files managed via memory mapping (`mmap`), allowing fast lookups without loading entire historical trees into the Go heap.
+3. **SubRoot Values**: The value committed at each leaf is the RFC 6962 mini-log root computed by the KV storage layer (`wire.ComputeMiniLogRoot`), authenticating all occurrences of that key in the Input Log.
 
 ### 2.2 The 3-Step Atomic Commitment Sequence
 The publisher coordinates the progression from KV storage to public commitment through a structured 3-step sequence designed to satisfy two strict system constraints:
@@ -144,3 +149,22 @@ The state commitment subsystem provides authenticated indexing over search keys 
 - **Proposed**: Mutating and syncing the in-memory MPT to disk *first*, and then appending the commitment to the Output Log.
 - **Theoretical Rejection**: If the node crashes or power fails after the MPT disk sync but before the Output Log append completes, the local MPT has advanced to a state that was never committed or witnessed in the Output Log. On restart, the node would serve state ahead of the Output Log, violating the universal invariant `MPT_Size <= Output_Size`.
 - **Chosen Design**: Predict root lock-free -> append to Output Log -> commit to MPT under short lock.
+
+---
+
+## 4. Verification Gate
+
+All MPT variable-length canonical key, prefix proof, and Output Log publisher tests are verified via:
+
+```bash
+go test -race ./vindex/v1/internal/mpt/... ./vindex/v1/internal/tree/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined 3-step atomic commitment sequence and split-locking concurrency model. |
+| 2026-10-14 | M1–M3 | Tracked separate `durableSize` and `IsExact()` watermark (M1), upgraded `torchwood/mpt` for variable-length canonical keys and two-sided prefix proofs (`ProvePrefix`/`VerifyPrefix`) (M2), and decoupled `internal/mpt` from `internal/tree` (M3). |

@@ -199,3 +199,22 @@ Extensive empirical benchmarking across storage prototypes was conducted in the 
   1. *Parallel In-Memory Hashing*: Distinct keys in each batch are distributed across worker goroutines. Each worker computes compact range appends and serializes chunk entries independently in pure memory with zero shared state.
   2. *Sequential Database Commit*: The precomputed key-value writes are merged into a single atomic Pebble batch and committed sequentially.
 - **Impact**: Delivers linear multi-core scaling for CPU-intensive mini-log hashing on high-throughput workloads, eliminating pipeline stalls while preserving zero-contention, deterministic single-threaded database durability.
+
+---
+
+## 4. Verification Gate
+
+All inverted chunk storage, chunk-aligned paging, `GetSubRoot`, and `StageMappedBatch` tests are verified via:
+
+```bash
+go test -race ./vindex/v1/internal/kvstore/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined 41-byte inverted chunk layout (`^chunkNum`), 33-byte prefix Bloom filters, and two-generational chunk cache. |
+| 2026-10-14 | M1–M3 | Added chunk-aligned read paging, `maxChunksPerRequest` guardrail, O(1) `GetSubRoot`, `SeekPrefixGE` active chunk loading, eliminated phantom empty chunk 0 (M1), added `GetKeySubRoots` and `ModifiedKeySubRoots` (M2), and unified compact range hashing via `vindex/v1/wire` (M3). |

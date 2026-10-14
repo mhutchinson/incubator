@@ -181,7 +181,7 @@ go run ./vindex/v1/cmd/vindexd \
   --enable_ui=true
 ```
 
-> **Note on Tile Serving:** `vindexd` serves the C2SP lookup API (`/vindex/v1/lookup/{hash}`) and `/checkpoint` directly. The tile files written to `--output_log_dir` can be served statically over HTTP (e.g. via Caddy or Nginx) to support external witnesses and full log auditors.
+> **Note on Tile Serving:** `vindexd` serves the two-endpoint C2SP API (`/vindex/v1/keys/{key...}` and `/vindex/v1/entries/{key...}`, plus legacy `/vindex/v1/lookup/{hash}`) and `/vindex/v1/checkpoint` directly. The tile files written to `--output_log_dir` can be served statically over HTTP (e.g. via Caddy or Nginx) to support external witnesses and full log auditors.
 
 For large initial historical catch-ups, run with `--oneshot` to index the log up to tip and terminate.
 
@@ -230,8 +230,11 @@ go run ./vindex/v1/cmd/vindex-client \
 
 ### Using HTTP Directly
 VIndex exposes standard C2SP plain-text HTTP endpoints:
-- `GET /checkpoint`: Latest signed Output Log checkpoint.
-- `GET /vindex/v1/lookup/{hex_sha256_key_hash}`: Cryptographically authenticated proof and leaf indices.
+- `GET /vindex/v1/keys/{key...}[?prefix=true]`: Authenticated key/prefix sub-root lookup with MPT and Output Log proofs.
+- `GET /vindex/v1/entries/{key...}?before=X[&limit=Y]`: Lock-free paginated mini-log occurrence indices and compact range prefixes.
+- `GET /vindex/v1/lookup/{hex_sha256_key_hash}`: Legacy single-request combined point lookup.
+- `GET /vindex/v1/checkpoint`: Latest signed Output Log checkpoint (alias: `/checkpoint`).
+- `GET /vindex/v1/inputlog_checkpoint`: Latest signed Input Log checkpoint (alias: `/inputlog_checkpoint`).
 - `GET /healthz`: Process liveness probe.
 - `GET /readyz`: Sync readiness probe.
 

@@ -6,16 +6,15 @@ This example implements a VIndex WASM MapFn for **Merkle Tree Certificates (MTC)
 
 - **MTC Entry Type 1 (`TBSCertificateLogEntry`)**: Parses 2-byte big-endian entry type (`0x0001`) prefix followed by ASN.1 DER `TBSCertificateLogEntry`. Other entry types are ignored.
 
-## Indexing & Domain Expansion
+## Indexing & Reversed-Label Canonical Keys
 
 For each certificate leaf, the mapper:
-1. Extracts all DNS names from the **Subject Alternative Name (SAN)** extension.
-2. Normalizes domains (lowercasing, stripping wildcards like `*.`).
-3. Computes hierarchical domain sub-roots down to **eTLD+1** (using the Public Suffix List). For example, `deep.maps.google.co.uk` emits search keys for:
-   - `deep.maps.google.co.uk`
-   - `maps.google.co.uk`
-   - `google.co.uk`
-4. Emits canonical preimages to the host runtime via `sdk.RegisterEmit`.
+1. Extracts all DNS names from the **Subject Common Name (CN)** and **Subject Alternative Name (SAN)** extension.
+2. Normalizes domains via IDNA2008 Punycode (`idna.Lookup.ToASCII`) and ASCII lowercasing, preserving leading wildcard labels (`*.`) as a terminal wildcard label (`*`).
+3. Reverses domain labels and appends a mandatory trailing dot (`ToReversedDomainKey`), e.g.:
+   - `deep.maps.google.co.uk` -> `uk.co.google.maps.deep.`
+   - `*.google.co.uk` -> `uk.co.google.*.`
+4. Emits each unique reversed-label canonical key to the host runtime via `sdk.RegisterEmit` without map-time parent domain expansion (hierarchical subdomain discovery is served natively at query time via MPT prefix queries `GET /vindex/v1/keys/uk.co.google.?prefix=true`).
 
 ## Building & Testing
 

@@ -113,3 +113,22 @@ The ingestion subsystem manages upstream data retrieval, sandboxed mapping, and 
   - Binding against bespoke host runtime imports destroys the clean abstraction of a mapping function as a pure, portable callback from raw leaf bytes to emitted key preimages. Guest SDKs in other languages (Rust, TinyGo, Zig) would require specialized bindings and FFI boilerplate.
   - Calling a host import for every hash introduces bidirectional FFI context switching overhead.
 - **Chosen Design**: Keep the guest contract completely pure and self-contained: the guest simply emits raw canonical string preimages, and the Go host performs bulk SIMD hashing natively.
+
+---
+
+## 4. Verification Gate
+
+All tile fetching, cryptographic tile verification, cache durability, reaper, and WASM pipeline tests are verified via:
+
+```bash
+go test -race ./vindex/v1/internal/ingest/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined 256-leaf tile ingestion, local tile cache, WASM worker pool, and monotonic resequencer. |
+| 2026-10-14 | M1–M3 | Added Level-0 tile Merkle root verification (`verifyTileInclusion`), mandatory checkpoint verifier, atomic `PutBundle` + self-healing `GetBundle`, deterministic `ErrWASMFatalTrap` halt (M1), canonical key emission (M2), and extracted `mapfn/host` (M3). |
