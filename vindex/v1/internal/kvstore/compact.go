@@ -18,57 +18,24 @@ import (
 	"crypto/sha256"
 	"math/bits"
 
+	"github.com/transparency-dev/incubator/vindex/v1/wire"
 	"github.com/transparency-dev/merkle/compact"
 	"github.com/transparency-dev/merkle/rfc6962"
 )
 
-var emptyRoot = sha256.Sum256(nil)
-
 // LeafHash computes the RFC 6962 standard leaf hash: SHA256(0x00 || data).
-//
-// Previously: Called rfc6962.DefaultHasher.HashLeaf(data).
-// Why replaced: DefaultHasher allocates a new sha256.digest object (sha256.New())
-// and a dynamic heap slice on every call (161 B/op, 3 allocs/op). For leaves up to
-// 511 bytes (which includes all 8-byte index leaves in VIndex), using an inline stack
-// buffer with sha256.Sum256 achieves 0 B/op, 0 allocs/op, and ~35% lower latency.
 func LeafHash(data []byte) [sha256.Size]byte {
-	if len(data) <= 511 {
-		var b [512]byte
-		b[0] = 0x00
-		copy(b[1:], data)
-		return sha256.Sum256(b[:1+len(data)])
-	}
-	h := sha256.New()
-	h.Write([]byte{0x00})
-	h.Write(data)
-	var out [sha256.Size]byte
-	h.Sum(out[:0])
-	return out
+	return wire.LeafHash(data)
 }
 
 // InteriorHash computes the RFC 6962 standard interior node hash: SHA256(0x01 || left || right).
-//
-// Previously: Called rfc6962.DefaultHasher.HashChildren(left[:], right[:]).
-// Why replaced: DefaultHasher instantiated a new sha256.digest (sha256.New()) and
-// allocated temporary slices on every internal node collapse (240 B/op, 3 allocs/op).
-// During batch ingestion, this accounted for 3.70 GB (24.1%) of total heap allocation churn
-// in MTC profiles. An inline [65]byte stack buffer (0x01 || left || right) with direct
-// sha256.Sum256 eliminates 100% of allocations (0 B/op, 0 allocs/op) and is 33% faster.
 func InteriorHash(left, right [sha256.Size]byte) [sha256.Size]byte {
-	var b [1 + 2*sha256.Size]byte
-	b[0] = 0x01
-	copy(b[1:], left[:])
-	copy(b[1+sha256.Size:], right[:])
-	return sha256.Sum256(b[:])
+	return wire.InteriorHash(left, right)
 }
 
 // EmptyRoot returns the RFC 6962 root hash of an empty tree (SHA256("")).
-//
-// Previously: Called rfc6962.DefaultHasher.EmptyRoot().
-// Why replaced: DefaultHasher allocated a new []byte slice on every invocation.
-// We return a static [32]byte array directly with zero allocations.
 func EmptyRoot() [sha256.Size]byte {
-	return emptyRoot
+	return wire.EmptyRoot()
 }
 
 // BatchRoot computes the RFC 6962 root hash from a slice of raw leaf data.

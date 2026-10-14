@@ -20,7 +20,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -33,15 +32,18 @@ import (
 	"strings"
 
 	"github.com/transparency-dev/formats/log"
-	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/mpt"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/verifier"
-	"github.com/transparency-dev/merkle/compact"
+	"github.com/transparency-dev/incubator/vindex/v1/wire"
 	"github.com/transparency-dev/merkle/proof"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera/api/layout"
 	tclient "github.com/transparency-dev/tessera/client"
 	"golang.org/x/mod/sumdb/note"
 )
+
+// KeySubRoot is an alias for wire.KeySubRoot.
+type KeySubRoot = wire.KeySubRoot
 
 var (
 	ErrMissingSection       = errors.New("missing mandatory section in response")
@@ -67,7 +69,7 @@ type KeysResponse struct {
 	QueryKey      string
 	IsPrefix      bool
 	Exists        bool
-	Keys          []tree.PrefixKeyVal
+	Keys          []KeySubRoot
 	OutputLogSize uint64
 	InputLogSize  uint64
 	MapRoot       [32]byte
@@ -88,7 +90,7 @@ func (r *EntriesResponse) NextExpectedSubRoot() ([32]byte, error) {
 	if r == nil || r.NextBefore == nil || r.PrefixCoveredSz == 0 {
 		return [32]byte{}, nil
 	}
-	return computeMiniLogRoot(r.PrefixHashes, r.PrefixCoveredSz, nil)
+	return wire.ComputeMiniLogRoot(r.PrefixHashes, r.PrefixCoveredSz, nil)
 }
 
 // PrefixKeyResult holds the verified mini-log root and all leaf indices for a single key matched by a prefix lookup.
@@ -129,7 +131,7 @@ func (r *LookupResponse) NextExpectedSubRoot() ([32]byte, error) {
 	if r == nil || r.NextBefore == nil || r.PrefixCoveredSz == 0 {
 		return [32]byte{}, nil
 	}
-	return computeMiniLogRoot(r.PrefixHashes, r.PrefixCoveredSz, nil)
+	return wire.ComputeMiniLogRoot(r.PrefixHashes, r.PrefixCoveredSz, nil)
 }
 
 // Verifier verifies plain-text C2SP lookup responses from VIndex servers.
@@ -149,19 +151,13 @@ func ParseVerifier(keyOrPath string) (note.Verifier, error) {
 	return verifier.ParseVerifier(keyOrPath)
 }
 
-type section struct {
-	name string
-	arg  string
-	body []byte
-}
-
-func (v *Verifier) verifyStateCommitment(sections map[string]section) (outCP *log.Checkpoint, inCP *log.Checkpoint, mapRoot [32]byte, rawInCP []byte, err error) {
+func (v *Verifier) verifyStateCommitment(sections map[string]wire.Section) (outCP *log.Checkpoint, inCP *log.Checkpoint, mapRoot [32]byte, rawInCP []byte, err error) {
 	// 1. Output Log Checkpoint (— vindex/v1 —)
 	vindexSec, ok := sections["vindex/v1"]
 	if !ok {
 		return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: vindex/v1", ErrMissingSection)
 	}
-	rawOutCP := bytes.TrimSpace(vindexSec.body)
+	rawOutCP := bytes.TrimSpace(vindexSec.Body)
 	if len(rawOutCP) > 0 && rawOutCP[len(rawOutCP)-1] != '\n' {
 		rawOutCP = append(rawOutCP, '\n')
 	}
@@ -172,7 +168,7 @@ func (v *Verifier) verifyStateCommitment(sections map[string]section) (outCP *lo
 		}
 		outCP = parsed
 	} else {
-		parsed, err := tree.ParseCheckpointHeader(rawOutCP)
+		parsed, err := wire.ParseCheckpointHeader(rawOutCP)
 		if err != nil {
 			return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: output log checkpoint header invalid: %v", ErrCheckpointFailed, err)
 		}
@@ -184,11 +180,11 @@ func (v *Verifier) verifyStateCommitment(sections map[string]section) (outCP *lo
 	if !ok {
 		return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: output-log-leaf-v1", ErrMissingSection)
 	}
-	leafIdx, err := strconv.ParseUint(strings.TrimSpace(leafSec.arg), 10, 64)
+	leafIdx, err := strconv.ParseUint(strings.TrimSpace(leafSec.Arg), 10, 64)
 	if err != nil {
-		return nil, nil, [32]byte{}, nil, fmt.Errorf("invalid leaf index argument %q in output-log-leaf-v1: %w", leafSec.arg, err)
+		return nil, nil, [32]byte{}, nil, fmt.Errorf("invalid leaf index argument %q in output-log-leaf-v1: %w", leafSec.Arg, err)
 	}
-	leafBody := bytes.TrimSpace(leafSec.body)
+	leafBody := bytes.TrimSpace(leafSec.Body)
 
 	// 3. Output Log Inclusion Proof (— output-log-proof-v1 —)
 	proofSec, ok := sections["output-log-proof-v1"]
@@ -196,7 +192,7 @@ func (v *Verifier) verifyStateCommitment(sections map[string]section) (outCP *lo
 		return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: output-log-proof-v1", ErrMissingSection)
 	}
 	var outProof [][]byte
-	for _, line := range strings.Split(strings.TrimSpace(string(proofSec.body)), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(string(proofSec.Body)), "\n") {
 		l := strings.TrimSpace(line)
 		if l == "" {
 			continue
@@ -209,11 +205,11 @@ func (v *Verifier) verifyStateCommitment(sections map[string]section) (outCP *lo
 	}
 
 	var inCPHeader *log.Checkpoint
-	mapRoot, inCPHeader, rawInCP, err = tree.ParseOutputLogLeaf(leafBody)
+	mapRoot, inCPHeader, rawInCP, err = wire.ParseOutputLogLeaf(leafBody)
 	if err != nil {
 		return nil, nil, [32]byte{}, nil, fmt.Errorf("output-log-leaf-v1 malformed: %w", err)
 	}
-	rawLeafData := tree.FormatOutputLogLeaf(mapRoot, rawInCP)
+	rawLeafData := wire.FormatOutputLogLeaf(mapRoot, rawInCP)
 
 	// Verify Output Log inclusion
 	leafHash := rfc6962.DefaultHasher.HashLeaf(rawLeafData)
@@ -238,7 +234,7 @@ func (v *Verifier) verifyStateCommitment(sections map[string]section) (outCP *lo
 
 // VerifyKeysResponse verifies a raw response body from GET /vindex/v1/keys/{key...}[?prefix=true].
 func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPrefix bool, rawBody []byte) (*KeysResponse, error) {
-	sections, err := parseSections(rawBody)
+	sections, err := wire.ParseSections(rawBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse response sections: %w", err)
 	}
@@ -253,8 +249,8 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 	if !ok {
 		return nil, fmt.Errorf("%w: mpt-proof-v1", ErrMissingSection)
 	}
-	proofType := strings.TrimSpace(mptSec.arg)
-	mptProofBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(mptSec.body)))
+	proofType := strings.TrimSpace(mptSec.Arg)
+	mptProofBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(mptSec.Body)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to base64 decode mpt proof: %w", err)
 	}
@@ -264,8 +260,8 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 	if !ok {
 		return nil, fmt.Errorf("%w: keys-v1", ErrMissingSection)
 	}
-	var keys []tree.PrefixKeyVal
-	for _, line := range strings.Split(strings.TrimSpace(string(keysSec.body)), "\n") {
+	var keys []KeySubRoot
+	for _, line := range strings.Split(strings.TrimSpace(string(keysSec.Body)), "\n") {
 		l := strings.TrimSpace(line)
 		if l == "" {
 			continue
@@ -284,7 +280,7 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 		}
 		var subRoot [32]byte
 		copy(subRoot[:], subRootBytes)
-		keys = append(keys, tree.PrefixKeyVal{
+		keys = append(keys, KeySubRoot{
 			Key:     kStr,
 			SubRoot: subRoot,
 		})
@@ -295,7 +291,7 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 			if len(keys) > 0 {
 				return nil, fmt.Errorf("%w: got %d keys in non-inclusion response", ErrNonInclusionNotEmpty, len(keys))
 			}
-			if err := tree.VerifyKey(mapRoot, []byte(queryKey), [32]byte{}, false, mptProofBytes); err != nil {
+			if err := mpt.VerifyKey(mapRoot, []byte(queryKey), [32]byte{}, false, mptProofBytes); err != nil {
 				return nil, fmt.Errorf("%w: non-inclusion proof verification failed: %v", ErrMPTFailed, err)
 			}
 			return &KeysResponse{
@@ -315,7 +311,7 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 		if len(keys) != 1 || keys[0].Key != queryKey {
 			return nil, fmt.Errorf("%w: inclusion response must contain exactly 1 matching key %q, got %d", ErrMPTFailed, queryKey, len(keys))
 		}
-		if err := tree.VerifyKey(mapRoot, []byte(queryKey), keys[0].SubRoot, true, mptProofBytes); err != nil {
+		if err := mpt.VerifyKey(mapRoot, []byte(queryKey), keys[0].SubRoot, true, mptProofBytes); err != nil {
 			return nil, fmt.Errorf("%w: inclusion proof verification failed: %v", ErrMPTFailed, err)
 		}
 		return &KeysResponse{
@@ -334,7 +330,7 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 	if proofType != "prefix" {
 		return nil, fmt.Errorf("unexpected mpt proof type %q for prefix lookup", proofType)
 	}
-	if err := tree.VerifyPrefix(mapRoot, []byte(queryKey), keys, mptProofBytes); err != nil {
+	if err := mpt.VerifyPrefix(mapRoot, []byte(queryKey), keys, mptProofBytes); err != nil {
 		return nil, fmt.Errorf("%w: prefix proof verification failed: %v", ErrMPTFailed, err)
 	}
 	return &KeysResponse{
@@ -354,20 +350,20 @@ func (v *Verifier) VerifyEntriesResponse(ctx context.Context, before uint64, exp
 	if expectedSubRoot == ([32]byte{}) {
 		return nil, fmt.Errorf("%w: VerifyEntriesResponse requires a non-zero expectedSubRoot", ErrMPTFailed)
 	}
-	sections, err := parseSections(rawBody)
+	sections, err := wire.ParseSections(rawBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse entries response sections: %w", err)
 	}
 	return v.verifyEntriesSections(sections, before, expectedSubRoot)
 }
 
-func (v *Verifier) verifyEntriesSections(sections map[string]section, upperBound uint64, expectedSubRoot [32]byte) (*EntriesResponse, error) {
+func (v *Verifier) verifyEntriesSections(sections map[string]wire.Section, upperBound uint64, expectedSubRoot [32]byte) (*EntriesResponse, error) {
 	indicesSec, ok := sections["indices-v1"]
 	if !ok {
 		return nil, fmt.Errorf("%w: indices-v1", ErrMissingSection)
 	}
 	var nextBefore *uint64
-	if arg := strings.TrimSpace(indicesSec.arg); arg != "" {
+	if arg := strings.TrimSpace(indicesSec.Arg); arg != "" {
 		nb, err := strconv.ParseUint(arg, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("invalid next_before in indices-v1 argument %q: %w", arg, err)
@@ -376,7 +372,7 @@ func (v *Verifier) verifyEntriesSections(sections map[string]section, upperBound
 	}
 
 	var indices []uint64
-	for _, line := range strings.Split(strings.TrimSpace(string(indicesSec.body)), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(string(indicesSec.Body)), "\n") {
 		l := strings.TrimSpace(line)
 		if l == "" {
 			continue
@@ -401,7 +397,7 @@ func (v *Verifier) verifyEntriesSections(sections map[string]section, upperBound
 	var prefixHashes [][sha256.Size]byte
 	var prefixCoveredSize uint64
 	if pcrSec, ok := sections["prefix-compact-range-v1"]; ok {
-		arg := strings.TrimSpace(pcrSec.arg)
+		arg := strings.TrimSpace(pcrSec.Arg)
 		if arg == "" {
 			return nil, fmt.Errorf("missing covered_size argument in prefix-compact-range-v1")
 		}
@@ -410,7 +406,7 @@ func (v *Verifier) verifyEntriesSections(sections map[string]section, upperBound
 			return nil, fmt.Errorf("invalid size in prefix-compact-range-v1 %q: %w", arg, err)
 		}
 		prefixCoveredSize = sz
-		for _, line := range strings.Split(strings.TrimSpace(string(pcrSec.body)), "\n") {
+		for _, line := range strings.Split(strings.TrimSpace(string(pcrSec.Body)), "\n") {
 			l := strings.TrimSpace(line)
 			if l == "" {
 				continue
@@ -445,7 +441,7 @@ func (v *Verifier) verifyEntriesSections(sections map[string]section, upperBound
 		}
 	}
 
-	computedMiniLogRoot, err := computeMiniLogRoot(prefixHashes, prefixCoveredSize, indices)
+	computedMiniLogRoot, err := wire.ComputeMiniLogRoot(prefixHashes, prefixCoveredSize, indices)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute mini-log root: %w", err)
 	}
@@ -465,7 +461,7 @@ func (v *Verifier) verifyEntriesSections(sections map[string]section, upperBound
 // VerifyResponse verifies a combined response body against the given search keyHash and before bound.
 // When before != nil, expectedSubRoot must be provided to authenticate the continuation page (Backlog 2.6.1).
 func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before *uint64, rawBody []byte, expectedSubRoot ...[32]byte) (*LookupResponse, error) {
-	sections, err := parseSections(rawBody)
+	sections, err := wire.ParseSections(rawBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse response sections: %w", err)
 	}
@@ -481,8 +477,8 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 	if !ok {
 		return nil, fmt.Errorf("%w: mpt-proof-v1", ErrMissingSection)
 	}
-	proofType := strings.TrimSpace(mptSec.arg)
-	mptProofBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(mptSec.body)))
+	proofType := strings.TrimSpace(mptSec.Arg)
+	mptProofBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(mptSec.Body)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to base64 decode mpt proof: %w", err)
 	}
@@ -493,13 +489,13 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 		if !ok {
 			return nil, fmt.Errorf("%w: indices-v1", ErrMissingSection)
 		}
-		if strings.TrimSpace(string(indicesSec.body)) != "" {
+		if strings.TrimSpace(string(indicesSec.Body)) != "" {
 			return nil, fmt.Errorf("%w: non-empty indices in non-inclusion response", ErrNonInclusionNotEmpty)
 		}
 		if _, ok := sections["prefix-compact-range-v1"]; ok {
 			return nil, fmt.Errorf("non-inclusion response must not contain prefix-compact-range-v1")
 		}
-		if err := tree.Verify(mapRoot, keyHash, [sha256.Size]byte{}, false, mptProofBytes); err != nil {
+		if err := mpt.Verify(mapRoot, keyHash, [sha256.Size]byte{}, false, mptProofBytes); err != nil {
 			return nil, fmt.Errorf("%w: non-inclusion proof verification failed: %v", ErrMPTFailed, err)
 		}
 		return &LookupResponse{
@@ -538,7 +534,7 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 	}
 
 	if before == nil {
-		if err := tree.Verify(mapRoot, keyHash, entriesResp.MiniLogRoot, true, mptProofBytes); err != nil {
+		if err := mpt.Verify(mapRoot, keyHash, entriesResp.MiniLogRoot, true, mptProofBytes); err != nil {
 			return nil, fmt.Errorf("%w: inclusion proof verification failed: %v", ErrMPTFailed, err)
 		}
 	}
@@ -560,112 +556,11 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 }
 
 func emptyRoot() [sha256.Size]byte {
-	h := rfc6962.DefaultHasher.EmptyRoot()
-	var out [sha256.Size]byte
-	copy(out[:], h)
-	return out
-}
-
-func leafHash(data []byte) [sha256.Size]byte {
-	h := rfc6962.DefaultHasher.HashLeaf(data)
-	var out [sha256.Size]byte
-	copy(out[:], h)
-	return out
+	return wire.EmptyRoot()
 }
 
 func computeMiniLogRoot(prefixHashes [][sha256.Size]byte, prefixCoveredSize uint64, indices []uint64) ([sha256.Size]byte, error) {
-	if (prefixCoveredSize == 0) != (len(prefixHashes) == 0) {
-		return [sha256.Size]byte{}, fmt.Errorf("mismatched prefix-compact-range: coveredSize=%d, hashes=%d", prefixCoveredSize, len(prefixHashes))
-	}
-	if len(prefixHashes) == 0 && len(indices) == 0 {
-		return emptyRoot(), nil
-	}
-
-	rf := &compact.RangeFactory{
-		Hash: rfc6962.DefaultHasher.HashChildren,
-	}
-
-	var cr *compact.Range
-	if prefixCoveredSize > 0 {
-		hashes := make([][]byte, len(prefixHashes))
-		for i := range prefixHashes {
-			hashes[i] = prefixHashes[i][:]
-		}
-		var err error
-		cr, err = rf.NewRange(0, prefixCoveredSize, hashes)
-		if err != nil {
-			return [sha256.Size]byte{}, fmt.Errorf("invalid prefix range: %w", err)
-		}
-	} else {
-		cr = rf.NewEmptyRange(0)
-	}
-
-	for _, idx := range indices {
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], idx)
-		lh := leafHash(b[:])
-		if err := cr.Append(lh[:], nil); err != nil {
-			return [sha256.Size]byte{}, err
-		}
-	}
-
-	r, err := cr.GetRootHash(nil)
-	if err != nil {
-		return [sha256.Size]byte{}, err
-	}
-	var root [sha256.Size]byte
-	copy(root[:], r)
-	return root, nil
-}
-
-func parseSections(body []byte) (map[string]section, error) {
-	lines := strings.Split(string(body), "\n")
-	sections := make(map[string]section)
-
-	var currentName string
-	var currentArg string
-	var currentLines []string
-
-	flush := func() {
-		if currentName != "" {
-			sections[currentName] = section{
-				name: currentName,
-				arg:  currentArg,
-				body: []byte(strings.Join(currentLines, "\n")),
-			}
-		}
-	}
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		var isHeader bool
-		var headerContent string
-
-		if strings.HasPrefix(trimmed, "— ") && strings.HasSuffix(trimmed, " —") {
-			isHeader = true
-			headerContent = strings.TrimSuffix(strings.TrimPrefix(trimmed, "— "), " —")
-		} else if strings.HasPrefix(trimmed, "--- ") && strings.HasSuffix(trimmed, " ---") {
-			isHeader = true
-			headerContent = strings.TrimSuffix(strings.TrimPrefix(trimmed, "--- "), " ---")
-		}
-
-		if isHeader {
-			flush()
-			parts := strings.SplitN(headerContent, " ", 2)
-			currentName = parts[0]
-			if len(parts) > 1 {
-				currentArg = parts[1]
-			} else {
-				currentArg = ""
-			}
-			currentLines = nil
-		} else if currentName != "" {
-			currentLines = append(currentLines, line)
-		}
-	}
-	flush()
-
-	return sections, nil
+	return wire.ComputeMiniLogRoot(prefixHashes, prefixCoveredSize, indices)
 }
 
 // Client performs verified lookups against a VIndex HTTP endpoint.

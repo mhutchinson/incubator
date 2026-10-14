@@ -156,7 +156,7 @@ func TestMTCIndex_Integration(t *testing.T) {
 	}
 
 	const chunkSize = 16
-	leafMapper := &mtc.MTCLeafMapper{}
+	leafMapper := &mtcLeafMapper{}
 	pub := tree.NewOutputPublisher(db, mptMgr, outLog, nil)
 	idxer := kvstore.NewKVIndexer(db, chunkSize)
 

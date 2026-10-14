@@ -15,9 +15,7 @@
 package mtc
 
 import (
-	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
@@ -26,7 +24,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/mtc/mtctest"
 )
 
@@ -136,15 +133,7 @@ func marshalMTCEntry(dnsNames []string) ([]byte, error) {
 	return append([]byte{0, 1}, entryBytes...), nil
 }
 
-func TestMTCLeafMapper(t *testing.T) {
-	ctx := context.Background()
-	mapper := &MTCLeafMapper{}
-	defer func() {
-		if err := mapper.Close(ctx); err != nil {
-			t.Errorf("mapper.Close() error: %v", err)
-		}
-	}()
-
+func TestExtractDomainNames(t *testing.T) {
 	derHex := "30820146a003020102301c311a3018060a2b0601040182da4b2f010c0a34343336332e34382e38301e170d3235313131313230313732365a170d3235313131383230313732365a30818e310b3009060355040613025553311330110603550408130a43616c69666f726e6961311430120603550407130b4c6f7320416e67656c6573313c303a060355040a1333496e7465726e657420436f72706f726174696f6e20666f722041737369676e6564204e616d657320616e64204e756d626572733116301406035504030c0d2a2e6578616d706c652e636f6d042088c3292097527f95650a51dac5945eca168bc4bb2664c30d022036a4c47cfccea34e304c30250603551d11041e301c820d2a2e6578616d706c652e636f6d820b6578616d706c652e636f6d300e0603551d0f0101ff04040302078030130603551d25040c300a06082b0601050507030100"
 	derBytes, err := hex.DecodeString(derHex)
 	if err != nil {
@@ -167,15 +156,12 @@ func TestMTCLeafMapper(t *testing.T) {
 	tests := []struct {
 		name string
 		data []byte
-		want []ingest.MappedEntry
+		want []string
 	}{
 		{
 			name: "Valid Type 1 (wildcard preserved, reversed-label with trailing dot)",
 			data: validType1,
-			want: []ingest.MappedEntry{
-				{Key: "com.example.*.", KeyHash: sha256.Sum256([]byte("com.example.*."))},
-				{Key: "com.example.", KeyHash: sha256.Sum256([]byte("com.example."))},
-			},
+			want: []string{"com.example.*.", "com.example."},
 		},
 		{
 			name: "Type 0 (ignored)",
@@ -195,40 +181,23 @@ func TestMTCLeafMapper(t *testing.T) {
 		{
 			name: "Subdomain indexing (reversed-label single key)",
 			data: subdomainCert,
-			want: []ingest.MappedEntry{
-				{Key: "uk.co.google.maps.deep.", KeyHash: sha256.Sum256([]byte("uk.co.google.maps.deep."))},
-			},
+			want: []string{"uk.co.google.maps.deep."},
 		},
 		{
 			name: "Mixed case normalization",
 			data: mixedCaseCert,
-			want: []ingest.MappedEntry{
-				{Key: "com.google.maps.", KeyHash: sha256.Sum256([]byte("com.google.maps."))},
-			},
+			want: []string{"com.google.maps."},
 		},
-	}
-
-	less := func(a, b ingest.MappedEntry) bool {
-		for i := 0; i < 32; i++ {
-			if a.KeyHash[i] < b.KeyHash[i] {
-				return true
-			}
-			if a.KeyHash[i] > b.KeyHash[i] {
-				return false
-			}
-		}
-		return false
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := mapper.MapLeaf(ctx, tt.data)
-			if err != nil {
-				t.Fatalf("MapLeaf() error = %v", err)
-			}
-
-			if diff := cmp.Diff(tt.want, got, cmpopts.SortSlices(less), cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("MapLeaf() mismatch (-want +got):\n%s", diff)
+			var got []string
+			ExtractDomainNames(tt.data, func(domain string) {
+				got = append(got, domain)
+			})
+			if diff := cmp.Diff(tt.want, got, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("ExtractDomainNames() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -248,45 +217,6 @@ func TestExtractDomainNames_Golden(t *testing.T) {
 
 			if diff := cmp.Diff(want, got, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("ExtractDomainNames() mismatch (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestMTCLeafMapper_Golden(t *testing.T) {
-	ctx := context.Background()
-	mapper := &MTCLeafMapper{}
-	defer func() { _ = mapper.Close(ctx) }()
-
-	less := func(a, b ingest.MappedEntry) bool {
-		for i := 0; i < 32; i++ {
-			if a.KeyHash[i] < b.KeyHash[i] {
-				return true
-			}
-			if a.KeyHash[i] > b.KeyHash[i] {
-				return false
-			}
-		}
-		return false
-	}
-
-	for _, tc := range mtctest.GoldenLeaves() {
-		t.Run(tc.Category, func(t *testing.T) {
-			raw := tc.MustLeafBytes()
-			got, err := mapper.MapLeaf(ctx, raw)
-			if err != nil {
-				t.Fatalf("MapLeaf() error = %v", err)
-			}
-			var want []ingest.MappedEntry
-			for _, d := range tc.ExpectedDomains {
-				want = append(want, ingest.MappedEntry{
-					Key:     d,
-					KeyHash: sha256.Sum256([]byte(d)),
-				})
-			}
-
-			if diff := cmp.Diff(want, got, cmpopts.SortSlices(less), cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("MapLeaf() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

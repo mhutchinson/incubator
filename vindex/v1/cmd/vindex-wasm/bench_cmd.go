@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
+	"github.com/transparency-dev/incubator/vindex/v1/mapfn/host"
 )
 
 func runBenchCmd(ctx context.Context, args []string) error {
@@ -74,15 +74,15 @@ func runBenchCmd(ctx context.Context, args []string) error {
 		bundle[i] = inputBytes
 	}
 
-	host, err := ingest.NewWASMHost(ctx, wasmBytes, *workers)
+	wasmHost, err := host.NewWASMHost(ctx, wasmBytes, *workers)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WASM host: %w", err)
 	}
-	defer func() { _ = host.Close(ctx) }()
+	defer func() { _ = wasmHost.Close(ctx) }()
 
 	// Warmup
 	for i := 0; i < 10; i++ {
-		if _, err := host.MapBundle(ctx, bundle); err != nil {
+		if _, err := wasmHost.MapBundle(ctx, bundle); err != nil {
 			return fmt.Errorf("warmup MapBundle failed: %w", err)
 		}
 	}
@@ -103,7 +103,7 @@ func runBenchCmd(ctx context.Context, args []string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runner, err := host.NewRunner(ctx)
+			runner, err := wasmHost.NewRunner(ctx)
 			if err != nil {
 				errMu.Lock()
 				if execErr == nil {

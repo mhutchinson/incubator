@@ -25,7 +25,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
+	"github.com/transparency-dev/incubator/vindex/v1/mapfn/host"
 )
 
 type testJSONEntry struct {
@@ -100,18 +100,18 @@ func runTestCmd(ctx context.Context, args []string) error {
 		}
 	}
 
-	host, err := ingest.NewWASMHost(ctx, wasmBytes, 1)
+	wasmHost, err := host.NewWASMHost(ctx, wasmBytes, 1)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WASM host: %w", err)
 	}
-	defer func() { _ = host.Close(ctx) }()
+	defer func() { _ = wasmHost.Close(ctx) }()
 
 	bundle := make([][]byte, *bundleSize)
 	for i := range bundle {
 		bundle[i] = inputBytes
 	}
 
-	bundleResults, err := host.MapBundle(ctx, bundle)
+	bundleResults, err := wasmHost.MapBundle(ctx, bundle)
 	if err != nil {
 		return fmt.Errorf("MapBundle execution failed: %w", err)
 	}

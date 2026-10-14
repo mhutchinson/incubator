@@ -18,10 +18,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -29,6 +27,7 @@ import (
 	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/metrics"
+	"github.com/transparency-dev/incubator/vindex/v1/wire"
 	"k8s.io/klog/v2"
 )
 
@@ -229,27 +228,5 @@ func (p *OutputPublisher) Publish(ctx context.Context, rawInputLogCP []byte, inp
 
 // ParseCheckpointHeader parses a raw signed-note / tlog-checkpoint header extracting Origin, Size, and Hash.
 func ParseCheckpointHeader(rawCP []byte) (*log.Checkpoint, error) {
-	lines := bytes.Split(rawCP, []byte("\n"))
-	if len(lines) < 3 {
-		return nil, fmt.Errorf("invalid checkpoint format: expected at least 3 lines, got %d", len(lines))
-	}
-	origin := string(lines[0])
-	size, err := strconv.ParseUint(string(lines[1]), 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse checkpoint size %q: %w", string(lines[1]), err)
-	}
-	hashStr := string(lines[2])
-	hashBytes, err := base64.StdEncoding.DecodeString(hashStr)
-	if err != nil {
-		if h, hErr := hex.DecodeString(hashStr); hErr == nil && len(h) == 32 {
-			hashBytes = h
-		} else {
-			return nil, fmt.Errorf("failed to decode checkpoint root hash %q: %w", hashStr, err)
-		}
-	}
-	return &log.Checkpoint{
-		Origin: origin,
-		Size:   size,
-		Hash:   hashBytes,
-	}, nil
+	return wire.ParseCheckpointHeader(rawCP)
 }

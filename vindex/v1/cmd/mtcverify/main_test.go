@@ -34,6 +34,23 @@ import (
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
 )
 
+type testMTCLeafMapper struct{}
+
+func (m *testMTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
+	var entries []ingest.MappedEntry
+	mtc.ExtractDomainNames(leaf, func(name string) {
+		entries = append(entries, ingest.MappedEntry{
+			Key:     name,
+			KeyHash: sha256.Sum256([]byte(name)),
+		})
+	})
+	return entries, nil
+}
+
+func (m *testMTCLeafMapper) Close(_ context.Context) error {
+	return nil
+}
+
 func marshalMTCEntry(dnsNames []string) ([]byte, error) {
 	rawNames := []asn1.RawValue{}
 	for _, name := range dnsNames {
@@ -192,7 +209,7 @@ func TestMTCVerify_Integration(t *testing.T) {
 
 	outLog := &localOutputLog{origin: "MTCIndex"}
 	const chunkSize = 16
-	leafMapper := &mtc.MTCLeafMapper{}
+	leafMapper := &testMTCLeafMapper{}
 	pub := tree.NewOutputPublisher(db, mptMgr, outLog, nil)
 	idxer := kvstore.NewKVIndexer(db, chunkSize)
 

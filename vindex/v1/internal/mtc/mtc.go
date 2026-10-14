@@ -17,19 +17,15 @@ package mtc
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
+	"github.com/transparency-dev/incubator/vindex/v1/internal/verifier"
 	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/net/idna"
 )
@@ -111,154 +107,15 @@ func ExtractDNSNames(entry *TBSCertificateLogEntry) []string {
 }
 
 // MTCVerifier implements note.Verifier for MTC checkpoint signatures.
-type MTCVerifier struct {
-	name            string
-	pubKey          ed25519.PublicKey
-	keyHash         uint32
-	cosignerIDBytes []byte
-	logIDBytes      []byte
-}
+type MTCVerifier = verifier.MTCVerifier
 
 // NewMTCVerifier creates a new MTCVerifier.
 func NewMTCVerifier(name string, pubKey ed25519.PublicKey, cosignerIDStr, logIDStr string) (*MTCVerifier, error) {
-	// Compute key hash: SHA-256(key name || 0x0A || 0xFF || "mtc-checkpoint/v1")[:4]
-	h := sha256.New()
-	h.Write([]byte(name))
-	h.Write([]byte{0x0a, 0xff})
-	h.Write([]byte("mtc-checkpoint/v1"))
-	sum := h.Sum(nil)
-	keyHash := binary.BigEndian.Uint32(sum[:4])
-
-	cosignerIDBytes, err := encodeRelativeOIDStr(cosignerIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode cosigner ID: %w", err)
-	}
-
-	logIDBytes, err := encodeRelativeOIDStr(logIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode log ID: %w", err)
-	}
-
-	return &MTCVerifier{
-		name:            name,
-		pubKey:          pubKey,
-		keyHash:         keyHash,
-		cosignerIDBytes: cosignerIDBytes,
-		logIDBytes:      logIDBytes,
-	}, nil
-}
-
-// Name returns the verifier name.
-func (v *MTCVerifier) Name() string {
-	return v.name
-}
-
-// KeyHash returns the verifier key hash.
-func (v *MTCVerifier) KeyHash() uint32 {
-	return v.keyHash
-}
-
-// Verify verifies the signature over the checkpoint message.
-func (v *MTCVerifier) Verify(msg, sig []byte) bool {
-	// Parse checkpoint to get size and hash
-	// msg should be:
-	// [origin]
-	// [size]
-	// [hash]
-	lines := strings.Split(string(msg), "\n")
-	if len(lines) < 3 {
-		return false
-	}
-	sizeStr := lines[1]
-	hashB64 := lines[2]
-
-	size, err := strconv.ParseUint(sizeStr, 10, 64)
-	if err != nil {
-		return false
-	}
-
-	hash, err := base64.StdEncoding.DecodeString(hashB64)
-	if err != nil {
-		return false
-	}
-
-	if len(hash) != 32 {
-		return false
-	}
-
-	// Construct MTCSubtreeSignatureInput:
-	// "mtc-subtree/v1\n" + 0 (byte) + len(cosignerID) (1 byte) + cosignerID + len(logID) (1 byte) + logID + start (8 bytes uint64 big-endian) + end (8 bytes uint64 big-endian) + hash (32 bytes)
-	var input []byte
-	input = append(input, []byte("mtc-subtree/v1\n")...)
-	input = append(input, 0)
-
-	if len(v.cosignerIDBytes) > 255 || len(v.logIDBytes) > 255 {
-		return false // Length must fit in 1 byte
-	}
-
-	input = append(input, byte(len(v.cosignerIDBytes)))
-	input = append(input, v.cosignerIDBytes...)
-	input = append(input, byte(len(v.logIDBytes)))
-	input = append(input, v.logIDBytes...)
-
-	var startBytes [8]byte
-	binary.BigEndian.PutUint64(startBytes[:], 0)
-	input = append(input, startBytes[:]...)
-
-	var endBytes [8]byte
-	binary.BigEndian.PutUint64(endBytes[:], size)
-	input = append(input, endBytes[:]...)
-
-	input = append(input, hash...)
-
-	return ed25519.Verify(v.pubKey, input, sig)
+	return verifier.NewMTCVerifier(name, pubKey, cosignerIDStr, logIDStr)
 }
 
 // Interface check
 var _ note.Verifier = (*MTCVerifier)(nil)
-
-// Helper functions for relative OID encoding
-
-func encodeRelativeOIDStr(s string) ([]byte, error) {
-	parts := strings.Split(s, ".")
-	var components []uint32
-	for _, p := range parts {
-		v, err := strconv.ParseUint(p, 10, 32)
-		if err != nil {
-			return nil, err
-		}
-		components = append(components, uint32(v))
-	}
-	return encodeRelativeOID(components), nil
-}
-
-func encodeRelativeOID(components []uint32) []byte {
-	var encoded []byte
-	for _, c := range components {
-		encoded = append(encoded, encodeBase128(c)...)
-	}
-	return encoded
-}
-
-func encodeBase128(v uint32) []byte {
-	if v == 0 {
-		return []byte{0}
-	}
-	var chunks []byte
-	for v > 0 {
-		chunks = append(chunks, byte(v&0x7f))
-		v >>= 7
-	}
-	var encoded []byte
-	for i := len(chunks) - 1; i >= 0; i-- {
-		b := chunks[i]
-		if i > 0 {
-			b |= 0x80
-		}
-		encoded = append(encoded, b)
-	}
-	return encoded
-}
 
 var (
 	sanOIDBytes = []byte{0x55, 0x1d, 0x11} // id-ce-subjectAltName (2.5.29.17)
@@ -530,25 +387,3 @@ func ExtractDomainNames(leaf []byte, emit func(domain string)) {
 		emit(name)
 	}
 }
-
-// MTCLeafMapper implements ingest.LeafMapper for MTC log entries.
-type MTCLeafMapper struct{}
-
-// MapLeaf parses an MTC log leaf and returns mapped entries for all extracted domain names.
-func (m *MTCLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
-	var entries []ingest.MappedEntry
-	ExtractDomainNames(leaf, func(name string) {
-		entries = append(entries, ingest.MappedEntry{
-			Key:     name,
-			KeyHash: sha256.Sum256([]byte(name)),
-		})
-	})
-	return entries, nil
-}
-
-// Close releases any resources held by the mapper.
-func (m *MTCLeafMapper) Close(_ context.Context) error {
-	return nil
-}
-
-var _ ingest.LeafMapper = (*MTCLeafMapper)(nil)

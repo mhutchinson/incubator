@@ -19,11 +19,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+
+	"github.com/transparency-dev/incubator/vindex/v1/mapfn/host"
 )
 
 const (
 	// DefaultBundleSize is the default number of leaves per LeafBundle.
-	DefaultBundleSize uint64 = 256
+	DefaultBundleSize uint64 = host.DefaultBundleSize
 )
 
 var (
@@ -76,16 +78,10 @@ type MappedBatch struct {
 }
 
 // BundleMapper is an optional optimization interface for LeafMappers supporting batched execution.
-type BundleMapper interface {
-	LeafMapper
-	MapBundle(ctx context.Context, leaves [][]byte) ([][]MappedEntry, error)
-}
+type BundleMapper = host.BundleMapper
 
 // RunnerProvider is an optional optimization interface for LeafMappers that can furnish dedicated runners per worker.
-type RunnerProvider interface {
-	LeafMapper
-	NewRunner(ctx context.Context) (LeafMapper, error)
-}
+type RunnerProvider = host.RunnerProvider
 
 
 // Merge combines another MappedBatch into this one.

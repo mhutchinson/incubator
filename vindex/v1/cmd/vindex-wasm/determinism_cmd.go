@@ -24,7 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/transparency-dev/incubator/vindex/v1/internal/ingest"
+	"github.com/transparency-dev/incubator/vindex/v1/mapfn/host"
 )
 
 func runDeterminismCmd(ctx context.Context, args []string) error {
@@ -74,14 +74,14 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 		bundle[i] = inputBytes
 	}
 
-	host, err := ingest.NewWASMHost(ctx, wasmBytes, *concurrency)
+	wasmHost, err := host.NewWASMHost(ctx, wasmBytes, *concurrency)
 	if err != nil {
 		return fmt.Errorf("failed to initialize WASM host: %w", err)
 	}
-	defer func() { _ = host.Close(ctx) }()
+	defer func() { _ = wasmHost.Close(ctx) }()
 
 	// Baseline run
-	baseline, err := host.MapBundle(ctx, bundle)
+	baseline, err := wasmHost.MapBundle(ctx, bundle)
 	if err != nil {
 		return fmt.Errorf("baseline MapBundle failed: %w", err)
 	}
@@ -105,7 +105,7 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runner, err := host.NewRunner(ctx)
+			runner, err := wasmHost.NewRunner(ctx)
 			if err != nil {
 				atomic.AddInt64(&errCount, 1)
 				mismatchMu.Lock()
@@ -163,7 +163,7 @@ func runDeterminismCmd(ctx context.Context, args []string) error {
 	return nil
 }
 
-func equalEntries(a, b []ingest.MappedEntry) bool {
+func equalEntries(a, b []host.MappedEntry) bool {
 	if len(a) != len(b) {
 		return false
 	}

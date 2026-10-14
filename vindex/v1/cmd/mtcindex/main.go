@@ -114,7 +114,7 @@ func run(ctx context.Context) error {
 	defer func() { _ = mptMgr.Close() }()
 
 	// 3. Leaf Mapper
-	leafMapper := &mtc.MTCLeafMapper{}
+	leafMapper := &mtcLeafMapper{}
 	defer func() { _ = leafMapper.Close(ctx) }()
 
 	// 4. Output Log
@@ -409,3 +409,22 @@ func getOutputLogSigner() note.Signer {
 	}
 	return s
 }
+
+type mtcLeafMapper struct{}
+
+func (m *mtcLeafMapper) MapLeaf(_ context.Context, leaf []byte) ([]ingest.MappedEntry, error) {
+	var entries []ingest.MappedEntry
+	mtc.ExtractDomainNames(leaf, func(name string) {
+		entries = append(entries, ingest.MappedEntry{
+			Key:     name,
+			KeyHash: sha256.Sum256([]byte(name)),
+		})
+	})
+	return entries, nil
+}
+
+func (m *mtcLeafMapper) Close(_ context.Context) error {
+	return nil
+}
+
+var _ ingest.LeafMapper = (*mtcLeafMapper)(nil)

@@ -15,91 +15,36 @@
 package server
 
 import (
-	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/transparency-dev/incubator/vindex/v1/internal/kvstore"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/tree"
+	"github.com/transparency-dev/incubator/vindex/v1/wire"
 	"golang.org/x/net/publicsuffix"
 )
 
 // FormatKeysResponse builds the plain-text C2SP response for GET /vindex/v1/keys/{key...}[?prefix=true].
 // mode must be one of "inclusion", "non-inclusion", or "prefix".
 func FormatKeysResponse(state *tree.ServingState, mode string, proof []byte, matches []tree.PrefixKeyVal) []byte {
-	var sb bytes.Buffer
-
-	// Section 1: — vindex/v1 —
-	sb.WriteString("— vindex/v1 —\n")
-	sb.Write(bytes.TrimRight(state.RawCheckpoint, "\n"))
-	sb.WriteString("\n\n")
-
-	// Section 2: — output-log-leaf-v1 <leaf_index> —
-	fmt.Fprintf(&sb, "— output-log-leaf-v1 %d —\n", state.OutputLogIndex)
-	sb.WriteString(hex.EncodeToString(state.MapRoot[:]))
-	sb.WriteString("\n")
-	sb.Write(bytes.TrimRight(state.RawInputLogCP, "\n"))
-	sb.WriteString("\n\n")
-
-	// Section 3: — output-log-proof-v1 —
-	sb.WriteString("— output-log-proof-v1 —\n")
-	for _, p := range state.OutputLogProof {
-		sb.WriteString(base64.StdEncoding.EncodeToString(p[:]))
-		sb.WriteString("\n")
-	}
-	sb.WriteString("\n")
-
-	// Section 4: — mpt-proof-v1 <mode> —
-	fmt.Fprintf(&sb, "— mpt-proof-v1 %s —\n", mode)
-	sb.WriteString(base64.StdEncoding.EncodeToString(proof))
-	sb.WriteString("\n\n")
-
-	// Section 5: — keys-v1 —
-	sb.WriteString("— keys-v1 —\n")
-	for _, m := range matches {
-		sb.WriteString(m.Key)
-		sb.WriteByte(' ')
-		sb.WriteString(hex.EncodeToString(m.SubRoot[:]))
-		sb.WriteByte('\n')
-	}
-
-	return sb.Bytes()
+	return wire.FormatKeysResponse(state.RawCheckpoint, state.OutputLogIndex, state.MapRoot, state.RawInputLogCP, state.OutputLogProof, mode, proof, matches)
 }
 
 // FormatEntriesResponse builds the plain-text C2SP response for GET /vindex/v1/entries/{key...}?before=X[&limit=Y].
 func FormatEntriesResponse(matchedIndices []uint64, prefixCR *kvstore.CompactRange, nextBefore *uint64) []byte {
-	var sb bytes.Buffer
-
-	// Section 1: — prefix-compact-range-v1 <covered_size> — (omitted when covered_size == 0)
-	if prefixCR != nil && prefixCR.CoveredSize > 0 {
-		fmt.Fprintf(&sb, "— prefix-compact-range-v1 %d —\n", prefixCR.CoveredSize)
-		for _, h := range prefixCR.Hashes {
-			sb.WriteString(base64.StdEncoding.EncodeToString(h[:]))
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
+	var coveredSize uint64
+	var hashes [][sha256.Size]byte
+	if prefixCR != nil {
+		coveredSize = prefixCR.CoveredSize
+		hashes = prefixCR.Hashes
 	}
-
-	// Section 2: — indices-v1 [next_before] —
-	if nextBefore != nil {
-		fmt.Fprintf(&sb, "— indices-v1 %d —\n", *nextBefore)
-	} else {
-		sb.WriteString("— indices-v1 —\n")
-	}
-	for _, idx := range matchedIndices {
-		sb.WriteString(strconv.FormatUint(idx, 10))
-		sb.WriteString("\n")
-	}
-
-	return sb.Bytes()
+	return wire.FormatEntriesResponse(matchedIndices, coveredSize, hashes, nextBefore)
 }
 
 // PrefixPolicy validates whether a prefix query (?prefix=true) is permitted.
@@ -212,65 +157,13 @@ func parseCanonicalKey(r *http.Request, routePrefixes []string) (string, error) 
 
 // FormatResponse builds the standardized plain-text C2SP response for lookup results.
 func FormatResponse(state *tree.ServingState, proof []byte, exists bool, matchedIndices []uint64, prefixCR *kvstore.CompactRange, nextBefore *uint64) []byte {
-	var sb bytes.Buffer
-
-	// Section 1: — vindex/v1 —
-	sb.WriteString("— vindex/v1 —\n")
-	sb.Write(bytes.TrimRight(state.RawCheckpoint, "\n"))
-	sb.WriteString("\n\n")
-
-	// Section 2: — output-log-leaf-v1 <leaf_index> —
-	fmt.Fprintf(&sb, "— output-log-leaf-v1 %d —\n", state.OutputLogIndex)
-	sb.WriteString(hex.EncodeToString(state.MapRoot[:]))
-	sb.WriteString("\n")
-	sb.Write(bytes.TrimRight(state.RawInputLogCP, "\n"))
-	sb.WriteString("\n\n")
-
-	// Section 3: — output-log-proof-v1 —
-	sb.WriteString("— output-log-proof-v1 —\n")
-	for _, p := range state.OutputLogProof {
-		sb.WriteString(base64.StdEncoding.EncodeToString(p[:]))
-		sb.WriteString("\n")
+	var coveredSize uint64
+	var hashes [][sha256.Size]byte
+	if prefixCR != nil {
+		coveredSize = prefixCR.CoveredSize
+		hashes = prefixCR.Hashes
 	}
-	sb.WriteString("\n")
-
-	if !exists {
-		// Non-inclusion response
-		sb.WriteString("— mpt-proof-v1 non-inclusion —\n")
-		sb.WriteString(base64.StdEncoding.EncodeToString(proof))
-		sb.WriteString("\n\n")
-
-		sb.WriteString("— indices-v1 —\n")
-		return sb.Bytes()
-	}
-
-	// Inclusion response
-	sb.WriteString("— mpt-proof-v1 inclusion —\n")
-	sb.WriteString(base64.StdEncoding.EncodeToString(proof))
-	sb.WriteString("\n\n")
-
-	// Section 5: — prefix-compact-range-v1 —
-	if prefixCR != nil && prefixCR.CoveredSize > 0 {
-		fmt.Fprintf(&sb, "— prefix-compact-range-v1 %d —\n", prefixCR.CoveredSize)
-		for _, h := range prefixCR.Hashes {
-			sb.WriteString(base64.StdEncoding.EncodeToString(h[:]))
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-	}
-
-	// Section 6: — indices-v1 [next_before] —
-	if nextBefore != nil {
-		fmt.Fprintf(&sb, "— indices-v1 %d —\n", *nextBefore)
-	} else {
-		sb.WriteString("— indices-v1 —\n")
-	}
-	for _, idx := range matchedIndices {
-		sb.WriteString(strconv.FormatUint(idx, 10))
-		sb.WriteString("\n")
-	}
-
-	return sb.Bytes()
+	return wire.FormatLookupResponse(state.RawCheckpoint, state.OutputLogIndex, state.MapRoot, state.RawInputLogCP, state.OutputLogProof, proof, exists, matchedIndices, coveredSize, hashes, nextBefore)
 }
 
 var hexKeyRegexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
