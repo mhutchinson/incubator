@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -827,6 +828,243 @@ func TestClient_EntriesTruncationAndCompactRangeValidation(t *testing.T) {
 	overflowBody := fmt.Sprintf("— prefix-compact-range-v1 99 —\n%s\n\n— indices-v1 10 —\n10\n20\n", dummyHash)
 	if _, err := verifier.VerifyEntriesResponse(ctx, 100, subRoot, []byte(overflowBody)); err == nil || !strings.Contains(err.Error(), "exceed upperBound") {
 		t.Fatalf("expected exceed upperBound error, got: %v", err)
+	}
+}
+
+func TestClient_CheckpointVerificationWitnessPolicyAndMonotonicHistory(t *testing.T) {
+	ctx := context.Background()
+
+	genKey := func(name string) (note.Signer, note.Verifier) {
+		sKey, vKey, err := note.GenerateKey(rand.Reader, name)
+		if err != nil {
+			t.Fatalf("note.GenerateKey(%s) failed: %v", name, err)
+		}
+		s, err := note.NewSigner(sKey)
+		if err != nil {
+			t.Fatalf("note.NewSigner(%s) failed: %v", name, err)
+		}
+		v, err := note.NewVerifier(vKey)
+		if err != nil {
+			t.Fatalf("note.NewVerifier(%s) failed: %v", name, err)
+		}
+		return s, v
+	}
+
+	outSigner, outVerifier := genKey("example.com/output")
+	inSigner, inVerifier := genKey("example.com/input")
+	w1Signer, w1Verifier := genKey("witness1.example.com")
+	w2Signer, w2Verifier := genKey("witness2.example.com")
+	w3Signer, w3Verifier := genKey("witness3.example.com")
+
+	hash1 := sha256.Sum256([]byte("root-1"))
+	hash2 := sha256.Sum256([]byte("root-2"))
+
+	signCP := func(origin string, size uint64, hash [32]byte, signers ...note.Signer) []byte {
+		text := fmt.Sprintf("%s\n%d\n%s\n", origin, size, base64.StdEncoding.EncodeToString(hash[:]))
+		raw, err := note.Sign(&note.Note{Text: text}, signers...)
+		if err != nil {
+			t.Fatalf("note.Sign failed: %v", err)
+		}
+		return raw
+	}
+
+	// 1. RequireVerifiers rejects missing verifiers
+	strictV := NewVerifier(VerifierConfig{RequireVerifiers: true})
+	rawUnsigned := []byte(fmt.Sprintf("example.com/output\n10\n%s\n", base64.StdEncoding.EncodeToString(hash1[:])))
+	if _, err := strictV.VerifyOutputLogCheckpoint(rawUnsigned); !errors.Is(err, ErrCheckpointFailed) {
+		t.Fatalf("expected ErrCheckpointFailed when RequireVerifiers=true and verifier=nil, got: %v", err)
+	}
+
+	// 2. WitnessPolicy (2-of-3 witnesses required)
+	witnessV := NewVerifier(VerifierConfig{
+		OutputLogOrigin:   "example.com/output",
+		OutputLogVerifier: outVerifier,
+		OutputLogWitnessPolicy: &WitnessPolicy{
+			Witnesses: []note.Verifier{w1Verifier, w2Verifier, w3Verifier},
+			Threshold: 2,
+		},
+	})
+
+	// Only 1 witness signed -> must fail threshold
+	cp1Witness := signCP("example.com/output", 10, hash1, outSigner, w1Signer)
+	if _, err := witnessV.VerifyOutputLogCheckpoint(cp1Witness); !errors.Is(err, ErrCheckpointFailed) || !strings.Contains(err.Error(), "witness threshold not met") {
+		t.Fatalf("expected witness threshold error for 1-of-3, got: %v", err)
+	}
+
+	// 2b. Duplicate witness entries in policy + repeated signature line from w1 -> must STILL fail 2-of-3 threshold
+	dupWitnessV := NewVerifier(VerifierConfig{
+		OutputLogOrigin:   "example.com/output",
+		OutputLogVerifier: outVerifier,
+		OutputLogWitnessPolicy: &WitnessPolicy{
+			Witnesses: []note.Verifier{w1Verifier, w1Verifier, w2Verifier},
+			Threshold: 2,
+		},
+	})
+	lines := strings.Split(strings.TrimRight(string(cp1Witness), "\n"), "\n")
+	repeatedSigNote := string(cp1Witness) + lines[len(lines)-1] + "\n"
+	if _, err := dupWitnessV.VerifyOutputLogCheckpoint([]byte(repeatedSigNote)); !errors.Is(err, ErrCheckpointFailed) || !strings.Contains(err.Error(), "witness threshold not met") {
+		t.Fatalf("expected repeated signature from single witness to fail threshold=2, got: %v", err)
+	}
+
+	// 2c. Primary verifier collision in WitnessPolicy.Witnesses -> must be rejected
+	collidingWitnessV := NewVerifier(VerifierConfig{
+		OutputLogOrigin:   "example.com/output",
+		OutputLogVerifier: outVerifier,
+		OutputLogWitnessPolicy: &WitnessPolicy{
+			Witnesses: []note.Verifier{outVerifier, w1Verifier},
+			Threshold: 1,
+		},
+	})
+	if _, err := collidingWitnessV.VerifyOutputLogCheckpoint(cp1Witness); !errors.Is(err, ErrCheckpointFailed) || !strings.Contains(err.Error(), "collides with primary log verifier") {
+		t.Fatalf("expected primary verifier collision error, got: %v", err)
+	}
+
+	// 2d. Negative threshold or nil witness entry -> must be rejected
+	negThresholdV := NewVerifier(VerifierConfig{
+		OutputLogOrigin:        "example.com/output",
+		OutputLogVerifier:      outVerifier,
+		OutputLogWitnessPolicy: &WitnessPolicy{Witnesses: []note.Verifier{w1Verifier}, Threshold: -1},
+	})
+	if _, err := negThresholdV.VerifyOutputLogCheckpoint(cp1Witness); !errors.Is(err, ErrCheckpointFailed) {
+		t.Fatalf("expected negative threshold error, got: %v", err)
+	}
+	nilWitnessV := NewVerifier(VerifierConfig{
+		OutputLogOrigin:        "example.com/output",
+		OutputLogVerifier:      outVerifier,
+		OutputLogWitnessPolicy: &WitnessPolicy{Witnesses: []note.Verifier{nil}, Threshold: 1},
+	})
+	if _, err := nilWitnessV.VerifyOutputLogCheckpoint(cp1Witness); !errors.Is(err, ErrCheckpointFailed) {
+		t.Fatalf("expected nil witness error, got: %v", err)
+	}
+
+	// 2e. 2 distinct witnesses signed -> must pass and record size=10, hash=hash1
+	cp2Witnesses := signCP("example.com/output", 10, hash1, outSigner, w1Signer, w3Signer)
+	if _, err := witnessV.VerifyOutputLogCheckpoint(cp2Witnesses); err != nil {
+		t.Fatalf("expected 2-of-3 witness checkpoint to pass, got: %v", err)
+	}
+
+	// 3. Monotonic History Ratcheting (size regression & split-view)
+	// Same size + same hash -> allowed
+	if _, err := witnessV.VerifyOutputLogCheckpoint(cp2Witnesses); err != nil {
+		t.Fatalf("expected identical checkpoint at size 10 to pass, got: %v", err)
+	}
+
+	// Same size + different hash -> split-view detected!
+	cpSplit := signCP("example.com/output", 10, hash2, outSigner, w1Signer, w2Signer)
+	if _, err := witnessV.VerifyOutputLogCheckpoint(cpSplit); !errors.Is(err, ErrCheckpointRegressed) {
+		t.Fatalf("expected ErrCheckpointRegressed on split-view at size 10, got: %v", err)
+	}
+
+	// Smaller size (5 < 10) -> regression detected!
+	cpRegressed := signCP("example.com/output", 5, hash1, outSigner, w1Signer, w2Signer)
+	if _, err := witnessV.VerifyOutputLogCheckpoint(cpRegressed); !errors.Is(err, ErrCheckpointRegressed) {
+		t.Fatalf("expected ErrCheckpointRegressed on size 5 < 10, got: %v", err)
+	}
+
+	// Larger size (20 > 10) -> advances watermark!
+	cpAdvanced := signCP("example.com/output", 20, hash2, outSigner, w2Signer, w3Signer)
+	if _, err := witnessV.VerifyOutputLogCheckpoint(cpAdvanced); err != nil {
+		t.Fatalf("expected size 20 > 10 to pass, got: %v", err)
+	}
+
+	// 4. Client.GetCheckpoint and Client.GetInputLogCheckpoint enforce verification
+	var serveCorrupt bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vindex/v1/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		if serveCorrupt {
+			_, _ = w.Write(signCP("example.com/output", 25, hash1, w1Signer)) // missing outSigner
+			return
+		}
+		_, _ = w.Write(signCP("example.com/output", 25, hash1, outSigner, w1Signer))
+	})
+	mux.HandleFunc("/vindex/v1/inputlog_checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		if serveCorrupt {
+			_, _ = w.Write(signCP("example.com/input", 100, hash1, w1Signer)) // missing inSigner
+			return
+		}
+		_, _ = w.Write(signCP("example.com/input", 100, hash1, inSigner, w1Signer))
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cli, err := New(ts.URL, VerifierConfig{
+		OutputLogOrigin:        "example.com/output",
+		OutputLogVerifier:      outVerifier,
+		OutputLogWitnessPolicy: &WitnessPolicy{Witnesses: []note.Verifier{w1Verifier}, Threshold: 1},
+		InputLogOrigin:         "example.com/input",
+		InputLogVerifier:       inVerifier,
+		InputLogWitnessPolicy:  &WitnessPolicy{Witnesses: []note.Verifier{w1Verifier}, Threshold: 1},
+		RequireVerifiers:       true,
+	}, ts.Client())
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	if _, err := cli.GetCheckpoint(ctx); err != nil {
+		t.Fatalf("GetCheckpoint valid failed: %v", err)
+	}
+	if _, err := cli.GetInputLogCheckpoint(ctx); err != nil {
+		t.Fatalf("GetInputLogCheckpoint valid failed: %v", err)
+	}
+
+	serveCorrupt = true
+	if _, err := cli.GetCheckpoint(ctx); !errors.Is(err, ErrCheckpointFailed) {
+		t.Fatalf("expected GetCheckpoint to reject invalid signature, got: %v", err)
+	}
+	if _, err := cli.GetInputLogCheckpoint(ctx); !errors.Is(err, ErrCheckpointFailed) {
+		t.Fatalf("expected GetInputLogCheckpoint to reject invalid signature, got: %v", err)
+	}
+
+	// 5. VerifyKeysResponse with corrupted MPT proof must NOT advance maxOutSize/maxInSize watermarks
+	srv, _, _, pub, idxer := setupTestEnvironment(t, 64)
+	kTest := "com.google."
+	khTest := sha256.Sum256([]byte(kTest))
+	res, err := idxer.IndexBatch(ctx, &ingest.MappedBatch{
+		Count:         50,
+		KeyMap:        map[[32]byte][]uint64{khTest: {1}},
+		CanonicalKeys: map[[32]byte]string{khTest: kTest},
+	}, nil)
+	if err != nil {
+		t.Fatalf("IndexBatch failed: %v", err)
+	}
+	rawInCP := []byte("example.com/input\n50\n" + base64.StdEncoding.EncodeToString(make([]byte, 32)) + "\n")
+	if _, err := pub.PublishKeyBatch(ctx, res.ModifiedKeySubRoots, &log.Checkpoint{Origin: "example.com/input", Size: 50}, rawInCP); err != nil {
+		t.Fatalf("PublishKeyBatch failed: %v", err)
+	}
+	wGood := httptest.NewRecorder()
+	srv.HandleKeys(wGood, httptest.NewRequest(http.MethodGet, "/vindex/v1/keys/com.google.", nil))
+	goodBody := wGood.Body.String()
+	// Corrupt the keys-v1 subRoot so MPT inclusion proof verification fails
+	idx := strings.Index(goodBody, "— keys-v1 —\n")
+	if idx < 0 {
+		t.Fatalf("missing keys-v1 section in goodBody: %s", goodBody)
+	}
+	badBody := goodBody[:idx] + "— keys-v1 —\ncom.google. " + strings.Repeat("0", 64) + "\n"
+
+	watermarkV := NewVerifier(VerifierConfig{
+		OutputLogOrigin: "example.com/output",
+		InputLogOrigin:  "example.com/input",
+	})
+	if _, err := watermarkV.VerifyKeysResponse(ctx, kTest, false, []byte(badBody)); err == nil {
+		t.Fatal("expected VerifyKeysResponse to fail on corrupted MPT proof")
+	}
+	if watermarkV.maxOutSize != 0 || watermarkV.maxInSize != 0 {
+		t.Fatalf("failed VerifyKeysResponse must not advance watermarks: maxOutSize=%d maxInSize=%d", watermarkV.maxOutSize, watermarkV.maxInSize)
+	}
+	if _, err := watermarkV.VerifyKeysResponse(ctx, kTest, false, []byte(goodBody)); err != nil {
+		t.Fatalf("expected valid VerifyKeysResponse after failed response to succeed, got: %v", err)
+	}
+	if watermarkV.maxOutSize == 0 || watermarkV.maxInSize != 50 {
+		t.Fatalf("expected valid VerifyKeysResponse to advance watermarks, got maxOutSize=%d maxInSize=%d", watermarkV.maxOutSize, watermarkV.maxInSize)
+	}
+
+	// 6. NewInputLogClient defaults origin to inVerifier.Name() when origin == ""
+	inCli, err := NewInputLogClient(ts.URL, "", inVerifier, ts.Client())
+	if err != nil {
+		t.Fatalf("NewInputLogClient failed: %v", err)
+	}
+	if inCli.origin != "example.com/input" {
+		t.Fatalf("expected NewInputLogClient origin to default to %q, got %q", "example.com/input", inCli.origin)
 	}
 }
 

@@ -30,6 +30,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/incubator/vindex/v1/internal/mpt"
@@ -49,6 +50,7 @@ var (
 	ErrMissingSection       = errors.New("missing mandatory section in response")
 	ErrInvalidSectionHeader = errors.New("invalid section header format")
 	ErrCheckpointFailed     = errors.New("checkpoint verification failed")
+	ErrCheckpointRegressed  = errors.New("checkpoint history regressed or split-view detected")
 	ErrInclusionFailed      = errors.New("inclusion proof verification failed")
 	ErrMPTFailed            = errors.New("mpt proof verification failed")
 	ErrIndexOrder           = errors.New("indices are not strictly monotonically increasing")
@@ -56,12 +58,21 @@ var (
 	ErrNonInclusionNotEmpty = errors.New("non-inclusion response returned non-empty indices")
 )
 
-// VerifierConfig holds the origins and verifiers for cryptographic validation.
+// WitnessPolicy defines an optional threshold witness cosignature requirement for checkpoints.
+type WitnessPolicy struct {
+	Witnesses []note.Verifier
+	Threshold int
+}
+
+// VerifierConfig holds the origins, verifiers, and witness policies for cryptographic validation.
 type VerifierConfig struct {
-	OutputLogOrigin   string
-	OutputLogVerifier note.Verifier
-	InputLogOrigin    string
-	InputLogVerifier  note.Verifier
+	OutputLogOrigin        string
+	OutputLogVerifier      note.Verifier
+	OutputLogWitnessPolicy *WitnessPolicy
+	InputLogOrigin         string
+	InputLogVerifier       note.Verifier
+	InputLogWitnessPolicy  *WitnessPolicy
+	RequireVerifiers       bool
 }
 
 // KeysResponse represents a verified response from GET /vindex/v1/keys/{key...}.
@@ -136,7 +147,12 @@ func (r *LookupResponse) NextExpectedSubRoot() ([32]byte, error) {
 
 // Verifier verifies plain-text C2SP lookup responses from VIndex servers.
 type Verifier struct {
-	cfg VerifierConfig
+	cfg        VerifierConfig
+	mu         sync.Mutex
+	maxOutSize uint64
+	maxOutHash [32]byte
+	maxInSize  uint64
+	maxInHash  [32]byte
 }
 
 // NewVerifier creates a new Verifier instance.
@@ -151,28 +167,162 @@ func ParseVerifier(keyOrPath string) (note.Verifier, error) {
 	return verifier.ParseVerifier(keyOrPath)
 }
 
+type witnessID struct {
+	name string
+	hash uint32
+}
+
+func verifyCheckpointWithPolicy(rawCP []byte, origin string, v note.Verifier, policy *WitnessPolicy, requireVerifier bool, label string) (*log.Checkpoint, error) {
+	rawCP = bytes.TrimSpace(rawCP)
+	if len(rawCP) > 0 && rawCP[len(rawCP)-1] != '\n' {
+		rawCP = append(rawCP, '\n')
+	}
+	if policy != nil && policy.Threshold < 0 {
+		return nil, fmt.Errorf("%w: %s witness threshold %d cannot be negative", ErrCheckpointFailed, label, policy.Threshold)
+	}
+	if v == nil {
+		if requireVerifier {
+			return nil, fmt.Errorf("%w: %s verifier is required", ErrCheckpointFailed, label)
+		}
+		if policy != nil && policy.Threshold > 0 {
+			return nil, fmt.Errorf("%w: %s witness policy requires primary verifier", ErrCheckpointFailed, label)
+		}
+		parsed, err := wire.ParseCheckpointHeader(rawCP)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s checkpoint header invalid: %v", ErrCheckpointFailed, label, err)
+		}
+		if origin != "" && parsed.Origin != origin {
+			return nil, fmt.Errorf("%w: %s origin mismatch: got %q, want %q", ErrCheckpointFailed, label, parsed.Origin, origin)
+		}
+		return parsed, nil
+	}
+
+	effOrigin := origin
+	if effOrigin == "" {
+		effOrigin = v.Name()
+	}
+
+	var uniqueWitnesses []note.Verifier
+	var witnessMap map[witnessID]struct{}
+	if policy != nil && policy.Threshold > 0 {
+		primaryID := witnessID{name: v.Name(), hash: v.KeyHash()}
+		witnessMap = make(map[witnessID]struct{}, len(policy.Witnesses))
+		for _, w := range policy.Witnesses {
+			if w == nil {
+				return nil, fmt.Errorf("%w: %s witness policy contains nil verifier", ErrCheckpointFailed, label)
+			}
+			wid := witnessID{name: w.Name(), hash: w.KeyHash()}
+			if wid == primaryID {
+				return nil, fmt.Errorf("%w: %s witness %q collides with primary log verifier", ErrCheckpointFailed, label, w.Name())
+			}
+			if _, exists := witnessMap[wid]; !exists {
+				witnessMap[wid] = struct{}{}
+				uniqueWitnesses = append(uniqueWitnesses, w)
+			}
+		}
+		if policy.Threshold > len(uniqueWitnesses) {
+			return nil, fmt.Errorf("%w: %s witness threshold %d exceeds %d distinct configured witnesses", ErrCheckpointFailed, label, policy.Threshold, len(uniqueWitnesses))
+		}
+	}
+
+	parsed, _, n, err := log.ParseCheckpoint(rawCP, effOrigin, v, uniqueWitnesses...)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s checkpoint signature invalid: %v", ErrCheckpointFailed, label, err)
+	}
+
+	if policy != nil && policy.Threshold > 0 {
+		seenSigs := make(map[witnessID]struct{}, len(n.Sigs))
+		for _, sig := range n.Sigs[1:] {
+			wid := witnessID{name: sig.Name, hash: sig.Hash}
+			if _, ok := witnessMap[wid]; ok {
+				seenSigs[wid] = struct{}{}
+			}
+		}
+		if len(seenSigs) < policy.Threshold {
+			return nil, fmt.Errorf("%w: %s witness threshold not met: got %d valid witness signatures, want at least %d", ErrCheckpointFailed, label, len(seenSigs), policy.Threshold)
+		}
+	}
+
+	return parsed, nil
+}
+
+func (v *Verifier) checkCheckpointsLocked(outCP, inCP *log.Checkpoint) error {
+	if outCP != nil {
+		if outCP.Size < v.maxOutSize {
+			return fmt.Errorf("%w: output log checkpoint size regressed from %d to %d", ErrCheckpointRegressed, v.maxOutSize, outCP.Size)
+		}
+		if outCP.Size == v.maxOutSize && v.maxOutSize > 0 && !bytes.Equal(outCP.Hash, v.maxOutHash[:]) {
+			return fmt.Errorf("%w: output log split-view at size %d: got %x, want %x", ErrCheckpointRegressed, outCP.Size, outCP.Hash, v.maxOutHash)
+		}
+	}
+	if inCP != nil {
+		if inCP.Size < v.maxInSize {
+			return fmt.Errorf("%w: input log checkpoint size regressed from %d to %d", ErrCheckpointRegressed, v.maxInSize, inCP.Size)
+		}
+		if inCP.Size == v.maxInSize && v.maxInSize > 0 && !bytes.Equal(inCP.Hash, v.maxInHash[:]) {
+			return fmt.Errorf("%w: input log split-view at size %d: got %x, want %x", ErrCheckpointRegressed, inCP.Size, inCP.Hash, v.maxInHash)
+		}
+	}
+	return nil
+}
+
+func (v *Verifier) checkCheckpointsMonotonic(outCP, inCP *log.Checkpoint) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.checkCheckpointsLocked(outCP, inCP)
+}
+
+func (v *Verifier) commitCheckpoints(outCP, inCP *log.Checkpoint) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if err := v.checkCheckpointsLocked(outCP, inCP); err != nil {
+		return err
+	}
+	if outCP != nil && outCP.Size > v.maxOutSize {
+		v.maxOutSize = outCP.Size
+		copy(v.maxOutHash[:], outCP.Hash)
+	}
+	if inCP != nil && inCP.Size > v.maxInSize {
+		v.maxInSize = inCP.Size
+		copy(v.maxInHash[:], inCP.Hash)
+	}
+	return nil
+}
+
+// VerifyOutputLogCheckpoint verifies a raw Output Log checkpoint against configured verifiers, witness policy, and monotonic history.
+func (v *Verifier) VerifyOutputLogCheckpoint(rawCP []byte) (*log.Checkpoint, error) {
+	cp, err := verifyCheckpointWithPolicy(rawCP, v.cfg.OutputLogOrigin, v.cfg.OutputLogVerifier, v.cfg.OutputLogWitnessPolicy, v.cfg.RequireVerifiers, "output log")
+	if err != nil {
+		return nil, err
+	}
+	if err := v.commitCheckpoints(cp, nil); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
+// VerifyInputLogCheckpoint verifies a raw Input Log checkpoint against configured verifiers, witness policy, and monotonic history.
+func (v *Verifier) VerifyInputLogCheckpoint(rawCP []byte) (*log.Checkpoint, error) {
+	cp, err := verifyCheckpointWithPolicy(rawCP, v.cfg.InputLogOrigin, v.cfg.InputLogVerifier, v.cfg.InputLogWitnessPolicy, v.cfg.RequireVerifiers, "input log")
+	if err != nil {
+		return nil, err
+	}
+	if err := v.commitCheckpoints(nil, cp); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
 func (v *Verifier) verifyStateCommitment(sections map[string]wire.Section) (outCP *log.Checkpoint, inCP *log.Checkpoint, mapRoot [32]byte, rawInCP []byte, err error) {
 	// 1. Output Log Checkpoint (— vindex/v1 —)
 	vindexSec, ok := sections["vindex/v1"]
 	if !ok {
 		return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: vindex/v1", ErrMissingSection)
 	}
-	rawOutCP := bytes.TrimSpace(vindexSec.Body)
-	if len(rawOutCP) > 0 && rawOutCP[len(rawOutCP)-1] != '\n' {
-		rawOutCP = append(rawOutCP, '\n')
-	}
-	if v.cfg.OutputLogVerifier != nil {
-		parsed, _, _, err := log.ParseCheckpoint(rawOutCP, v.cfg.OutputLogOrigin, v.cfg.OutputLogVerifier)
-		if err != nil {
-			return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: output log checkpoint signature invalid: %v", ErrCheckpointFailed, err)
-		}
-		outCP = parsed
-	} else {
-		parsed, err := wire.ParseCheckpointHeader(rawOutCP)
-		if err != nil {
-			return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: output log checkpoint header invalid: %v", ErrCheckpointFailed, err)
-		}
-		outCP = parsed
+	outCP, err = verifyCheckpointWithPolicy(vindexSec.Body, v.cfg.OutputLogOrigin, v.cfg.OutputLogVerifier, v.cfg.OutputLogWitnessPolicy, v.cfg.RequireVerifiers, "output log")
+	if err != nil {
+		return nil, nil, [32]byte{}, nil, err
 	}
 
 	// 2. Output Log Leaf (— output-log-leaf-v1 <leaf_index> —)
@@ -216,18 +366,19 @@ func (v *Verifier) verifyStateCommitment(sections map[string]wire.Section) (outC
 	if err := proof.VerifyInclusion(rfc6962.DefaultHasher, leafIdx, outCP.Size, leafHash, outProof, outCP.Hash); err != nil {
 		return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: output log inclusion proof invalid: %v", ErrInclusionFailed, err)
 	}
-	if v.cfg.InputLogVerifier != nil {
-		origin := v.cfg.InputLogOrigin
-		if origin == "" {
-			origin = v.cfg.InputLogVerifier.Name()
-		}
-		parsed, _, _, err := log.ParseCheckpoint(rawInCP, origin, v.cfg.InputLogVerifier)
+	if v.cfg.InputLogVerifier != nil || v.cfg.RequireVerifiers || (v.cfg.InputLogWitnessPolicy != nil && v.cfg.InputLogWitnessPolicy.Threshold != 0) {
+		inCP, err = verifyCheckpointWithPolicy(rawInCP, v.cfg.InputLogOrigin, v.cfg.InputLogVerifier, v.cfg.InputLogWitnessPolicy, v.cfg.RequireVerifiers, "input log")
 		if err != nil {
-			return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: input log checkpoint signature invalid: %v", ErrCheckpointFailed, err)
+			return nil, nil, [32]byte{}, nil, err
 		}
-		inCP = parsed
 	} else {
+		if v.cfg.InputLogOrigin != "" && inCPHeader.Origin != v.cfg.InputLogOrigin {
+			return nil, nil, [32]byte{}, nil, fmt.Errorf("%w: input log origin mismatch: got %q, want %q", ErrCheckpointFailed, inCPHeader.Origin, v.cfg.InputLogOrigin)
+		}
 		inCP = inCPHeader
+	}
+	if err := v.checkCheckpointsMonotonic(outCP, inCP); err != nil {
+		return nil, nil, [32]byte{}, nil, err
 	}
 	return outCP, inCP, mapRoot, rawInCP, nil
 }
@@ -294,6 +445,9 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 			if err := mpt.VerifyKey(mapRoot, []byte(queryKey), [32]byte{}, false, mptProofBytes); err != nil {
 				return nil, fmt.Errorf("%w: non-inclusion proof verification failed: %v", ErrMPTFailed, err)
 			}
+			if err := v.commitCheckpoints(outCP, inCP); err != nil {
+				return nil, err
+			}
 			return &KeysResponse{
 				QueryKey:      queryKey,
 				IsPrefix:      false,
@@ -314,6 +468,9 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 		if err := mpt.VerifyKey(mapRoot, []byte(queryKey), keys[0].SubRoot, true, mptProofBytes); err != nil {
 			return nil, fmt.Errorf("%w: inclusion proof verification failed: %v", ErrMPTFailed, err)
 		}
+		if err := v.commitCheckpoints(outCP, inCP); err != nil {
+			return nil, err
+		}
 		return &KeysResponse{
 			QueryKey:      queryKey,
 			IsPrefix:      false,
@@ -332,6 +489,9 @@ func (v *Verifier) VerifyKeysResponse(ctx context.Context, queryKey string, isPr
 	}
 	if err := mpt.VerifyPrefix(mapRoot, []byte(queryKey), keys, mptProofBytes); err != nil {
 		return nil, fmt.Errorf("%w: prefix proof verification failed: %v", ErrMPTFailed, err)
+	}
+	if err := v.commitCheckpoints(outCP, inCP); err != nil {
+		return nil, err
 	}
 	return &KeysResponse{
 		QueryKey:      queryKey,
@@ -498,6 +658,9 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 		if err := mpt.Verify(mapRoot, keyHash, [sha256.Size]byte{}, false, mptProofBytes); err != nil {
 			return nil, fmt.Errorf("%w: non-inclusion proof verification failed: %v", ErrMPTFailed, err)
 		}
+		if err := v.commitCheckpoints(outCP, inCP); err != nil {
+			return nil, err
+		}
 		return &LookupResponse{
 			Key:           hex.EncodeToString(keyHash[:]),
 			KeyHash:       keyHash,
@@ -537,6 +700,9 @@ func (v *Verifier) VerifyResponse(ctx context.Context, keyHash [32]byte, before 
 		if err := mpt.Verify(mapRoot, keyHash, entriesResp.MiniLogRoot, true, mptProofBytes); err != nil {
 			return nil, fmt.Errorf("%w: inclusion proof verification failed: %v", ErrMPTFailed, err)
 		}
+	}
+	if err := v.commitCheckpoints(outCP, inCP); err != nil {
+		return nil, err
 	}
 
 	return &LookupResponse{
@@ -874,7 +1040,7 @@ func (c *Client) LookupPrefixAll(ctx context.Context, prefix string, pageSize ui
 	}, nil
 }
 
-// GetCheckpoint retrieves the latest Output Log checkpoint from the vindexd server.
+// GetCheckpoint retrieves and verifies the latest Output Log checkpoint from the vindexd server.
 func (c *Client) GetCheckpoint(ctx context.Context) ([]byte, error) {
 	u := c.baseURL.JoinPath("vindex", "v1", "checkpoint")
 
@@ -897,10 +1063,13 @@ func (c *Client) GetCheckpoint(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	if _, err := c.verifier.VerifyOutputLogCheckpoint(body); err != nil {
+		return nil, err
+	}
 	return body, nil
 }
 
-// GetInputLogCheckpoint retrieves the latest Input Log checkpoint from the vindexd server.
+// GetInputLogCheckpoint retrieves and verifies the latest Input Log checkpoint from the vindexd server.
 func (c *Client) GetInputLogCheckpoint(ctx context.Context) ([]byte, error) {
 	u := c.baseURL.JoinPath("vindex", "v1", "inputlog_checkpoint")
 
@@ -923,6 +1092,9 @@ func (c *Client) GetInputLogCheckpoint(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	if _, err := c.verifier.VerifyInputLogCheckpoint(body); err != nil {
+		return nil, err
+	}
 	return body, nil
 }
 
@@ -972,6 +1144,9 @@ func NewInputLogClient(inLogUrl string, origin string, inV note.Verifier, hc *ht
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP fetcher for %q: %v", u, err)
 	}
+	if origin == "" && inV != nil {
+		origin = inV.Name()
+	}
 	return &InputLogClient{
 		v:      inV,
 		origin: origin,
@@ -988,7 +1163,11 @@ type InputLogClient struct {
 
 // Dereference takes pointers and returns an iterator over verified InputLogLeaf entries.
 func (c *InputLogClient) Dereference(ctx context.Context, cpRaw []byte, pointers []uint64) iter.Seq2[InputLogLeaf, error] {
-	cp, _, _, err := log.ParseCheckpoint(cpRaw, c.origin, c.v)
+	effOrigin := c.origin
+	if effOrigin == "" && c.v != nil {
+		effOrigin = c.v.Name()
+	}
+	cp, _, _, err := log.ParseCheckpoint(cpRaw, effOrigin, c.v)
 	if err != nil {
 		return func(yield func(InputLogLeaf, error) bool) {
 			yield(InputLogLeaf{}, fmt.Errorf("failed to parse input log checkpoint: %v", err))
