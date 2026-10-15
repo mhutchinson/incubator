@@ -1,0 +1,279 @@
+# Sub-Design: WASM Guest SDK & Plugin Interface
+
+This document defines the WebAssembly guest ABI, developer contract, memory management protocols, load-bearing invariants, and verified performance optimizations for the **WASM Guest SDK** (`vindex/mapfn`).
+
+---
+
+## 1. Context & Objectives
+
+### 1.1 Architectural Separation: User Callback vs. Guest SDK vs. Host Runtime
+Mapping in VIndex operates across three decoupled layers:
+1. **User Logic (`MapFn`)**: The pure Go function implementing the streaming callback (`func(leaf []byte, emit func(key []byte))`) written by ecosystem developers. It has no knowledge of WebAssembly, linear memory pointers, or host runtimes.
+2. **Guest SDK (`mapfn/sdk`)**: The runtime harness compiled into the guest `.wasm` binary alongside `MapFn`. It exports the low-level `map_bundle` and `input_buffer` ABIs, manages linear memory slabs, iterates through leaf crates, invokes `MapFn`, and serializes output canonical keys via `emit`.
+3. **Host Sandbox Runtime (`mapfn/host` & `internal/ingest`)**: `mapfn/host` provides the standalone, WASI-free Wazero sandbox pool (`InstantiateModule`) that loads the compiled `.wasm` plugin, executes `map_bundle` over 256-leaf tiles, preserves the emitted canonical keys for the MPT, and computes 32-byte key hashes using native CPU SIMD instructions for Pebble storage.
+
+### 1.2 Problem Statement & Real-World Friction
+Every transparency ecosystem indexes different payloads (e.g. DER X.509 certificates in Certificate Transparency, newline-delimited strings in Go SumDB, or JSON provenance records in Sigstore). VIndex must allow ecosystem authors to define custom extraction logic without compromising node security, crashing the host process, or causing state divergence across independent monitors.
+
+Relying on in-process native Go plugins or shared libraries introduces three severe failure modes:
+1. **Toolchain Version Drift & Non-Determinism**: If two independent indexers or verifiers compile their code with different Go versions (e.g. Go 1.23 vs. Go 1.25) or execute on different operating systems, standard library behavior can diverge. A subtle parsing change in ASN.1 DER certificate decoding or Unicode normalization across compiler versions on even **one leaf out of 100 million** causes the computed `MapRoot` to diverge permanently, triggering false split-view alarms and destroying ecosystem consensus.
+2. **Host Process Fragility**: Untrusted or malformed leaves in public logs could cause out-of-bounds memory accesses, nil pointer panics, or unbounded recursion. Running native code directly in the host engine risks terminating the entire `vindexd` daemon.
+3. **Foreign Function Interface (FFI) Overhead**: Naively executing foreign functions across language boundaries on a per-leaf basis introduces excessive context-switching and memory-copying overhead, consuming ~23% of total host CPU time purely in FFI crossings.
+
+### 1.3 Goals & Non-Goals
+- **Goals**:
+  - Provide a high-level, idiomatic developer contract (`func(leaf []byte, emit func(key []byte))`) allowing ecosystem authors to write pure functions without managing raw WebAssembly linear memory pointers.
+  - Provide a zero-allocation guest runtime SDK (`mapfn/sdk`) that binds the developer's function to the high-performance `map_bundle` ABI.
+  - Freeze compiler and standard library bytecode inside a hermetic `.wasm` binary, guaranteeing bit-for-bit identical execution across all host architectures, operating systems, and toolchain versions.
+  - Amortize boundary-crossing overhead by processing full 256-leaf crates in a single FFI call using contiguous shared-memory slabs.
+  - Provide an offline verification CLI (`vindex-wasm`) to validate determinism, memory bounds, and throughput prior to deployment.
+- **Non-Goals**:
+  - **No Host Execution in this Package**: The host-side Wazero runtime pool and SIMD hashing pipeline are housed in the Ingest subsystem (`internal/ingest`).
+  - **No In-Place Dynamic Upgrades**: Once a compiled plugin binary is published for an Input Log, its bytecode is immutable. Fixing a parsing bug requires deploying a new index instance from leaf 0.
+  - **No In-Guest Cryptographic Hashing**: Guest modules do not compute SHA-256 hashes; they emit raw canonical string preimages and delegate hashing to the Go host.
+  - **No Host I/O or State**: Guest modules are strictly pure functions; they have zero access to disk, network, environment variables, or host clocks.
+
+### 1.4 Requirements, Constraints & Known Pain Points
+- **Host Runtime**: Pure Go WebAssembly runtime via `github.com/tetratelabs/wazero` executing under the `wasip1` specification with zero CGO dependencies.
+- **WASM Memory Constraints**: Guest modules execute within a bounded linear memory space (tens of megabytes by default, scalable via configuration), with pre-allocated multi-megabyte static input and output slabs.
+- **Known Pain Points ("Warts and All")**:
+  - **Standard Go WASM Binary Size**: Standard Go (`GOOS=wasip1 GOARCH=wasm`) bundles the complete Go runtime and garbage collector into the binary, resulting in ~1.9 MB to ~2.5 MB binaries. While TinyGo produces ~200 KB binaries, it lacks support for certain standard library packages (such as full `crypto/x509`).
+  - **Immutable Logic Cost**: Because mapping logic is frozen to prevent split-view attacks, any bug in key extraction cannot be hot-patched; it requires re-indexing the entire log from leaf 0.
+  - **Memory Slab Ceiling**: A tile bundle containing abnormally large leaves (e.g. 50 KB certificates with hundreds of SANs) can exceed the initial guest memory allocation, requiring the host to configure larger linear memory bounds.
+
+---
+
+## 2. Detailed Design
+
+### 2.1 The High-Level Developer Experience
+Ecosystem developers write standard, idiomatic Go. They do not write assembly, manage WebAssembly linear pointers, or handle memory layout serialization.
+
+The developer implements a pure mapping function using a streaming `emit` callback:
+
+```go
+type EmitMapFunc func(leaf []byte, emit func(key []byte))
+```
+
+Example implementation for a certificate log:
+
+```go
+package main
+
+import (
+	"crypto/x509"
+	"strings"
+
+	"github.com/transparency-dev/incubator/vindex/mapfn/sdk"
+	"golang.org/x/net/idna"
+)
+
+func mapCertificate(leaf []byte, emit func([]byte)) {
+	cert, err := x509.ParseCertificate(leaf)
+	if err != nil {
+		return
+	}
+
+	if cert.Subject.CommonName != "" {
+		if d, err := normalizeDomain(cert.Subject.CommonName); err == nil {
+			emit([]byte(d))
+		}
+	}
+	for _, san := range cert.DNSNames {
+		if d, err := normalizeDomain(san); err == nil {
+			emit([]byte(d))
+		}
+	}
+}
+
+func normalizeDomain(domain string) (string, error) {
+	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+	return idna.Lookup.ToASCII(d)
+}
+
+func init() {
+	// Guest plugins compile with -buildmode=c-shared (GOOS=wasip1 GOARCH=wasm);
+	// the runtime executes package init() during module instantiation and invokes
+	// the exported map_bundle function directly without calling main().
+	sdk.RegisterEmit(mapCertificate)
+}
+
+func main() {}
+```
+
+The `sdk.RegisterEmit` harness automatically binds the user's pure function to the low-level `map_bundle` FFI export. Each call to `emit(key)` writes the length-prefixed preimage directly into the pre-allocated output memory slab in-place. This eliminates intermediate slice allocations (`[]string` or `[][]byte`), dynamic array resizing, and garbage collector overhead inside the WebAssembly guest.
+
+#### WASM Guest ABI Contract:
+To exchange data across the FFI boundary while eliminating per-leaf allocation overhead:
+- **Memory Lifecycle**: The guest exports `input_buffer() uint32` returning the base pointer of a pre-allocated multi-megabyte input slab in linear memory. The host serializes the 256-leaf bundle directly into this buffer, invokes `map_bundle`, and reads the resulting preimages from the returned output slab pointer.
+- **Statelessness Invariant**: Guest code must maintain zero mutable state across invocations. All mapping logic must be deterministic and pure; execution depends strictly on the bytes of each individual leaf.
+
+---
+
+### 2.2 Low-Level WASM ABI & The Pack-and-Wipe Memory Slab
+To eliminate the 23% CPU overhead of per-leaf FFI boundary crossings, the host and guest communicate through contiguous pre-allocated memory slabs using the `input_buffer` and `map_bundle` exports:
+
+```text
+//go:wasmexport input_buffer
+func input_buffer() uint32
+
+//go:wasmexport map_bundle
+func map_bundle(inputPtr uint32, inputLen uint32) uint64
+```
+
+#### Memory Slab Lifecycle:
+1. **Pack (Host)**: The Go host queries `input_buffer()` once on instance initialization and serializes all 256 leaves of an Input Log data tile into the contiguous input slab in the guest's linear memory.
+2. **Execute (FFI Call)**: The host invokes `map_bundle(inputPtr, inputLen)`.
+3. **Stream (Guest SDK)**: Inside WASM, the SDK harness reads the `[Count+1]uint32` offset table (`leaf := payload[offsets[i]:offsets[i+1]]`), iterates over all leaves in a tight in-guest loop, and invokes `userMapFn(leaf, emit)`. Each call to `emit` copies the length-prefixed preimage directly into the pre-allocated output slab at the current write cursor, avoiding intermediate collection allocations.
+4. **Return & Unpack (Host)**: The guest returns a packed 64-bit integer `uint64(outputPtr)<<32 | uint64(outputLen)`. The host reads all extracted preimages directly from the guest linear memory.
+5. **Wipe (Guest/Host)**: Output slab write cursors are reset (`offset = 0`) at the start of the next `map_bundle` call, completely eliminating guest heap allocations and GC pauses.
+
+#### Binary Slab Layouts (All `uint32` fields encoded in Little-Endian):
+
+| Memory Buffer | Offset | Field Name | Data Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **Input Slab** | `0` | `LeafCount` | `uint32` (4B, LE) | Number of leaves in the crate (`Count`, 1 to 256). |
+| | `4` | `OffsetTable` | `[Count+1]uint32` (LE) | `Count + 1` byte offsets relative to `PayloadBlock`: `OffsetTable[0] = 0`, followed by the end offset of each leaf (`leaf[i] = PayloadBlock[OffsetTable[i]:OffsetTable[i+1]]`). |
+| | `8 + 4*Count` | `PayloadBlock` | `[]byte` | Raw, contiguous leaf bytes concatenated end-to-end. |
+| **Output Slab** | `0` | `LeafCount` | `uint32` (4B, LE) | Number of leaves processed (`Count`). |
+| | `4` | `KeyCountTable` | `[Count]uint32` (LE) | Number of preimages emitted by each respective leaf. |
+| | `4 + 4*Count` | `PreimageBlock` | `[]byte` | Concatenated length-prefixed preimages (`uint32 length` (LE) + raw preimage bytes). |
+
+---
+
+### 2.3 In-Situ Invariants & Performance Optimizations
+
+- **[Correctness Invariant] Bytecode Immutability Across Toolchains**:
+  - *Rule*: The `MapFn` WASM binary must be compiled once, cryptographically hashed, and referenced by its SHA-256 digest. Every participating indexer and verifier must execute this exact bytecode.
+  - *Rationale*: Protects the distributed ecosystem against subtle compiler, standard library, or operating system changes (e.g. updates to Go's ASN.1 parser or Unicode tables).
+  - *Consequence ("Or Else")*: If nodes ran native code compiled with different toolchains, edge-case parsing discrepancies would produce conflicting `MapRoot` commitments, causing false split-view detections and breaking verifier trust.
+
+- **[Correctness Invariant] Hermetic Isolation & Fatal HALT Policy**:
+  - *Rule*: Guest WASM execution must run in a hermetically sealed environment with zero host filesystem access, zero network sockets, and deterministic frozen clocks. If the guest encounters an unhandled panic, memory fault, or execution trap, the host daemon terminates immediately with a fatal `HALT`.
+  - *Rationale*: Ensures that execution is 100% deterministic and reproducible on any machine.
+  - *Consequence ("Or Else")*: Silently swallowing guest traps or returning partial results produces divergent key mappings, resulting in false non-inclusion proofs.
+
+- **[Performance Optimization] Bundled FFI Invocation (`map_bundle`)**:
+  - *Mechanism*: Packs an entire 256-leaf crate into the input slab and executes a single FFI call per tile, rather than crossing the boundary once per leaf.
+  - *Impact*: Reduces FFI transitions from 768 to 2–3 per tile, slashing FFI CPU overhead from ~23% of host CPU time to < 1%.
+
+- **[Performance Optimization] Pack-and-Wipe Slab Allocation**:
+  - *Mechanism*: Slabs are allocated once in guest linear memory and reused across sequential tile invocations with simple pointer resets.
+  - *Impact*: Eliminates in-guest heap allocations and garbage collector pauses, keeping memory usage bounded and CPU dedicated to parsing.
+
+- **[Performance Optimization] Raw Preimage Emission & Host SIMD Cryptography**:
+  - *Mechanism*: Guest sandboxes emit raw string preimages. The Go host performs bulk SHA-256 hashing using native hardware vector instructions (Single Instruction, Multiple Data / SIMD, such as x86 SHA-NI or ARMv8 Crypto extensions).
+  - *Impact*: Eliminates the ~55% software crypto bottleneck inside WebAssembly bytecode.
+
+---
+
+### 2.4 Offline Developer Verification Tooling (`vindex-wasm`)
+The mapping subsystem provides a standalone CLI tool (`vindex/cmd/vindex-wasm`) to allow plugin authors to test and qualify their mapping binaries before production deployment:
+
+```bash
+# Test mapping output against a literal leaf string or file
+vindex-wasm test --wasm=map.wasm --input="golang.org/x/crypto v0.1.0 h1:..."
+vindex-wasm test --wasm=map.wasm --input_file=leaf.bin --format=json
+
+# Run performance and throughput benchmarks (leaves/sec)
+vindex-wasm bench --wasm=map.wasm --input="golang.org/x/crypto v0.1.0 h1:..." --iterations=1000
+
+# Assert bit-for-bit determinism across repeated executions and concurrency
+vindex-wasm verify-determinism --wasm=map.wasm --input="golang.org/x/crypto v0.1.0 h1:..."
+
+# Inspect exported memory slabs and ABI metadata
+vindex-wasm inspect --wasm=map.wasm
+```
+
+---
+
+## 3. Alternatives Considered (or Tried)
+
+### 3.1 Per-Leaf Mapping (`map_leaf`) vs. Bundled Mapping (`map_bundle`)
+- **Proposed**: Invoking an exported `map_leaf(ptr, len)` guest function individually for every leaf.
+- **Empirical Rejection**: Generated 768 FFI calls per 256-leaf tile (memory allocation, leaf mapping, and arena reset transitions x 256). Profiling revealed that ~23% of total host CPU time was spent purely on boundary-crossing overhead.
+- **Chosen Design**: Bundled mapping (`map_bundle`) processes all 256 leaves in a single invocation via shared memory slabs, reducing FFI overhead to < 1%.
+
+### 3.2 In-Guest Software Cryptography vs. Host SIMD Preimage Hashing
+- **Proposed**: Compiling SHA-256 hashing libraries directly into the guest WASM bytecode so that the guest outputs 32-byte key hashes directly.
+- **Empirical Rejection**: Because WebAssembly runtimes lack direct access to native CPU hardware crypto instructions, software bitwise hashing consumed ~55% of all CPU cycles during mapping.
+- **Chosen Design**: Guest modules output raw canonical string preimages; the Go host performs bulk hardware-accelerated SHA-256 using CPU SIMD vector instructions.
+
+### 3.3 Exporting Host Hardware Hashing into WASM vs. Pure Preimage Return
+- **Proposed**: Exposing an imported host function (`host.sha256(ptr, len)`) into the WebAssembly sandbox so guest modules could invoke host hardware crypto while still returning pre-computed hashes.
+- **Theoretical Rejection (Ergonomics & Architectural Purity)**:
+  - Ruled out without benchmarking due to excessive SDK complexity and loss of pure-function abstraction.
+  - Requiring a host import forces guest SDK authors across different languages (Go, Rust, TinyGo, Zig) to bind against proprietary host runtime hooks rather than writing a clean, portable function (`leaf []byte -> []string`).
+  - Incurring bidirectional FFI hops for every individual hash would introduce its own boundary overhead.
+- **Chosen Design**: Keep the guest contract completely pure and self-contained: the guest simply emits raw canonical string preimages, and the Go host performs bulk SIMD hashing natively.
+
+### 3.4 In-Process Go Plugins / CGO vs. WebAssembly Sandboxing
+- **Proposed**: Dynamically loading Go plugins (`plugin.Open`) or shared C libraries (`cgo`).
+- **Theoretical Rejection**:
+  - In-process native plugins do not guarantee determinism across toolchain versions (Go compiler upgrades can alter standard library parsing behavior).
+  - Memory corruptions or panics inside the plugin crash the main daemon.
+  - Go plugins have poor cross-platform support and require identical dependency version trees between the host and plugin.
+- **Chosen Design**: Standardized on Wazero WebAssembly sandboxing.
+
+### 3.5 Slice-Returning MapFn (`func(leaf) []string`) vs. Streaming Callback (`func(leaf, emit)`)
+- **Proposed & Historical Design**: For a long time, the design specified a 1:1 slice-returning contract (`type MapFn func(leaf []byte) []string` or `[][]byte`), where user logic parsed a leaf and returned an allocated collection of preimages to the SDK harness.
+- **Why It Was Changed**:
+  - *In-Guest Allocation Churn*: Returning dynamic slices forced the guest runtime to allocate slice headers and backing arrays for every single leaf. On high-fanout workloads like Certificate Transparency (up to 50 SANs per certificate), dynamic `append` growth triggered repeated slice reallocations and GC sweeps inside the WASM sandbox.
+  - *Cross-Language WASM Portability*: Systems languages that compile to WebAssembly (C, C++, Rust, Zig) lack native Go-style dynamic slices. Returning a variable-length list requires importing or linking a dynamic heap allocator (`malloc`/`dlmalloc`) and managing complex array descriptors.
+  - *Direct Arena Streaming*: In contrast, a streaming callback (`func(leaf []byte, emit func(key []byte))`) allows user parsing code to write preimages directly into the SDK's pre-allocated linear memory output buffer at the current cursor.
+  - *Measurable Throughput Gain*: Eliminating intermediate slice allocations and GC overhead inside the guest delivers a 15% to 25% throughput improvement in guest mapping execution (and up to 35% on high-fanout certificate parsing).
+- **Chosen Design**: Streaming callback (`EmitMapFunc` / `RegisterEmit`) as the canonical zero-allocation contract.
+
+---
+
+## Appendix: Guest Parsing Optimization Case Study (Certificate Transparency)
+
+### A.1 The In-Guest Parsing Bottleneck
+While WebAssembly provides sandboxed memory safety and cross-platform determinism, guest execution overhead is non-uniform across Go packages. Compiling standard library decoders (`crypto/x509`, `encoding/asn1`, `encoding/json`, `regexp`) into `wasip1/wasm` introduces severe performance degradation:
+
+1. **Reflection & Heap Churn**: Standard decoders build dynamic Abstract Syntax Trees (ASTs) on the Go heap, triggering garbage collection cycles inside bounded guest linear memory.
+2. **Extraneous Cryptographic Decoding**: Standard `crypto/x509` decodes public key structures, executes `big.Int` modular arithmetic, and validates elliptic curve points—operations irrelevant to search key extraction.
+3. **Concurrency Saturation**: Under naive parsing, guest execution drops to ~1,200 leaves/s per core. Even scaling across 16 to 24 parallel Wazero workers caps aggregate throughput at ~14,000 leaves/s. Because the downstream storage engine and trie can commit >200,000 leaves/s, the pipeline becomes completely CPU-starved on guest mapping.
+
+- **[Performance Optimization] Zero-Allocation In-Guest Parsing**:
+  - *Mechanism*: Ecosystem plugins should avoid reflection-heavy standard library decoders in favor of targeted, in-place byte scanners over raw leaf payloads.
+  - *Impact*: Eliminates in-guest AST heap allocations and extraneous cryptographic validation, preventing guest WASM execution from starving the downstream storage and trie pipeline.
+
+### A.2 Structural Architecture: Naive vs. Targeted Parsing
+- **Naive Architecture (Standard Library Decoders)**:
+  Deserializes the full certificate structure via `crypto/x509` and `encoding/asn1`. Incurs full ASN.1 reflection overhead, parses public keys, and validates signatures.
+- **Optimized Architecture (Targeted In-Place Scanner)**:
+  Bypasses `crypto/x509` and reflection entirely. A zero-allocation cursor scans the raw ASN.1 TLV stream in-place, extracting only the Subject Common Name (OID `2.5.4.3`) and SAN `dNSName` entries (OID `2.5.29.17`):
+  - *Extension Filtering*: Unrecognized extension OIDs are skipped without decoding or allocating values.
+  - *CT Poison & SCTs*: Ignored; search indexing requires domain preimages rather than certificate chain validation.
+  - *Framing Differences*: Precertificate entries (`precert_entry`) and standard certificates (`x509_entry`) differ only by initial byte offset (skipping the outer certificate sequence or the 32-byte issuer hash) before entering the identical scanning loop.
+
+### A.3 Empirical Telemetry (Sycamore 2026h2 Dataset, 10,240 Real Certificates)
+
+| Metric | Naive (`crypto/x509`) | Targeted In-Place Scanner | Delta / Speedup |
+| :--- | :--- | :--- | :--- |
+| **WASM Single-Thread** | 1,269 leaves/s (788 μs/leaf) | **9,391 leaves/s** (106.5 μs/leaf) | **7.4x** |
+| **WASM 16 Workers** | 14,684 leaves/s (1,065 μs/leaf) | **109,828 leaves/s** (142 μs/leaf) | **7.5x** |
+| **Tile Ingest Latency (P50)** | 272.6 ms | **36.3 ms** | **7.5x lower** |
+| **Tile Ingest Latency (P99)** | 379.8 ms | **56.6 ms** | **6.7x lower** |
+| **Projected Wall Time (1B Leaves)** | 18.9 hours | **2.53 hours** | **-16.37 hours (-86.6%)** |
+
+Across all 10,240 real Static-CT certificates in the evaluation dataset, the targeted scanner produced output 100% bitwise identical to `crypto/x509` (0 mismatches).
+
+---
+
+## 4. Verification Gate
+
+All guest SDK, sandbox host (`mapfn/host`), example mapper (`ct`, `mtc`, `sumdb`), and `vindex-wasm` CLI tests are verified via:
+
+```bash
+go test -race ./vindex/mapfn/... ./vindex/cmd/vindex-wasm/...
+```
+
+---
+
+## 5. Design Log
+
+| Date | Milestone | Summary |
+| :--- | :--- | :--- |
+| 2026-09-22 | v1 Initial | Defined `EmitMapFunc`, `input_buffer` / `map_bundle` pack-and-wipe slabs, and targeted ASN.1 CT scanner. |
+| 2026-10-14 | M1–M3 | Fixed guest `input_buffer` pointer cache and output overflow trap (`ErrWASMFatalTrap`) (M1), updated CT/MTC mappers to reversed-label trailing-dot canonical keys and Go SumDB case-escaping (M2), and extracted standalone `mapfn/host` sandbox package (M3). |
