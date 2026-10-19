@@ -2,6 +2,8 @@
 
 A **Verifiable Index (VIndex)** provides efficient, trustless, and cryptographically verifiable querying over append-only transparency logs (such as Certificate Transparency, Merkle Tree Certificates, and Go SumDB).
 
+> **New to VIndex?** Jump straight into the [**5-Minute Quickstart Guide**](./QUICKSTART.md) or run `just demo-local` to launch a fully self-contained local indexer and query client.
+>
 > **Looking for the original WAL-based MVP?** The initial prototype that preceded this architecture has been retired on `main`; you can browse its source and docs at commit [`d76a0d4`](https://github.com/transparency-dev/incubator/tree/d76a0d4/vindex).
 
 ---
@@ -106,7 +108,7 @@ The VIndex topology bounds search indexing between two append-only logs—a stru
 
 ### Client & Subsystem Specifications
 - [**Client SDK & Query Proof Verification**](./client/README.md): Lightweight public Go client library with pure, stateless `Verify*` primitives, optional O(1) `StateTracker` checkpoint ratcheting, two-endpoint C2SP verification, two-sided prefix proofs, `torchwood.Policy` (`tlog-policy`) verification, and backward pagination chains.
-- **C2SP Wire Format & Merkle Codecs** (`internal/wire`): Internal zero-I/O C2SP multi-section parser/formatter, Output Log index state commitment codecs, and RFC 6962 value log compact range hash root computation.
+- [**C2SP Wire Format & Merkle Codecs**](./internal/wire/): Internal zero-I/O C2SP multi-section parser/formatter, Output Log index state commitment codecs, and RFC 6962 value log compact range hash root computation.
 - [**Ingestion Pipeline & Tile Cache**](./internal/ingest/README.md): Upstream tile and entry bundle fetching, local tile cache durability, WASM worker pool, host SIMD hashing, monotonic resequencing, and safe cache pruning.
 - [**WASM Guest SDK & Plugin Interface**](./mapfn/README.md): Public Go guest SDK runtime harness (`mapfn/sdk`), internal WASI-free Wazero sandbox host (`internal/wasmhost`), pack-and-wipe linear memory slabs, and `vindex-wasm` verification tooling.
 - [**Inverted Chunk Storage Engine**](./internal/kvstore/README.md): Embedded Pebble LSM engine, inverted chunk keys (`'c' + KeyHash + ^chunkNum`, where `KeyHash = SHA-256(key)` is strictly an internal Pebble storage digest while the MPT stores un-hashed canonical keys), 33-byte prefix Bloom filters, delimitless 16-bit offset serialization, and the `pebble-tests` empirical suite.
@@ -118,3 +120,31 @@ The VIndex topology bounds search indexing between two append-only logs—a stru
 ### Tooling & Verification
 - [**Hammer Load Testing Framework**](./internal/hammer/README.md): Integration load generator, Zipfian workload synthesizer, and concurrent verifying lookup client harness.
 
+---
+
+## 8. Repository Structure & Development Workflow
+
+### Repository Structure
+The `vindex/` repository layout reflects the decoupled modular architecture:
+
+- [`client/`](./client/README.md): Public, lightweight client verification SDK and HTTP client (decoupled from `pebble` and `wazero`).
+- [`cmd/`](./cmd/): Command-line developer utilities and operational binaries:
+  - [`vindex-wasm/`](./cmd/vindex-wasm/): Offline CLI tooling for inspecting, testing, and benchmarking WASM mapping plugins (decoupled from `net/http` and `tessera`).
+- [`docs/`](./docs/): Authoritative specifications, system architecture design, and application profiles.
+- [`internal/`](./internal/): Private core engine subsystems:
+  - [`auditor/`](./internal/auditor/README.md): Full-log independent auditor and root mismatch detection.
+  - [`coordinator/`](./internal/coordinator/README.md): Batch loop orchestration, watermark synchronization, and Zero-WAL crash recovery.
+  - [`hammer/`](./internal/hammer/README.md): Synthetic Zipfian load generator and closed-loop verification harness.
+  - [`ingest/`](./internal/ingest/README.md): Upstream tile fetching, local tile cache durability, and concurrent mapping pipeline.
+  - [`kvstore/`](./internal/kvstore/README.md): Embedded Pebble LSM inverted chunk storage engine with bitwise chunk inversion.
+  - [`metrics/`](./internal/metrics/): Prometheus metrics registration, latency histograms, and engine telemetry instrumentation.
+  - [`mpt/`](./internal/mpt/): Variable-length `torchwood/mpt` manager, canonical key validation, and point/prefix proof verification.
+  - [`mtc/`](./internal/mtc/): Merkle Tree Certificate (MTC) binary parser, X.509 SAN/CN extractor, reversed-label domain canonicalizer, and experimental `note.Verifier` policy adapter.
+  - [`server/`](./internal/server/README.md): C2SP HTTP read server (`<prefix>/keys` and `<prefix>/values`) and prefix policy enforcement.
+  - [`tree/`](./internal/tree/README.md): Output Log publisher, Tessera POSIX log integration, and 3-step state commitment.
+  - [`wasmhost/`](./internal/wasmhost/): Internal WASI-free Wazero sandbox host, canonical key validator, and deterministic memory pool.
+  - [`wire/`](./internal/wire/): Internal C2SP `tlog-vindex` multi-section wire framing, Output Log state commitment codecs, and RFC 6962 value log root calculation.
+- [`mapfn/`](./mapfn/README.md): WebAssembly guest SDK and example mapping plugins:
+  - [`sdk/`](./mapfn/sdk/): Public in-guest runtime harness, pack-and-wipe memory slabs, and low-level ABI bindings.
+  - [`examples/`](./mapfn/examples/): Example mapping plugins for transparency ecosystems (SumDB, Certificate Transparency, MTC, starter).
+- [`vindex.go`](./vindex.go): Top-level engine lifecycle orchestrator (`Engine`) and public Go API entrypoint.
