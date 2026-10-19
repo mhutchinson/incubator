@@ -20,7 +20,13 @@ These examples demonstrate how external developers can implement and compile cus
    - Normalizes domains (IDNA2008 Punycode, lowercase) into reversed-label canonical keys with a mandatory trailing dot (`com.google.mail.`, `com.google.*.`), without map-time parent expansion.
    - Emits canonical domain keys via `sdk.RegisterEmit` for direct MPT prefix/point indexing.
 
-3. **`starter`** (`mapfn/examples/starter`):
+3. **`mtc`** (`mapfn/examples/mtc`):
+   - Parses Merkle Tree Certificates (MTC) Type 1 `TBSCertificateLogEntry` ASN.1 DER leaves.
+   - Extracts Subject Common Name (CN) and Subject Alternative Names (SANs).
+   - Normalizes domains (IDNA2008 Punycode, lowercase) into reversed-label canonical keys with a mandatory trailing dot (`com.google.mail.`, `com.google.*.`), without map-time parent expansion.
+   - Emits canonical domain keys to the host runtime via `sdk.RegisterEmit`.
+
+4. **`starter`** (`mapfn/examples/starter`):
    - Minimal boilerplate demonstrating zero-allocation leaf ingestion and key emission.
    - Ideal starting point for writing a custom MapFn from scratch.
 

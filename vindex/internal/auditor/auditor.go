@@ -401,10 +401,12 @@ func New(cfg Config) (*Verifier, error) {
 	}
 
 	metrics.ResetAuditorRootMismatch()
+	metrics.ResetAuditorHalted()
 	return v, nil
 }
 
 func (v *Verifier) halt(err error) error {
+	metrics.SetAuditorHalted(1)
 	v.stateMu.Lock()
 	v.isHalted = true
 	v.haltErr = err
@@ -1059,6 +1061,7 @@ func (v *Verifier) commitInMemoryWatermarks(
 
 func (v *Verifier) updateMetrics(nextOutputSize, targetInputSize uint64, latestInCP *log.Checkpoint) {
 	metrics.ResetAuditorRootMismatch()
+	metrics.ResetAuditorHalted()
 	metrics.OutputTreeSize.Set(float64(nextOutputSize))
 	metrics.ServingTreeSize.Set(float64(targetInputSize))
 	metrics.KVCommittedSize.Set(float64(targetInputSize))
